@@ -27,6 +27,7 @@ class Config:
     max_parallel_tasks: int
     executable: str
     projects: tuple[Project, ...]
+    force_grace_timeout_seconds: int = 5
 
 
 def load(path: str | Path) -> Config:
@@ -50,6 +51,7 @@ def load(path: str | Path) -> Config:
         return value
     interval = positive('poll_interval_seconds', 30)
     parallel = positive('max_parallel_tasks', 1)
+    grace = positive('force_grace_timeout_seconds', 5)
     if dispatcher.get('shutdown_policy', 'wait') != 'wait':
         raise ConfigError('dispatcher.shutdown_policy must be wait')
     if section('github').get('auth_method', 'gh') != 'gh':
@@ -84,4 +86,4 @@ def load(path: str | Path) -> Config:
         if type(item.get('enabled')) is not bool:
             raise ConfigError('project.enabled must be boolean')
         result.append(Project(**{k: item[k] for k in Project.__dataclass_fields__}))
-    return Config(source, directory('workspace'), directory('logs'), interval, parallel, executable, tuple(result))
+    return Config(source, directory('workspace'), directory('logs'), interval, parallel, executable, tuple(result), grace)

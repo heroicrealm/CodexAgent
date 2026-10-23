@@ -2,6 +2,7 @@ dispatcher:
   poll_interval_seconds: 30
   max_parallel_tasks: 1
   shutdown_policy: wait
+  force_grace_timeout_seconds: 5
 paths:
   workspace: ~/codex-dispatcher/workspace
   logs: ~/codex-dispatcher/logs

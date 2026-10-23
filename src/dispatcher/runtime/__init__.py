@@ -58,8 +58,9 @@ def running(root):
 
 class Lifecycle:
     """Future scheduler contract: stop admission, drain, or cancel process groups."""
-    def __init__(self, max_parallel_tasks=1):
+    def __init__(self, max_parallel_tasks=1, force_grace_timeout_seconds=5):
         self.max_parallel_tasks = max_parallel_tasks
+        self.force_grace_timeout_seconds = force_grace_timeout_seconds
         self.stopping = False
         self.forced = False
         self.children = []
@@ -68,36 +69,61 @@ class Lifecycle:
         self.stopping = True
         self.forced |= force
 
+    def _active(self):
+        active = []
+        for child in self.children:
+            # Never poll/wait the leader until its entire group is gone. Even a
+            # zombie leader reserves its PID, preventing PGID reuse during killpg.
+            # Callers must likewise not reap a submitted child themselves.
+            if child.returncode is not None:
+                raise RuntimeError('Task leader was reaped outside Lifecycle')
+            try:
+                os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+            except ChildProcessError as exc:
+                raise RuntimeError('Task leader was reaped outside Lifecycle') from exc
+            live = False
+            for stat in Path('/proc').glob('[0-9]*/stat'):
+                try:
+                    fields = stat.read_text().rsplit(')', 1)[1].split()
+                except FileNotFoundError:
+                    continue
+                if int(fields[2]) == child.pid and fields[0] != 'Z':
+                    live = True
+                    break
+            if live:
+                active.append(child)
+            else:
+                child.wait()
+        self.children = active
+        return active
+
     def submit(self, argv):
         if self.stopping:
             raise RuntimeError('Dispatcher is stopping')
-        if sum(child.poll() is None for child in self.children) >= self.max_parallel_tasks:
+        if len(self._active()) >= self.max_parallel_tasks:
             raise RuntimeError('Parallel task limit reached')
         child = subprocess.Popen(argv, start_new_session=True)
         self.children.append(child)
         return child
 
     def drain(self):
-        while any(child.poll() is None for child in self.children):
+        while self._active():
             if self.forced:
                 self.cancel()
                 return
             time.sleep(0.05)
-        if self.forced:
-            self.cancel()
 
     def cancel(self):
-        # Kill the whole owned group even when the immediate child already exited.
-        for sig in (signal.SIGTERM, signal.SIGKILL):
-            for child in self.children:
-                try:
-                    os.killpg(child.pid, sig)
-                except ProcessLookupError:
-                    pass
-            if sig == signal.SIGTERM:
-                time.sleep(0.2)
-        for child in self.children:
-            child.wait()
+        for child in self._active():
+            os.killpg(child.pid, signal.SIGTERM)
+        deadline = time.monotonic() + self.force_grace_timeout_seconds
+        while self._active() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        for child in self._active():
+            os.killpg(child.pid, signal.SIGKILL)
+        # Do not release the leader PID until all live group members have gone.
+        while self._active():
+            time.sleep(0.02)
 
 
 def serve(config):
@@ -106,7 +132,7 @@ def serve(config):
     fd = lock(root)
     if fd is None:
         return
-    lifecycle = Lifecycle(config.max_parallel_tasks)
+    lifecycle = Lifecycle(config.max_parallel_tasks, config.force_grace_timeout_seconds)
     signal.signal(signal.SIGTERM, lambda *_: lifecycle.request_stop())
     signal.signal(signal.SIGINT, lambda *_: lifecycle.request_stop())
     signal.signal(signal.SIGUSR1, lambda *_: lifecycle.request_stop(True))

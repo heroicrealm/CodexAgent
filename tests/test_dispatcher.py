@@ -151,14 +151,158 @@ projects:
         config = load(self.path)
         run = Mock(return_value=subprocess.CompletedProcess([], 0, stdout='SECRET'))
         checks = diagnose(config, which=lambda _: '/stub', run=run)
-        self.assertTrue(all(level == 'PASS' for level, _ in checks))
-        run.assert_called_once_with(['gh', 'auth', 'status'], capture_output=True, timeout=15)
+        self.assertFalse(any(level == 'FAIL' for level, _ in checks))
+        run.assert_any_call(['gh', 'auth', 'status'], capture_output=True, timeout=15)
+        for binary in ('git', 'gh', 'codex'):
+            run.assert_any_call([binary, '--version'], capture_output=True, timeout=15)
         self.assertNotIn('SECRET', str(checks))
         self.assertTrue(any(level == 'FAIL' for level, _ in diagnose(config, which=lambda _: None)))
         run.return_value = subprocess.CompletedProcess([], 1)
         self.assertIn(('FAIL', 'GitHub authentication: run gh auth login'), diagnose(config, which=lambda _: '/stub', run=run))
         with unittest.mock.patch('dispatcher.doctor.prepare', side_effect=PermissionError):
             self.assertIn(('FAIL', 'Directories: check ownership and permissions'), diagnose(config, which=lambda _: None))
+
+    def test_grace_timeout_validation(self):
+        self.assertEqual(load(self.path).force_grace_timeout_seconds, 5)
+        for value in ('0', '-1', 'true', '1.5', 'null'):
+            self.path.write_text(self.yaml + f'dispatcher:\n  force_grace_timeout_seconds: {value}\n')
+            with self.assertRaises(ConfigError):
+                load(self.path)
+
+    def test_version_failures(self):
+        for error in (OSError('SECRET'), subprocess.TimeoutExpired('SECRET', 15), None):
+            with self.subTest(error=error):
+                def run(argv, **kwargs):
+                    if argv[-1] == '--version':
+                        if error:
+                            raise error
+                        return subprocess.CompletedProcess(argv, 42, stdout='SECRET')
+                    return subprocess.CompletedProcess(argv, 0)
+                checks = diagnose(load(self.path), which=lambda _: '/stub', run=run, environ={})
+                for binary in ('git', 'gh', 'codex'):
+                    self.assertTrue(any(level == 'FAIL' and message.startswith(binary + ': version')
+                                        for level, message in checks))
+                self.assertNotIn('SECRET', str(checks))
+
+    def test_ssh_agent(self):
+        config = load(self.path)
+        clone = config.workspace / 'first' / '.git'
+        clone.mkdir(parents=True)
+        for remote, required in (('git@github.com:owner/repo', True),
+                                 ('ssh://git@github.com/owner/repo', True),
+                                 ('https://github.com/owner/repo', False)):
+            for outcome in (0, 1, 2, OSError('SECRET'), subprocess.TimeoutExpired('ssh-add', 15)):
+                def run(argv, **kwargs):
+                    if argv[-1] == '-v':
+                        return subprocess.CompletedProcess(argv, 0, stdout=f'origin {remote} (fetch)')
+                    if argv == ['ssh-add', '-l']:
+                        if isinstance(outcome, Exception):
+                            raise outcome
+                        return subprocess.CompletedProcess(argv, outcome, stdout='SECRET')
+                    return subprocess.CompletedProcess(argv, 0)
+                with self.subTest(remote=remote, outcome=outcome):
+                    checks = diagnose(config, which=lambda _: '/stub', run=run,
+                                      environ={'SSH_AUTH_SOCK': '/stub/socket'})
+                    agent = [level for level, msg in checks if msg.startswith('SSH Agent:')]
+                    self.assertEqual(agent, ['PASS' if outcome == 0 else 'FAIL' if required else 'WARN'])
+                    self.assertNotIn('SECRET', str(checks))
+            checks = diagnose(config, which=lambda _: '/stub', run=run, environ={})
+            self.assertIn('FAIL' if required else 'PASS',
+                          [level for level, msg in checks if msg.startswith('SSH Agent:')])
+        checks = diagnose(config, which=lambda name: None if name == 'ssh-add' else '/stub',
+                          run=run, environ={'SSH_AUTH_SOCK': '/stub/socket'})
+        self.assertIn(('WARN', 'SSH Agent: install OpenSSH client and run ssh-add locally'), checks)
+
+    def test_transport_and_auth_errors(self):
+        config = load(self.path)
+        (config.workspace / 'first' / '.git').mkdir(parents=True)
+        for outcome in (OSError('SECRET'), subprocess.TimeoutExpired('git', 15), 1):
+            def run(argv, **kwargs):
+                if argv[-1] == '-v' or argv == ['gh', 'auth', 'status']:
+                    if isinstance(outcome, Exception):
+                        raise outcome
+                    return subprocess.CompletedProcess(argv, outcome, stdout='SECRET')
+                return subprocess.CompletedProcess(argv, 0)
+            checks = diagnose(config, which=lambda _: '/stub', run=run, environ={})
+            self.assertTrue(any(level == 'WARN' and msg.startswith('Git transport:') for level, msg in checks))
+            self.assertIn(('FAIL', 'GitHub authentication: run gh auth login'), checks)
+            self.assertNotIn('SECRET', str(checks))
+
+    def test_group_survives_exited_leader(self):
+        lifecycle = Lifecycle(force_grace_timeout_seconds=1)
+        marker = self.root / 'grandchild'
+        # The leader exits before a TERM-ignoring grandchild. Its unreaped PID
+        # must keep the group identity reserved throughout the grace period.
+        grandchild = ('import signal,time,pathlib,os; '
+                      'signal.signal(signal.SIGTERM, signal.SIG_IGN); '
+                      f'pathlib.Path({str(marker)!r}).write_text(str(os.getpid())); time.sleep(60)')
+        middle = f'import subprocess,sys; subprocess.Popen([sys.executable,"-c",{grandchild!r}])'
+        leader = f'import subprocess,sys; subprocess.Popen([sys.executable,"-c",{middle!r}])'
+        child = lifecycle.submit([sys.executable, '-c', leader])
+        unrelated = subprocess.Popen(['sleep', '60'], start_new_session=True)
+        try:
+            deadline = time.monotonic() + 5
+            while not marker.exists() and time.monotonic() < deadline:
+                time.sleep(.01)
+            self.assertTrue(marker.exists())
+            deadline = time.monotonic() + 5
+            while identity(child.pid) is not None and time.monotonic() < deadline:
+                time.sleep(.01)
+            self.assertIsNone(identity(child.pid))
+            lifecycle.request_stop()
+            timer = threading.Timer(.1, lambda: lifecycle.request_stop(True))
+            timer.start()
+            started = time.monotonic()
+            lifecycle.drain()
+            timer.join()
+            self.assertGreaterEqual(time.monotonic() - started, 1)
+            self.assertIsNone(identity(int(marker.read_text())))
+            self.assertIsNone(unrelated.poll())
+            lifecycle.cancel()  # repeated cancellation sends no more signals
+        finally:
+            lifecycle.cancel()
+            unrelated.terminate()
+            unrelated.wait()
+
+    def test_graceful_group_waits_for_descendant(self):
+        lifecycle = Lifecycle()
+        code = 'import subprocess,sys; subprocess.Popen([sys.executable,"-c","import time; time.sleep(.4)"])'
+        lifecycle.submit([sys.executable, '-c', code])
+        lifecycle.request_stop()
+        started = time.monotonic()
+        lifecycle.drain()
+        self.assertGreater(time.monotonic() - started, .3)
+        self.assertEqual(lifecycle.children, [])
+
+    def test_force_allows_term_cleanup(self):
+        lifecycle = Lifecycle(force_grace_timeout_seconds=2)
+        ready, cleaned = self.root / 'ready', self.root / 'cleaned'
+        code = ("import signal,time,pathlib; "
+                f"signal.signal(signal.SIGTERM, lambda *_: (time.sleep(.2), pathlib.Path({str(cleaned)!r}).touch(), exit(0))); "
+                f"pathlib.Path({str(ready)!r}).touch(); time.sleep(60)")
+        child = lifecycle.submit([sys.executable, '-c', code])
+        try:
+            deadline = time.monotonic() + 5
+            while not ready.exists() and time.monotonic() < deadline:
+                time.sleep(.01)
+            self.assertTrue(ready.exists())
+            lifecycle.request_stop(True)
+            with unittest.mock.patch('dispatcher.runtime.os.killpg', wraps=os.killpg) as killpg:
+                lifecycle.drain()
+                self.assertEqual([call.args[1] for call in killpg.call_args_list], [signal.SIGTERM])
+            self.assertTrue(cleaned.exists())
+            self.assertEqual(child.returncode, 0)
+        finally:
+            lifecycle.cancel()
+
+    def test_reaped_leader_is_not_signalled(self):
+        lifecycle = Lifecycle()
+        child = lifecycle.submit([sys.executable, '-c', 'pass'])
+        child.wait()
+        with unittest.mock.patch('dispatcher.runtime.os.killpg') as killpg:
+            with self.assertRaisesRegex(RuntimeError, 'reaped outside'):
+                lifecycle.cancel()
+            killpg.assert_not_called()
 
 
 if __name__ == '__main__':
