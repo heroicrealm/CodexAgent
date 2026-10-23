@@ -5,7 +5,7 @@ import sqlite3
 from datetime import datetime, timezone
 
 
-MUTABLE = ('discovered', 'pending', 'approved', 'revoked')
+MUTABLE = ('discovered', 'pending', 'revoked')
 
 
 def now():
@@ -30,7 +30,7 @@ class Store:
             CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY);
             CREATE TABLE IF NOT EXISTS tasks(
                 repository TEXT NOT NULL, number INTEGER NOT NULL, issue_id INTEGER NOT NULL,
-                project_id TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'pending',
+                project_id TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'discovered',
                 available INTEGER NOT NULL CHECK(available IN (0,1)),
                 version INTEGER NOT NULL, content_hash TEXT NOT NULL, snapshot TEXT NOT NULL,
                 observed TEXT NOT NULL, approved_version INTEGER,
@@ -43,6 +43,33 @@ class Store:
                 FOREIGN KEY(repository,number) REFERENCES tasks(repository,number));
             INSERT OR IGNORE INTO schema_migrations VALUES(1);
             ''')
+        try:
+            self._migrate_states()
+        except sqlite3.Error:
+            self.db.close()
+            raise
+
+    def _migrate_states(self):
+        """Version 2: pending means a current, available, confirmed snapshot.
+
+        Serialize the marker check with conversion so concurrent opens cannot
+        repeat migration. Execution snapshots, versions and history stay intact.
+        """
+        with self.db:
+            self.db.execute('BEGIN IMMEDIATE')
+            if self.db.execute('SELECT 1 FROM schema_migrations WHERE version=2').fetchone():
+                return
+            self.db.execute('''UPDATE tasks SET
+                state=CASE
+                    WHEN available=0 THEN 'revoked'
+                    WHEN approved_version=version THEN 'pending'
+                    ELSE 'discovered' END,
+                approved_version=CASE
+                    WHEN available=1 AND approved_version=version THEN approved_version
+                    ELSE NULL END
+                WHERE state IN ('approved','pending')''')
+            self.db.execute("UPDATE tasks SET approved_version=NULL WHERE state IN ('discovered','revoked')")
+            self.db.execute('INSERT INTO schema_migrations VALUES(2)')
 
     def close(self):
         self.db.close()
@@ -51,13 +78,30 @@ class Store:
         return self.db.execute('SELECT * FROM tasks WHERE repository=? AND number=?',
                                (repository.casefold(), number)).fetchone()
 
+    def confirm(self, repository, number, expected_version):
+        """Stage 3 contract: confirm only the available, current discovered version.
+
+        Polling never invokes this operation. A stale version or ineligible
+        state returns False without changing the record or its history.
+        """
+        repository = repository.casefold()
+        with self.db:
+            self.db.execute('BEGIN IMMEDIATE')
+            cursor = self.db.execute("""UPDATE tasks SET state='pending',approved_version=version
+                WHERE repository=? AND number=? AND version=? AND available=1
+                AND state='discovered'""", (repository, number, expected_version))
+            if cursor.rowcount:
+                row = self.get(repository, number)
+                self._history(repository, number, row['version'], 'confirmed', row['snapshot'], now())
+            return cursor.rowcount == 1
+
     def reset_confirmation(self, repository, number, expected_version):
         """Compare-and-reset operation for stage 3; never changes active attempts."""
         with self.db:
             self.db.execute('BEGIN IMMEDIATE')
-            cursor = self.db.execute('''UPDATE tasks SET approved_version=NULL,state='pending'
+            cursor = self.db.execute('''UPDATE tasks SET approved_version=NULL,state='discovered'
                 WHERE repository=? AND number=? AND version=? AND available=1
-                AND state IN ('pending','approved','discovered')''',
+                AND state IN ('pending','discovered')''',
                 (repository.casefold(), number, expected_version))
             return cursor.rowcount == 1
 
@@ -80,7 +124,7 @@ class Store:
                 snapshot, digest = json.dumps(issue, sort_keys=True), content_hash(issue)
                 if row is None:
                     self.db.execute('INSERT INTO tasks VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
-                        (repository, number, issue['id'], project.id, 'pending', 1, 1, digest,
+                        (repository, number, issue['id'], project.id, 'discovered', 1, 1, digest,
                          snapshot, snapshot, None, stamp, stamp))
                     self._history(repository, number, 1, 'discovered', snapshot, stamp)
                     counts['discovered'] += 1
@@ -88,8 +132,8 @@ class Store:
                 changed = row['content_hash'] != digest
                 if row['state'] in MUTABLE:
                     version = row['version'] + int(changed)
-                    state = 'pending' if changed or not row['available'] else row['state']
-                    approved = None if changed or not row['available'] else row['approved_version']
+                    state = 'discovered' if changed or not row['available'] or row['state'] == 'revoked' else row['state']
+                    approved = row['approved_version'] if state == 'pending' else None
                     self.db.execute('''UPDATE tasks SET snapshot=?,observed=?,content_hash=?,version=?,
                         state=?,available=1,approved_version=?,synced_at=? WHERE repository=? AND number=?''',
                         (snapshot, snapshot, digest, version, state, approved, stamp, repository, number))
