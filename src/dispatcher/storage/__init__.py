@@ -43,6 +43,14 @@ class Store:
                 FOREIGN KEY(repository,number) REFERENCES tasks(repository,number));
             INSERT OR IGNORE INTO schema_migrations VALUES(1);
             ''')
+        with self.db:
+            self.db.executescript("""
+            CREATE TABLE IF NOT EXISTS decisions(
+                id INTEGER PRIMARY KEY, repository TEXT NOT NULL, number INTEGER NOT NULL,
+                version INTEGER NOT NULL, source TEXT NOT NULL, action TEXT NOT NULL,
+                result TEXT NOT NULL, created_at TEXT NOT NULL, event_id TEXT,
+                UNIQUE(repository,event_id));
+            """)
         try:
             self._migrate_states()
         except sqlite3.Error:
@@ -95,6 +103,38 @@ class Store:
                 self._history(repository, number, row['version'], 'confirmed', row['snapshot'], now())
             return cursor.rowcount == 1
 
+    def queue(self, repository=None):
+        if repository:
+            return self.db.execute('SELECT * FROM tasks WHERE repository=? ORDER BY number',
+                                   (repository.casefold(),)).fetchall()
+        return self.db.execute('SELECT * FROM tasks ORDER BY repository,number').fetchall()
+
+    def decide(self, repository, number, version, action, source='cli', event_id=None, valid=True, expected_synced_at=None):
+        """First committed decision wins, including across independent connections."""
+        if action not in ('approve', 'reject') or source not in ('cli', 'github'):
+            raise ValueError('Invalid decision')
+        repository = repository.casefold()
+        with self.db:
+            self.db.execute('BEGIN IMMEDIATE')
+            if event_id is not None and self.db.execute(
+                    'SELECT 1 FROM decisions WHERE repository=? AND event_id=?', (repository, str(event_id))).fetchone():
+                return 'duplicate'
+            row = self.get(repository, number)
+            valid = valid and (expected_synced_at is None or (row is not None and row['synced_at'] == expected_synced_at))
+            result = 'unverified' if not valid else 'conflict'
+            if valid and row and row['version'] == version and row['available'] and row['state'] == 'discovered':
+                state = 'pending' if action == 'approve' else 'rejected'
+                self.db.execute('UPDATE tasks SET state=?,approved_version=? WHERE repository=? AND number=?',
+                                (state, version if action == 'approve' else None, repository, number))
+                self._history(repository, number, version, action, row['snapshot'], now())
+                result = 'applied'
+            elif valid and row and row['version'] == version and row['state'] == ('pending' if action == 'approve' else 'rejected'):
+                result = 'already_applied'
+            self.db.execute('INSERT INTO decisions(repository,number,version,source,action,result,created_at,event_id) VALUES(?,?,?,?,?,?,?,?)',
+                            (repository, number, version, source, action, result, now(),
+                             str(event_id) if event_id is not None else None))
+            return result
+
     def reset_confirmation(self, repository, number, expected_version):
         """Compare-and-reset operation for stage 3; never changes active attempts."""
         with self.db:
@@ -105,7 +145,7 @@ class Store:
                 (repository.casefold(), number, expected_version))
             return cursor.rowcount == 1
 
-    def apply(self, project, issues):
+    def apply(self, project, issues, *, observation=None):
         counts = dict(discovered=0, updated=0, unchanged=0, revoked=0, skipped_untrusted=0)
         repository, stamp = project.repository.casefold(), now()
         seen = set()
@@ -149,6 +189,8 @@ class Store:
             for row in self.db.execute('SELECT * FROM tasks WHERE repository=?', (repository,)).fetchall():
                 if row['number'] not in seen:
                     self._revoke(row, stamp, row['observed'], counts)
+            if observation is not None:
+                observation.update({row['number']: dict(row) for row in self.queue(repository)})
         return counts
 
     def _history(self, repository, number, version, event, snapshot, stamp):

@@ -1,4 +1,4 @@
-"""Read-only GitHub REST adapter. No issue text is ever used as a command."""
+"""Bounded GitHub adapter. No issue text is ever used as a command."""
 import json
 import re
 import subprocess
@@ -109,6 +109,76 @@ class Adapter:
             if len(data) < 100:
                 return list(issues.values())
         raise GitHubError('Pagination limit exceeded')
+
+    def write(self, endpoint, method, payload):
+        """Bounded write. Retrying is delegated to idempotent reconciliation."""
+        try:
+            reply = self.run([self.executable, 'api', '--method', method, endpoint, '--input', '-'],
+                             input=json.dumps(payload), capture_output=True, text=True, timeout=30, shell=False)
+            if reply.returncode:
+                raise GitHubError('GitHub write failed')
+            return json.loads(reply.stdout) if reply.stdout.strip() else None
+        except (OSError, subprocess.TimeoutExpired, ValueError):
+            raise GitHubError('GitHub request failed') from None
+
+    def pages(self, endpoint):
+        result = []
+        for page in range(1, 10001):
+            data = self.request(f'{endpoint}?per_page=100&page={page}')
+            if not isinstance(data, list) or len(data) > 100:
+                raise GitHubError('Invalid GitHub page')
+            result.extend(data)
+            if len(data) < 100:
+                return result
+        raise GitHubError('Pagination limit exceeded')
+
+    def label_page(self, endpoint):
+        data = self.pages(endpoint)
+        if any(not isinstance(v, dict) or not isinstance(v.get('name'), str) for v in data):
+            raise GitHubError('Invalid GitHub labels')
+        return data
+
+    def labels(self, project):
+        return self.label_page(f'repos/{project.repository}/labels')
+
+    def command_events(self, project, number):
+        """REST supplies authenticated event actors; GraphQL supplies edit time.
+
+        Without lastEditedAt we cannot bind a label to a content version safely.
+        A bot is never an authorized operator, even when its login is allowlisted.
+        """
+        events = self.pages(f'repos/{project.repository}/issues/{number}/events')
+        owner, repo = project.repository.split('/')
+        query = ('query($owner:String!,$repo:String!,$number:Int!){repository(owner:$owner,name:$repo)'
+                 '{issue(number:$number){databaseId lastEditedAt title body author{login}}}}')
+        result = self.write('graphql', 'POST', dict(query=query, variables=dict(owner=owner, repo=repo, number=number)))
+        try:
+            if result.get('errors'):
+                raise KeyError
+            issue = result['data']['repository']['issue']
+            if (not isinstance(issue['title'], str) or not isinstance(issue['body'], str)
+                    or type(issue['databaseId']) is not int
+                    or not isinstance(issue['author']['login'], str)
+                    or (issue['lastEditedAt'] is not None and not isinstance(issue['lastEditedAt'], str))):
+                raise KeyError
+            return events, issue
+        except (KeyError, TypeError, AttributeError):
+            raise GitHubError('Cannot verify command version') from None
+
+    def reconcile(self, project, row):
+        """Only touch configured indicator/command labels, preserving ready and others."""
+        from urllib.parse import quote
+        from dispatcher.config import COLORS
+        endpoint = f'repos/{project.repository}/issues/{row["number"]}/labels'
+        current = self.label_page(endpoint)
+        desired = project.label(row['state']).name
+        managed = {project.label(k).name.casefold() for k in COLORS if k != 'ready'}
+        present = {v['name'].casefold(): v['name'] for v in current}
+        for folded, name in present.items():
+            if folded in managed and folded != desired.casefold():
+                self.write(endpoint + '/' + quote(name, safe=''), 'DELETE', {})
+        if desired.casefold() not in present:
+            self.write(endpoint, 'POST', dict(labels=[desired]))
 
 
 def authenticated(run=subprocess.run, executable="gh"):

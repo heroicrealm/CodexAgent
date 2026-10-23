@@ -15,10 +15,26 @@ projects:
     enabled: true
     repository: owner/repository
     base_branch: main
-    task_label: codex-task
     # Empty or missing allowlist denies all issues.
     labels:
-      ready: codex-ready
+      # Legacy string form "ready: codex-ready" is also supported.
+      ready: {name: codex-ready, color: '0E8A16', description: 'Eligible for dispatcher discovery'}
+      discovered: {name: 'dispatcher:discovered', color: 'D4C5F9'}
+      approve: {name: 'dispatcher:approve', color: '0E8A16'}
+      reject: {name: 'dispatcher:reject', color: 'B60205'}
+      pending: {name: 'dispatcher:pending', color: 'FBCA04'}
+      running: {name: 'dispatcher:running', color: '1D76DB'}
+      review: {name: 'dispatcher:review', color: '5319E7'}
+      done: {name: 'dispatcher:done', color: '0E8A16'}
+      failed: {name: 'dispatcher:failed', color: 'D93F0B'}
+      rejected: {name: 'dispatcher:rejected', color: 'B60205'}
+      revoked: {name: 'dispatcher:revoked', color: 'C2E0C6'}
+      cancelled: {name: 'dispatcher:cancelled', color: 'E99695'}
+      interrupted: {name: 'dispatcher:interrupted', color: 'F9D0C4'}
+    # Written by init. Missing/stale status excludes this project from processing.
+    init_status: ''
+    init_message: ''
+    init_fingerprint: ''
     security:
       allowed_authors: [trusted-login]
 executables:

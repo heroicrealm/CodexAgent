@@ -152,3 +152,12 @@ docs/
 issues/stage01/
 systemd/codex-dispatcher.service
 ```
+
+
+## Реализация этапа 3
+
+Утверждённые требования: [stages/stage03.md](stages/stage03.md).
+Реализованная архитектура и границы: [stages/stage-03-implementation.md](stages/stage-03-implementation.md).
+В текущей поставке start остаётся инфраструктурной службой этапа 1; polling запускается
+командами poll/poll --watch. На всех этих входах применяется проверка init/fingerprint.
+Executor, retry, worktree, PR и merge остаются задачами следующих этапов.

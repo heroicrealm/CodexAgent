@@ -1,5 +1,5 @@
 """Strict configuration loading; relative paths are relative to the YAML file."""
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 import re
 import yaml
@@ -7,6 +7,18 @@ import yaml
 
 class ConfigError(ValueError):
     pass
+
+
+COLORS = dict(zip(
+    'ready discovered approve reject pending running review done failed rejected revoked cancelled interrupted'.split(),
+    '0E8A16 D4C5F9 0E8A16 B60205 FBCA04 1D76DB 5319E7 0E8A16 D93F0B B60205 C2E0C6 E99695 F9D0C4'.split()))
+
+
+@dataclass(frozen=True)
+class Label:
+    name: str
+    color: str
+    description: str = ''
 
 
 @dataclass(frozen=True)
@@ -17,6 +29,13 @@ class Project:
     base_branch: str
     task_label: str
     allowed_authors: tuple[str, ...] = ()
+    labels: dict[str, Label] = field(default_factory=dict)
+    init_status: str = ''
+    init_message: str = ''
+    init_fingerprint: str = ''
+
+    def label(self, key):
+        return self.labels.get(key, Label(self.task_label if key == 'ready' else f'dispatcher:{key}', COLORS[key]))
 
 
 @dataclass(frozen=True)
@@ -82,7 +101,31 @@ def load(path: str | Path) -> Config:
         security = item.get('security', {})
         if not isinstance(labels, dict) or not isinstance(security, dict):
             raise ConfigError('project labels/security must be mappings')
-        item['task_label'] = labels.get('ready', item.get('task_label', 'codex-ready'))
+        parsed = {}
+        for key, color in COLORS.items():
+            value = labels.get(key, item.get('task_label', 'codex-ready') if key == 'ready' else f'dispatcher:{key}')
+            if isinstance(value, str):
+                value = dict(name=value)
+            if not isinstance(value, dict):
+                raise ConfigError('label must be a string or mapping')
+            name = string(value.get('name'), f'labels.{key}.name')
+            color = value.get('color', color)
+            description = value.get('description', '')
+            if not isinstance(color, str) or not re.fullmatch('[0-9a-fA-F]{6}', color):
+                raise ConfigError('label color must be six RGB hex digits')
+            if not isinstance(description, str) or '\x00' in description:
+                raise ConfigError('label description must be a string')
+            parsed[key] = Label(name, color, description)
+        if len({label.name.casefold() for label in parsed.values()}) != len(parsed):
+            raise ConfigError('label names must be unique ignoring case')
+        item['labels'] = parsed
+        item['task_label'] = parsed['ready'].name
+        for key in ('init_status', 'init_message', 'init_fingerprint'):
+            value = item.setdefault(key, '')
+            if not isinstance(value, str):
+                raise ConfigError(f'{key} must be a string')
+        if item['init_status'] not in ('', 'success', 'fail'):
+            raise ConfigError('invalid init_status')
         authors = security.get('allowed_authors', [])
         if not isinstance(authors, list) or any(not isinstance(a, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9-]*', a) for a in authors):
             raise ConfigError('security.allowed_authors must be a list of GitHub logins')

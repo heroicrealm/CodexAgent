@@ -127,6 +127,9 @@ class Lifecycle:
 
 
 def serve(config):
+    from dispatcher.initialization import ready
+    if not any(ready(p) for p in config.projects):
+        raise RuntimeError('No initialized enabled projects; run init')
     os.umask(0o077)
     root = prepare(config)
     fd = lock(root)

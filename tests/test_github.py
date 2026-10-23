@@ -38,7 +38,14 @@ def store(tmp_path):
     value.close()
 
 
+@pytest.fixture(autouse=True)
+def stage2_label_boundary(monkeypatch):
+    monkeypatch.setattr(Adapter, 'reconcile', lambda *args: None)
+
+
 def config(project):
+    from dispatcher.initialization import fingerprint
+    project = replace(project, init_status='success', init_fingerprint=fingerprint(project))
     return Config(Path('/tmp/config'), Path('/tmp/work'), Path('/tmp/logs'), 30, 1, 'codex', (project,))
 
 
@@ -133,7 +140,7 @@ def test_projects_isolated(store, project):
     adapter = Mock()
     adapter.fetch.side_effect = [GitHubError('SECRET'), Adapter(run=Mock(return_value=response([
         raw(url='https://api.github.com/repos/other/repo/issues/1', user={'login':'another'},labels=[{'name':'go'}])]))).fetch(second)]
-    result = SyncService(replace(config(project),projects=(project,second,disabled)),store,adapter).poll()
+    result = SyncService(replace(config(project),projects=(config(project).projects[0],config(second).projects[0],disabled)),store,adapter).poll()
     assert result['discovered'] == 1 and len(result['errors']) == 1
     assert adapter.fetch.call_count == 2 and 'SECRET' not in str(result)
 
