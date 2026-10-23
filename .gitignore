@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+build/
+dist/
+.pytest_cache/
+.coverage
+.env
+.env.*
+config/*.yaml
+!config/config.example.yaml
+/runtime/
+/workspace/
+/logs/
+*.log

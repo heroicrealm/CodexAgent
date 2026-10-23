@@ -1,0 +1,17 @@
+dispatcher:
+  poll_interval_seconds: 30
+  max_parallel_tasks: 1
+  shutdown_policy: wait
+paths:
+  workspace: ~/codex-dispatcher/workspace
+  logs: ~/codex-dispatcher/logs
+github:
+  auth_method: gh
+codex:
+  executable: codex
+projects:
+  - id: example-project
+    enabled: true
+    repository: owner/repository
+    base_branch: main
+    task_label: codex-task
