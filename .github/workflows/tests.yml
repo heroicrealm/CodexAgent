@@ -12,7 +12,7 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - run: python -m venv /tmp/dispatcher-install
-      - run: /tmp/dispatcher-install/bin/python -m pip install .
-      - run: /tmp/dispatcher-install/bin/python -m unittest discover -s tests -v
+      - run: /tmp/dispatcher-install/bin/python -m pip install ".[test]"
+      - run: /tmp/dispatcher-install/bin/python -m pytest -q
       - run: /tmp/dispatcher-install/bin/python -m compileall -q src tests
       - run: /tmp/dispatcher-install/bin/codex-dispatcher --help

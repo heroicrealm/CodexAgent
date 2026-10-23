@@ -1,8 +1,10 @@
 # Codex Task Dispatcher
 
-Этап 1: локальная инфраструктура диспетчера на Python 3.12+ для Ubuntu и WSL2.
-Конфигурация поддерживает несколько независимых проектов. Polling Issues, запуск
-Codex по заданиям, worktree, отчёты и PR будут реализованы на следующих этапах.
+Этапы 1–2: локальная инфраструктура диспетчера на Python 3.12+ для Ubuntu и WSL2,
+конфигурация нескольких независимых проектов и чтение GitHub Issues с сохранением
+очереди в SQLite. Реализованы однократный опрос `poll` и отдельный цикл `poll --watch`.
+Подтверждение заданий, запуск Codex, worktree, публикация отчётов и PR пока не реализованы.
+Команда `start` запускает инфраструктурный процесс, но не включает polling автоматически.
 
 ## Установка
 
@@ -60,7 +62,7 @@ SSH config, Git `insteadOf`/`pushInsteadOf`, remote helpers и будущий с
 Значения по умолчанию: интервал 30 секунд, параллелизм 1, политика `wait`, grace timeout 5 секунд, авторизация
 `gh`, executable `codex`, каталоги `~/codex-dispatcher/workspace` и
 `~/codex-dispatcher/logs`. Интервал, параллелизм и `dispatcher.force_grace_timeout_seconds` — положительные целые числа.
-Другие shutdown policy и auth method отклоняются. Интервал пока не запускает polling.
+Другие shutdown policy и auth method отклоняются. Интервал применяется к `poll --watch`; команда `start` пока не запускает polling.
 
 Относительные workspace/logs разрешаются относительно каталога YAML; `~` раскрывается
 для текущего пользователя, затем путь канонизируется. Переменные окружения в YAML
@@ -117,10 +119,12 @@ UTC timestamp, level, event и опциональные project/task. Логир
 ## Проверки и архитектура
 
 ```bash
-python -m unittest discover -s tests -v
-python -m compileall -q src tests
+python -m pip install -e '.[test]'
+bash scripts/test.sh
 python -m pip wheel --no-deps . -w /tmp/dispatcher-wheels
 ```
+
+`bash scripts/test.sh` запускает pytest и `compileall` для `src` и `tests`.
 
 Тесты используют временные каталоги, stub/mock внешних CLI и безвредные локальные
 процессы. Проверяются YAML и несколько проектов, doctor и ошибки авторизации/прав,
@@ -128,7 +132,72 @@ python -m pip wheel --no-deps . -w /tmp/dispatcher-wheels
 Реальная авторизация GitHub и реальные задания для тестов не нужны.
 
 `config` отвечает за immutable настройки, `runtime` — за блокировки и Lifecycle,
-`logging` — за JSONL, `github` — за диагностику авторизации, `codex` — граница будущего
+`logging` — за JSONL, `github` — за чтение и нормализацию Issues, `storage` — за SQLite,
+`github.sync` — за синхронизацию проектов, `codex` — граница будущего
 адаптера, `cli` объединяет команды. `Lifecycle.submit()` ограничивает параллелизм и
-отклоняет новые операции после запроса остановки; scheduler этапа 2 должен вызывать
-его только для разрешённых конфигурацией проектов. Сам scheduler здесь отсутствует.
+отклоняет новые операции после запроса остановки; scheduler следующих этапов должен вызывать
+его только для разрешённых конфигурацией проектов. Планировщик запуска заданий здесь отсутствует.
+
+### Этап 2: опрос GitHub Issues
+
+Авторизуйте CLI: `gh auth login`, затем проверьте `gh auth status`.
+В конфигурации каждого проекта задайте `labels.ready` и
+`security.allowed_authors` (список GitHub login). Пустой список запрещает все
+Issues. Старые `task_label` и `base_branch` поддерживаются; предпочтительны
+`labels.ready` и `default_branch`. Путь CLI задаётся `executables.github`.
+Комментарии не служат командами. Необязательная целевая ветка указывается в
+теле Issue отдельной строкой `Target branch: feature/name` (также принимается
+`Целевая ветка: feature/name`); иначе используется default/base branch проекта.
+Повторные поля и недопустимые имена веток приводят к ошибке опроса проекта.
+
+```bash
+codex-dispatcher --config config/config.yaml poll
+```
+
+Команда только читает GitHub и сохраняет SQLite в
+`paths.workspace/.runtime/tasks.sqlite3`; JSON содержит `discovered`, `updated`,
+`unchanged`, `revoked`, `skipped_untrusted`, `errors`. При ошибках код выхода 1.
+Для проверки двух проектов добавьте второй enabled-проект со своими repository,
+labels и allowlist, выполните команду дважды: повторный опрос не создаёт записей.
+Опрос читает все открытые Issues постранично, чтобы замечать снятие ready-метки;
+PR исключаются. Проекты применяются отдельными атомарными транзакциями только
+после полного успешного обхода. Ошибка проекта не отзывает его очередь.
+
+`tasks.snapshot` — текущий согласуемый снимок, `observed` — последнее наблюдение,
+`history` — журнал изменений. Значимые поля: GitHub id, title, body, author,
+target branch. Метки и updated_at не изменяют версию. Подтверждение хранится в
+`approved_version`. Новый Issue получает `discovered` и ожидает ручного
+подтверждения. `pending` означает, что пользователь подтвердил актуальную
+версию (`approved_version=version`), и задача ожидает запуска. Изменение
+значимых полей возвращает незапущенную задачу в `discovered` со сбросом
+подтверждения; метаданные сохраняют подтверждение. Утрата готовности переводит
+в `revoked`, возврат готовности — в `discovered` без подтверждения. `Store.reset_confirmation(repo, number, expected_version)`
+сбрасывает подтверждение и возвращает доступную незапущенную задачу в
+`discovered`. `Store.confirm(repo, number, expected_version)` — атомарный контракт
+этапа 3: только доступная `discovered` с совпадающей версией переходит в
+`pending`; устаревшая версия или другое состояние возвращает False.
+Polling не вызывает подтверждение; CLI approve остаётся этапу 3. Для running/review и терминальных
+состояний снимок и состояние сохраняются, новые данные попадают в observed.
+Возврат ready не запускает такие задачи повторно.
+
+`SyncService.run(threading.Event)` предоставляет останавливаемый цикл с интервалом
+`dispatcher.poll_interval_seconds`; Event прерывает ожидание между опросами.
+Один запрос ограничен 30 секундами, максимум три попытки; backoff и серверные
+Retry-After/reset ограничены 60 секундами. Служба этапа 1 пока не запускает этот
+цикл автоматически. Нет исполнения Codex, записи GitHub или команд одобрения.
+
+Проверка всех этапов: `pip install -e '.[test]'`, затем `bash scripts/test.sh`.
+Тесты используют подменённый gh и временную SQLite, без GitHub-токенов.
+
+Для непрерывной ручной проверки: `codex-dispatcher --config config/config.yaml poll --watch`.
+SIGINT/SIGTERM прекращают цикл; текущий ограниченный сетевой запрос и его
+повторы завершаются перед выходом, ожидание интервала прерывается сразу.
+Один repository допускается только в одном проекте во избежание конфликта политик.
+
+При открытии существующей SQLite автоматически выполняется транзакционная
+миграция №2: старое состояние `approved` и прежнее `pending` становятся
+`pending` только при `available=1` и `approved_version=version`; иначе —
+`discovered` без подтверждения (при `available=0` — `revoked`). У `discovered`
+и `revoked` подтверждение очищается. Версии, снимки, история, timestamps и все
+поля активных/терминальных записей сохраняются. Маркер `schema_migrations`
+исключает повторное преобразование при следующем открытии базы.

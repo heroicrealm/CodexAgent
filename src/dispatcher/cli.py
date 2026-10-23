@@ -18,6 +18,8 @@ def main(argv=None):
     sub = parser.add_subparsers(dest='command', required=True)
     for command in ('start', 'status', 'doctor', '_serve'):
         sub.add_parser(command, help=argparse.SUPPRESS if command == '_serve' else None)
+    poll_parser = sub.add_parser('poll')
+    poll_parser.add_argument('--watch', action='store_true', help='Poll until SIGINT/SIGTERM')
     stop = sub.add_parser('stop')
     stop.add_argument('--force', action='store_true')
     args = parser.parse_args(argv)
@@ -32,6 +34,27 @@ def main(argv=None):
         if args.command == '_serve':
             serve(config)
             return 0
+        if args.command == 'poll':
+            import json
+            from dispatcher.github.sync import SyncService
+            from dispatcher.storage import Store
+            store = Store(root / 'tasks.sqlite3')
+            try:
+                service = SyncService(config, store)
+                if args.watch:
+                    from threading import Event
+                    stop_event = Event()
+                    signal.signal(signal.SIGINT, lambda *_: stop_event.set())
+                    signal.signal(signal.SIGTERM, lambda *_: stop_event.set())
+                    while not stop_event.is_set():
+                        print(json.dumps(service.poll()), flush=True)
+                        stop_event.wait(config.poll_interval_seconds)
+                    return 0
+                result = service.poll()
+                print(json.dumps(result))
+                return int(bool(result['errors']))
+            finally:
+                store.close()
         state = running(root)
         if args.command == 'status':
             print('running' if state else 'stopped')

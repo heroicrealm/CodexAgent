@@ -9,6 +9,9 @@ description = "Local infrastructure for a configurable Codex task dispatcher"
 requires-python = ">=3.12"
 dependencies = ["PyYAML>=6.0,<7"]
 
+[project.optional-dependencies]
+test = ["pytest>=8,<10"]
+
 [project.scripts]
 codex-dispatcher = "dispatcher.cli:main"
 
