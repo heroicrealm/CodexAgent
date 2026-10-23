@@ -1,8 +1,10 @@
 # Codex Task Dispatcher
 
-Этап 1: локальная инфраструктура диспетчера на Python 3.12+ для Ubuntu и WSL2.
-Конфигурация поддерживает несколько независимых проектов. Polling Issues, запуск
-Codex по заданиям, worktree, отчёты и PR будут реализованы на следующих этапах.
+Этапы 1–2: локальная инфраструктура диспетчера на Python 3.12+ для Ubuntu и WSL2,
+конфигурация нескольких независимых проектов и чтение GitHub Issues с сохранением
+очереди в SQLite. Реализованы однократный опрос `poll` и отдельный цикл `poll --watch`.
+Подтверждение заданий, запуск Codex, worktree, публикация отчётов и PR пока не реализованы.
+Команда `start` запускает инфраструктурный процесс, но не включает polling автоматически.
 
 ## Установка
 
@@ -60,7 +62,7 @@ SSH config, Git `insteadOf`/`pushInsteadOf`, remote helpers и будущий с
 Значения по умолчанию: интервал 30 секунд, параллелизм 1, политика `wait`, grace timeout 5 секунд, авторизация
 `gh`, executable `codex`, каталоги `~/codex-dispatcher/workspace` и
 `~/codex-dispatcher/logs`. Интервал, параллелизм и `dispatcher.force_grace_timeout_seconds` — положительные целые числа.
-Другие shutdown policy и auth method отклоняются. Интервал пока не запускает polling.
+Другие shutdown policy и auth method отклоняются. Интервал применяется к `poll --watch`; команда `start` пока не запускает polling.
 
 Относительные workspace/logs разрешаются относительно каталога YAML; `~` раскрывается
 для текущего пользователя, затем путь канонизируется. Переменные окружения в YAML
@@ -117,10 +119,12 @@ UTC timestamp, level, event и опциональные project/task. Логир
 ## Проверки и архитектура
 
 ```bash
-python -m unittest discover -s tests -v
-python -m compileall -q src tests
+python -m pip install -e '.[test]'
+bash scripts/test.sh
 python -m pip wheel --no-deps . -w /tmp/dispatcher-wheels
 ```
+
+`bash scripts/test.sh` запускает pytest и `compileall` для `src` и `tests`.
 
 Тесты используют временные каталоги, stub/mock внешних CLI и безвредные локальные
 процессы. Проверяются YAML и несколько проектов, doctor и ошибки авторизации/прав,
@@ -128,12 +132,13 @@ python -m pip wheel --no-deps . -w /tmp/dispatcher-wheels
 Реальная авторизация GitHub и реальные задания для тестов не нужны.
 
 `config` отвечает за immutable настройки, `runtime` — за блокировки и Lifecycle,
-`logging` — за JSONL, `github` — за диагностику авторизации, `codex` — граница будущего
+`logging` — за JSONL, `github` — за чтение и нормализацию Issues, `storage` — за SQLite,
+`github.sync` — за синхронизацию проектов, `codex` — граница будущего
 адаптера, `cli` объединяет команды. `Lifecycle.submit()` ограничивает параллелизм и
-отклоняет новые операции после запроса остановки; scheduler этапа 2 должен вызывать
-его только для разрешённых конфигурацией проектов. Сам scheduler здесь отсутствует.
+отклоняет новые операции после запроса остановки; scheduler следующих этапов должен вызывать
+его только для разрешённых конфигурацией проектов. Планировщик запуска заданий здесь отсутствует.
 
-### Этап 2: однократный опрос GitHub
+### Этап 2: опрос GitHub Issues
 
 Авторизуйте CLI: `gh auth login`, затем проверьте `gh auth status`.
 В конфигурации каждого проекта задайте `labels.ready` и
