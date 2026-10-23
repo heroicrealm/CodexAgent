@@ -16,6 +16,7 @@ class Project:
     repository: str
     base_branch: str
     task_label: str
+    allowed_authors: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -28,6 +29,7 @@ class Config:
     executable: str
     projects: tuple[Project, ...]
     force_grace_timeout_seconds: int = 5
+    github_executable: str = "gh"
 
 
 def load(path: str | Path) -> Config:
@@ -70,10 +72,21 @@ def load(path: str | Path) -> Config:
     projects = data.get('projects')
     if not isinstance(projects, list) or not projects:
         raise ConfigError('projects must be a nonempty array')
-    result, ids = [], set()
+    result, ids, repositories = [], set(), set()
     for item in projects:
         if not isinstance(item, dict):
             raise ConfigError('Each project must be a mapping')
+        item = dict(item)
+        item.setdefault('base_branch', item.get('default_branch', 'main'))
+        labels = item.get('labels', {})
+        security = item.get('security', {})
+        if not isinstance(labels, dict) or not isinstance(security, dict):
+            raise ConfigError('project labels/security must be mappings')
+        item['task_label'] = labels.get('ready', item.get('task_label', 'codex-ready'))
+        authors = security.get('allowed_authors', [])
+        if not isinstance(authors, list) or any(not isinstance(a, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9-]*', a) for a in authors):
+            raise ConfigError('security.allowed_authors must be a list of GitHub logins')
+        item['allowed_authors'] = tuple(authors)
         for key in ('id', 'repository', 'base_branch', 'task_label'):
             string(item.get(key), f'project.{key}')
         if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]*', item['id']):
@@ -83,7 +96,11 @@ def load(path: str | Path) -> Config:
         ids.add(item['id'])
         if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_.-]+', item['repository']) or item['repository'].split('/')[1] in ('.', '..'):
             raise ConfigError('project.repository must be owner/name')
+        repository = item['repository'].casefold()
+        if repository in repositories:
+            raise ConfigError('project.repository must be unique')
+        repositories.add(repository)
         if type(item.get('enabled')) is not bool:
             raise ConfigError('project.enabled must be boolean')
         result.append(Project(**{k: item[k] for k in Project.__dataclass_fields__}))
-    return Config(source, directory('workspace'), directory('logs'), interval, parallel, executable, tuple(result), grace)
+    return Config(source, directory('workspace'), directory('logs'), interval, parallel, executable, tuple(result), grace, string(section('executables').get('github', 'gh'), 'executables.github'))

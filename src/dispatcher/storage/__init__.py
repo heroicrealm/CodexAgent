@@ -1,0 +1,122 @@
+"""Versioned SQLite snapshots. Transactions serialize polling and future approval."""
+import hashlib
+import json
+import sqlite3
+from datetime import datetime, timezone
+
+
+MUTABLE = ('discovered', 'pending', 'approved', 'revoked')
+
+
+def now():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def content_hash(issue):
+    # Labels, timestamps and other transport metadata do not invalidate approval.
+    value = {key: issue[key] for key in ('id', 'title', 'body', 'target_branch', 'author')}
+    value['author'] = value['author'].casefold()
+    return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
+
+class Store:
+    def __init__(self, path):
+        self.db = sqlite3.connect(path, timeout=30)
+        self.db.row_factory = sqlite3.Row
+        self.db.execute('PRAGMA foreign_keys=ON')
+        self.db.execute('PRAGMA journal_mode=WAL')
+        with self.db:
+            self.db.executescript('''
+            CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY);
+            CREATE TABLE IF NOT EXISTS tasks(
+                repository TEXT NOT NULL, number INTEGER NOT NULL, issue_id INTEGER NOT NULL,
+                project_id TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'pending',
+                available INTEGER NOT NULL CHECK(available IN (0,1)),
+                version INTEGER NOT NULL, content_hash TEXT NOT NULL, snapshot TEXT NOT NULL,
+                observed TEXT NOT NULL, approved_version INTEGER,
+                created_at TEXT NOT NULL, synced_at TEXT NOT NULL,
+                PRIMARY KEY(repository, number));
+            CREATE TABLE IF NOT EXISTS history(
+                id INTEGER PRIMARY KEY, repository TEXT NOT NULL, number INTEGER NOT NULL,
+                version INTEGER NOT NULL, event TEXT NOT NULL, snapshot TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(repository,number) REFERENCES tasks(repository,number));
+            INSERT OR IGNORE INTO schema_migrations VALUES(1);
+            ''')
+
+    def close(self):
+        self.db.close()
+
+    def get(self, repository, number):
+        return self.db.execute('SELECT * FROM tasks WHERE repository=? AND number=?',
+                               (repository.casefold(), number)).fetchone()
+
+    def reset_confirmation(self, repository, number, expected_version):
+        """Compare-and-reset operation for stage 3; never changes active attempts."""
+        with self.db:
+            self.db.execute('BEGIN IMMEDIATE')
+            cursor = self.db.execute('''UPDATE tasks SET approved_version=NULL,state='pending'
+                WHERE repository=? AND number=? AND version=? AND available=1
+                AND state IN ('pending','approved','discovered')''',
+                (repository.casefold(), number, expected_version))
+            return cursor.rowcount == 1
+
+    def apply(self, project, issues):
+        counts = dict(discovered=0, updated=0, unchanged=0, revoked=0, skipped_untrusted=0)
+        repository, stamp = project.repository.casefold(), now()
+        seen = set()
+        with self.db:
+            self.db.execute('BEGIN IMMEDIATE')
+            for issue in issues:
+                number = issue['number']
+                seen.add(number)
+                row = self.get(repository, number)
+                if not issue['eligible']:
+                    if issue['author'].casefold() not in {a.casefold() for a in project.allowed_authors}:
+                        counts['skipped_untrusted'] += 1
+                    if row:
+                        self._revoke(row, stamp, json.dumps(issue), counts)
+                    continue
+                snapshot, digest = json.dumps(issue, sort_keys=True), content_hash(issue)
+                if row is None:
+                    self.db.execute('INSERT INTO tasks VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                        (repository, number, issue['id'], project.id, 'pending', 1, 1, digest,
+                         snapshot, snapshot, None, stamp, stamp))
+                    self._history(repository, number, 1, 'discovered', snapshot, stamp)
+                    counts['discovered'] += 1
+                    continue
+                changed = row['content_hash'] != digest
+                if row['state'] in MUTABLE:
+                    version = row['version'] + int(changed)
+                    state = 'pending' if changed or not row['available'] else row['state']
+                    approved = None if changed or not row['available'] else row['approved_version']
+                    self.db.execute('''UPDATE tasks SET snapshot=?,observed=?,content_hash=?,version=?,
+                        state=?,available=1,approved_version=?,synced_at=? WHERE repository=? AND number=?''',
+                        (snapshot, snapshot, digest, version, state, approved, stamp, repository, number))
+                    if changed or not row['available']:
+                        self._history(repository, number, version, 'updated' if changed else 'restored', snapshot, stamp)
+                    counts['updated' if changed or not row['available'] else 'unchanged'] += 1
+                else:
+                    if row['observed'] != snapshot:
+                        self._history(repository, number, row['version'], 'observed', snapshot, stamp)
+                    self.db.execute('UPDATE tasks SET observed=?,synced_at=? WHERE repository=? AND number=?',
+                                    (snapshot, stamp, repository, number))
+                    counts['updated' if changed else 'unchanged'] += 1
+            for row in self.db.execute('SELECT * FROM tasks WHERE repository=?', (repository,)).fetchall():
+                if row['number'] not in seen:
+                    self._revoke(row, stamp, row['observed'], counts)
+        return counts
+
+    def _history(self, repository, number, version, event, snapshot, stamp):
+        self.db.execute('INSERT INTO history(repository,number,version,event,snapshot,created_at) VALUES(?,?,?,?,?,?)',
+                        (repository, number, version, event, snapshot, stamp))
+
+    def _revoke(self, row, stamp, observed, counts):
+        mutable = row['state'] in MUTABLE
+        self.db.execute('''UPDATE tasks SET observed=?,synced_at=?,available=0,
+            state=?,approved_version=? WHERE repository=? AND number=?''',
+            (observed, stamp, 'revoked' if mutable else row['state'],
+             None if mutable else row['approved_version'], row['repository'], row['number']))
+        if row['available']:
+            self._history(row['repository'], row['number'], row['version'], 'revoked', observed, stamp)
+            counts['revoked'] += 1

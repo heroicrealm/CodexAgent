@@ -61,7 +61,7 @@ def ssh_diagnose(config, which, run, environ):
 
 def diagnose(config, which=shutil.which, run=subprocess.run, environ=None):
     checks = [('PASS' if sys.version_info >= (3, 12) else 'FAIL', 'Python 3.12+')]
-    for binary in ('git', 'gh', config.executable):
+    for binary in ('git', config.github_executable, config.executable):
         found = which(binary)
         if not found:
             checks.append(('FAIL', f'{binary}: install CLI or fix PATH'))
@@ -73,9 +73,9 @@ def diagnose(config, which=shutil.which, run=subprocess.run, environ=None):
             ok = False
         checks.append(('PASS' if ok else 'FAIL', f'{binary}: version check passed' if ok else
                        f'{binary}: version check failed; check executable and dependencies'))
-    if which('gh'):
+    if which(config.github_executable):
         try:
-            ok = authenticated(run)
+            ok = authenticated(run, config.github_executable)
         except (OSError, subprocess.TimeoutExpired):
             ok = False
         checks.append(('PASS' if ok else 'FAIL', 'GitHub authentication' if ok else 'GitHub authentication: run gh auth login'))

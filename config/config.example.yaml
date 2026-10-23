@@ -16,3 +16,10 @@ projects:
     repository: owner/repository
     base_branch: main
     task_label: codex-task
+    # Empty or missing allowlist denies all issues.
+    labels:
+      ready: codex-ready
+    security:
+      allowed_authors: [trusted-login]
+executables:
+  github: gh
