@@ -34,18 +34,24 @@ Polling, реальные задания, worktree и публикация ре�
 
 Проверки локально, 2026-10-23, Linux, Python 3.14.4:
 
-- `./scripts/test.sh`: 15 автоматических тестов, включая compileall.
+- `./scripts/test.sh`: все 15 автоматических тестов PASS; compileall PASS.
 - Тесты используют mock/stub CLI и локальные безвредные процессы: YAML и defaults,
   CLI lifecycle/сигналы/stale PID, graceful drain, TERM cleanup, KILL после grace,
   дочерние и внучатые процессы, ранний выход лидера, защита посторонней группы,
   повторная отмена, внешнее освобождение лидера, SSH/auth/версии/таймауты/ошибки.
-- `git diff --check`.
+- `git diff --check`: PASS.
 
 Локально нет Python 3.12, pip и ensurepip, поэтому чистая установка через venv/pip
 и запуск установленной команды локально **не подтверждены**. CI обновлён: отдельные
 Python 3.12 и 3.14, создание чистого venv, `pip install .`, все тесты, compileall и
-запуск установленного `codex-dispatcher --help`. Результат удалённого CI проверяется
-после push и сообщается отдельно; эта запись не утверждает успех ещё не выполненного CI.
+запуск установленного `codex-dispatcher --help`.
+
+Удалённый CI коммита реализации `69e9e57` успешно завершён для **обеих** версий:
+[GitHub Actions run 40014590767](https://github.com/heroicrealm/CodexAgent/actions/runs/40014590767).
+Все шаги PASS: создание venv, pip install, 15 тестов, compileall, установленный entry point.
+Таким образом установка на чистом Python 3.12 подтверждена в CI, а не локально.
+Push в STAGE_01 выполнен через HTTPS с credential helper GitHub CLI: исходный
+SSH remote не смог аутентифицироваться (publickey). Настройки remote не изменялись.
 
 Ограничения платформы: Linux /proc, flock, pidfd, waitid WNOWAIT; журнал без ротации.
 SIGKILL самого daemon не позволяет cleanup; следующий start игнорирует stale state.
