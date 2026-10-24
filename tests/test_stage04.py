@@ -3,6 +3,7 @@ import hashlib
 import io
 import json
 import os
+import runpy
 from pathlib import Path
 import signal
 import sqlite3
@@ -453,7 +454,7 @@ def test_outbox_uncertain_write_recovery_and_migration(env):
     try:
         execution = ExecutionStore(store)
         ExecutionStore(store)
-        assert [r[0] for r in store.db.execute('SELECT version FROM schema_migrations ORDER BY version')] == [1,2,3]
+        assert [r[0] for r in store.db.execute('SELECT version FROM schema_migrations ORDER BY version')] == [1,2,3,602]
         assert store.get(project.repository,1)['approved_version'] == 1
         api.pages.return_value = [dict(id=456,body=body)]
         TaskResultPublisher(execution,api).flush()
@@ -535,23 +536,16 @@ def test_stage04_configuration_rejects_invalid_values(env, section):
     with pytest.raises(ConfigError): load(config.source)
 
 
-def test_real_daemon_start_poll_execute_comment_stop(env):
-    """Exercise actual CLI daemon and stub gh over its real subprocess boundary."""
-    config, project, _, _, remote = env
-    api_state = config.source.parent / 'github-state.json'
-    raw = dict(id=1,number=1,title='Task',body='Requirements',user=dict(login='alice'),
-               labels=[dict(name=project.task_label)],state='open',updated_at='2026-10-24T00:00:00Z',
-               url='https://api.github.com/repos/owner/repo/issues/1',html_url='https://github.com/owner/repo/issues/1')
-    api_state.write_text(json.dumps(dict(issue=raw,comments=[])))
-    gh = config.source.parent / 'gh-stub'
+def write_github_state_stub(gh):
     gh.write_text(f'#!{sys.executable}\n' + '''
-import json,pathlib,sys
+import json,os,pathlib,sys,tempfile
 path=pathlib.Path(__file__).with_name('github-state.json')
 state=json.loads(path.read_text())
 method=sys.argv[sys.argv.index('--method')+1]
 endpoint=next(arg for arg in sys.argv if arg.startswith('repos/'))
 if method=='GET':
-    if '/comments' in endpoint: result=state['comments']
+    if endpoint=='repos/owner/repo': result=dict(id=11,full_name='owner/repo')
+    elif '/comments' in endpoint: result=state['comments']
     elif '/labels' in endpoint: result=state['issue']['labels']
     else: result=[state['issue']]
 else:
@@ -567,10 +561,115 @@ else:
         name=unquote(endpoint.rsplit('/',1)[-1])
         state['issue']['labels']=[x for x in state['issue']['labels'] if x['name']!=name]
         result={}
-    path.write_text(json.dumps(state))
+    temporary=None
+    try:
+        with tempfile.NamedTemporaryFile(mode='w',encoding='utf-8',dir=path.parent,
+                                         prefix=path.name+'.',suffix='.tmp',delete=False) as stream:
+            temporary=pathlib.Path(stream.name)
+            json.dump(state,stream)
+        os.replace(temporary,path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 print('HTTP/2 200 OK\\nDate: Sat, 24 Oct 2026 00:00:00 GMT\\n\\n'+json.dumps(result))
 ''')
     gh.chmod(0o700)
+
+
+def daemon_comment_diagnostic(argv, config, state):
+    """Bounded diagnostics, evaluated only on failure and still inside stop's try/finally."""
+    try:
+        status = subprocess.run([*argv, 'status'], capture_output=True, text=True, timeout=5)
+        status_text = f'exit={status.returncode}, stdout={status.stdout!r}, stderr={status.stderr!r}'
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        status_text = type(exc).__name__
+    try:
+        with (config.logs / 'dispatcher.jsonl').open('rb') as stream:
+            stream.seek(0, os.SEEK_END)
+            stream.seek(max(0, stream.tell() - 4096))
+            log = stream.read(4096).decode('utf-8', errors='replace')
+    except OSError as exc:
+        log = type(exc).__name__
+    return f'Expected one comment within 10s; GitHub state={state!r}; daemon status={status_text}; log tail={log}'
+
+
+@pytest.mark.parametrize('failure', [None, 'write', 'replace'])
+def test_github_state_stub_publishes_complete_json(tmp_path, monkeypatch, failure):
+    """Read during a deliberately partial write of the actual generated stub."""
+    path = tmp_path / 'github-state.json'
+    original = dict(issue={'labels': []}, comments=[])
+    path.write_text(json.dumps(original))
+    gh = tmp_path / 'gh-stub'
+    write_github_state_stub(gh)
+    streams = []
+    replacements = []
+    replace_file = os.replace
+
+    def partial_dump(value, stream):
+        streams.append(stream)
+        encoded = json.dumps(value)
+        midpoint = len(encoded) // 2
+        stream.write(encoded[:midpoint])
+        stream.flush()
+        # A reader opening the published path while the write is incomplete
+        # must still see the entire previous document, with no parse retries.
+        assert json.loads(path.read_text()) == original
+        if failure == 'write':
+            raise OSError('injected write failure')
+        stream.write(encoded[midpoint:])
+
+    def publish(source, destination):
+        source, destination = Path(source), Path(destination)
+        assert source.parent == destination.parent == tmp_path
+        assert source != destination
+        assert streams[-1].closed
+        assert json.loads(path.read_text()) == original
+        assert json.loads(source.read_text())['comments'] == [dict(id=1, body='result')]
+        replacements.append(source)
+        if failure == 'replace':
+            raise OSError('injected replace failure')
+        replace_file(source, destination)
+
+    monkeypatch.setattr(json, 'dump', partial_dump)
+    monkeypatch.setattr(os, 'replace', publish)
+    monkeypatch.setattr(sys, 'argv', [str(gh), '--method', 'POST', 'repos/owner/repo/issues/1/comments'])
+    monkeypatch.setattr(sys, 'stdin', io.StringIO(json.dumps({'body': 'result'})))
+    if failure:
+        with pytest.raises(OSError, match='injected'):
+            runpy.run_path(str(gh), run_name='__main__')
+        assert json.loads(path.read_text()) == original
+    else:
+        runpy.run_path(str(gh), run_name='__main__')
+        assert json.loads(path.read_text())['comments'] == [dict(id=1, body='result')]
+        assert len(replacements) == 1
+    assert streams and all(stream.closed for stream in streams)
+    assert sorted(p.name for p in tmp_path.iterdir()) == ['gh-stub', 'github-state.json']
+
+
+def test_daemon_comment_diagnostic_handles_status_timeout(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    config = SimpleNamespace(logs=tmp_path)
+    (tmp_path / 'dispatcher.jsonl').write_text('x' * 5000 + '\nlast daemon event\n')
+    def timeout(*args, **kwargs):
+        assert kwargs['timeout'] == 5
+        raise subprocess.TimeoutExpired(args[0], 5)
+    monkeypatch.setattr(subprocess, 'run', timeout)
+    diagnostic = daemon_comment_diagnostic(['dispatcher'], config, {'comments': []})
+    assert 'within 10s' in diagnostic and "'comments': []" in diagnostic
+    assert 'TimeoutExpired' in diagnostic and 'last daemon event' in diagnostic
+    assert len(diagnostic) < 4500
+
+
+def test_real_daemon_start_poll_execute_comment_stop(env):
+    """Exercise actual CLI daemon and stub gh over its real subprocess boundary."""
+    config, project, _, _, remote = env
+    api_state = config.source.parent / 'github-state.json'
+    raw = dict(id=1,number=1,title='Task',body='Requirements',user=dict(login='alice'),
+               labels=[dict(name=project.task_label)],state='open',updated_at='2026-10-24T00:00:00Z',
+               url='https://api.github.com/repos/owner/repo/issues/1',html_url='https://github.com/owner/repo/issues/1')
+    api_state.write_text(json.dumps(dict(issue=raw,comments=[])))
+    gh = config.source.parent / 'gh-stub'
+    write_github_state_stub(gh)
     data = yaml.safe_load(config.source.read_text())
     data['executables'] = dict(github=str(gh))
     data['dispatcher'] = dict(poll_interval_seconds=1)
@@ -589,7 +688,7 @@ print('HTTP/2 200 OK\\nDate: Sat, 24 Oct 2026 00:00:00 GMT\\n\\n'+json.dumps(res
             state=json.loads(api_state.read_text())
             if state['comments']: break
             time.sleep(.05)
-        assert len(state['comments'])==1
+        assert len(state['comments'])==1, daemon_comment_diagnostic(argv, config, state)
         assert 'Task completed successfully.' in state['comments'][0]['body']
         assert git(remote,'rev-parse','codex/issue-1')
     finally:
@@ -722,7 +821,7 @@ def test_scheduler_project_round_robin(env):
     git(repo,'config','user.name','Test')
     git(repo,'config','user.email','test@example.invalid')
     first_items=[issue(project),issue(project,id=2,number=2)]
-    second_items=[issue(second)]
+    second_items=[issue(second,id=3)]
     api=adapter([])
     api.fetch.side_effect=lambda p: first_items if p.id==project.id else second_items
     dispatcher=Dispatcher(config,Lifecycle(),api)

@@ -87,12 +87,21 @@ class Adapter:
                 self.sleep(delay)
         raise GitHubError('GitHub unavailable after bounded retries', status=last_status, kind=last_kind)
 
+    def repository_identity(self, project):
+        from dispatcher.storage.transitions import rest_id
+        raw = self.request(f'repos/{project.repository}')
+        if (not isinstance(raw, dict) or not rest_id(raw.get('id'))
+                or str(raw.get('full_name', '')).casefold() != project.repository.casefold()):
+            raise GitHubError('Unresolved repository identity', kind='invalid_response')
+        return raw['id']
+
     def fetch(self, project):
         """Fetch all open issues, including non-ready ones for safe revocation.
 
         Explicit page requests avoid trusting arbitrary Link URLs. A full page
         requires a subsequent page; any failure discards the entire project.
         """
+        repository_id = self.repository_identity(project)
         issues = {}
         for page in range(1, 10001):
             data = self.request(f'repos/{project.repository}/issues?' + urlencode(dict(state='open', per_page=100, page=page)))
@@ -106,7 +115,7 @@ class Adapter:
                     if 'pull_request' in raw:
                         continue
                     number = raw['number']
-                    if type(number) is not int or number <= 0 or type(raw['id']) is not int:
+                    if type(number) is not int or number <= 0 or type(raw['id']) is not int or not 0 < raw['id'] <= 9223372036854775807:
                         raise ValueError
                     expected = f'https://api.github.com/repos/{project.repository}/issues/{number}'
                     if raw['url'].casefold() != expected.casefold():
@@ -123,7 +132,7 @@ class Adapter:
                     branch = branches[0] if branches else project.base_branch
                     if not valid_branch(branch):
                         raise GitHubError('Invalid target branch')
-                    item = dict(id=raw['id'], number=number, repository=project.repository.casefold(),
+                    item = dict(id=raw['id'], repository_id=repository_id, number=number, repository=project.repository.casefold(),
                                 project_id=project.id, title=title, body=body, author=author,
                                 state=raw['state'], labels=labels, updated_at=raw['updated_at'],
                                 url=raw['html_url'], target_branch=branch, server_observed_at=observed_at)

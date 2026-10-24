@@ -639,7 +639,8 @@ def http_reply(status, body, extra=''):
 
 @pytest.mark.parametrize('date,expected', [('Sat, 24 Oct 2026 00:00:00 GMT', '2026-10-24T00:00:00+00:00'),
                                           ('invalid SECRET', None)])
-def test_adapter_captures_server_date_for_issue_page(setup, date, expected):
+def test_adapter_captures_server_date_for_issue_page(setup, date, expected, monkeypatch):
+    monkeypatch.setattr(Adapter, "repository_identity", lambda *args: 100)
     from test_github import raw
     _, project, _ = setup
     runner = Mock(return_value=http_reply(200, [raw(user=dict(login='alice'), labels=[dict(name=project.task_label)])], f'Date: {date}\n'))

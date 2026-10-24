@@ -41,6 +41,7 @@ def store(tmp_path):
 @pytest.fixture(autouse=True)
 def stage2_label_boundary(monkeypatch):
     monkeypatch.setattr(Adapter, 'reconcile', lambda *args: None)
+    monkeypatch.setattr(Adapter, 'repository_identity', lambda *args: 100)
 
 
 def config(project):
@@ -339,41 +340,44 @@ def legacy_database(tmp_path):
     return path, cases, before, history
 
 
-def test_legacy_migration_preserves_data_and_is_idempotent(legacy_database):
-    path, cases, before, history = legacy_database
-    for _ in range(2):
-        store = Store(path)
-        try:
-            assert store.db.execute("SELECT count(*) FROM tasks WHERE state='approved'").fetchone()[0] == 0
-            assert [row[0] for row in store.db.execute('SELECT version FROM schema_migrations ORDER BY version')] == [1, 2]
-            for number, (_, _, _, state, approved) in enumerate(cases, 1):
-                expected = dict(before[number-1], state=state, approved_version=approved)
-                assert dict(store.get('owner/repo', number)) == expected
-            assert [tuple(row) for row in store.db.execute('SELECT * FROM history ORDER BY id')] == history
-        finally:
-            store.close()
-
-
-def test_legacy_migration_rolls_back_on_error(legacy_database):
+def test_legacy_migration_backup_reset_and_idempotency(legacy_database):
     import sqlite3
     path, _, before, history = legacy_database
-    db = sqlite3.connect(path)
-    db.execute("CREATE TRIGGER fail_migration BEFORE UPDATE ON tasks WHEN NEW.number=5 BEGIN SELECT RAISE(ABORT,'test'); END")
-    db.close()
-    with pytest.raises(sqlite3.IntegrityError):
+    store = Store(path)
+    assert not store.queue()
+    store.close()
+    backups = list(path.parent.glob('*.bak'))
+    assert len(backups) == 1
+    backup = sqlite3.connect(backups[0])
+    backup.row_factory = sqlite3.Row
+    assert [dict(r) for r in backup.execute('SELECT * FROM tasks ORDER BY number')] == before
+    assert [tuple(r) for r in backup.execute('SELECT * FROM history ORDER BY id')] == history
+    backup.close()
+    store = Store(path)
+    assert not store.queue()
+    assert len(list(path.parent.glob('*.bak'))) == 1
+    store.close()
+
+
+def test_legacy_migration_rolls_back_on_error(legacy_database, monkeypatch):
+    import sqlite3
+    from dispatcher.storage import migrations
+    path, _, before, history = legacy_database
+    def fail(db):
+        db.execute('CREATE TABLE partial(id INTEGER)')
+        raise sqlite3.IntegrityError('test')
+    monkeypatch.setattr(migrations, 'initialize', fail)
+    with pytest.raises(RuntimeError, match='original data retained'):
         Store(path)
     db = sqlite3.connect(path)
     db.row_factory = sqlite3.Row
-    try:
-        assert [dict(row) for row in db.execute('SELECT * FROM tasks ORDER BY number')] == before
-        assert [tuple(row) for row in db.execute('SELECT * FROM history ORDER BY id')] == history
-        assert [row[0] for row in db.execute('SELECT version FROM schema_migrations')] == [1]
-        db.execute('DROP TRIGGER fail_migration')
-    finally:
-        db.close()
-    store = Store(path)
-    assert store.get('owner/repo', 1)['state'] == 'pending'
-    store.close()
+    assert [dict(r) for r in db.execute('SELECT * FROM tasks ORDER BY number')] == before
+    assert [tuple(r) for r in db.execute('SELECT * FROM history ORDER BY id')] == history
+    assert not db.execute("SELECT 1 FROM sqlite_master WHERE name='partial'").fetchone()
+    assert [r[0] for r in db.execute('SELECT version FROM schema_migrations')] == [1]
+    db.close()
+    assert list(path.parent.glob('*.bak'))
+
 
 
 @pytest.mark.parametrize('confirmed', [False, True])

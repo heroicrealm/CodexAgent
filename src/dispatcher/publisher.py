@@ -2,6 +2,7 @@
 import re
 from datetime import datetime, timezone
 from dispatcher.github import GitHubError
+from dispatcher.storage import now
 
 
 def marker(attempt):
@@ -50,6 +51,10 @@ class TaskResultPublisher:
         # Serialize publishers, including the reconciliation read and write. A
         # network failure leaves the immutable body pending for the next tick.
         for pending in db.execute('SELECT attempt_id FROM result_outbox WHERE published=0').fetchall():
+            operation_key = 'comment:' + pending[0]
+            with db:
+                db.execute("UPDATE publication_operations SET retry_count=retry_count+1,updated_at=? WHERE operation_key=? AND outcome='failed'",
+                           (now(), operation_key))
             try:
                 with db:
                     db.execute('BEGIN IMMEDIATE')
@@ -68,5 +73,10 @@ class TaskResultPublisher:
                         raise GitHubError(kind='invalid_response')
                     db.execute('UPDATE result_outbox SET published=1,comment_id=? WHERE attempt_id=?',
                                (str(found['id']), out['attempt_id']))
+                    db.execute("UPDATE publication_operations SET phase='comment',outcome='completed',updated_at=? WHERE operation_key=?",
+                               (now(), operation_key))
             except GitHubError:
+                with db:
+                    db.execute("UPDATE publication_operations SET phase='comment',outcome='failed',updated_at=? WHERE operation_key=? AND outcome!='completed'",
+                               (now(), operation_key))
                 continue

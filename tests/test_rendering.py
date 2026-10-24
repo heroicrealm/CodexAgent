@@ -95,7 +95,7 @@ def test_cli_offline_and_configured_projects(unicode_task, monkeypatch, capsys):
     store = Store(config.workspace / '.runtime/tasks.sqlite3')
     # Add a repository absent from configuration; preserve Store ordering.
     with store.db:
-        store.db.execute("INSERT INTO tasks SELECT 'aaa/hidden',number,issue_id,project_id,state,available,version,content_hash,snapshot,observed,approved_version,created_at,synced_at FROM tasks")
+        store.db.execute("INSERT INTO tasks(repository,number,issue_id,project_id,state,available,version,content_hash,snapshot,observed,approved_version,created_at,synced_at) SELECT 'aaa/hidden',number,issue_id+100,project_id,state,available,version,content_hash,snapshot,observed,approved_version,created_at,synced_at FROM tasks")
     store.close()
     assert main(['--config', str(config.source), 'queue']) == 0
     output = capsys.readouterr().out
