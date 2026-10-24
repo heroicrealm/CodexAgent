@@ -259,6 +259,17 @@ codex-dispatcher --config config/config.yaml approve example-project 123
 codex-dispatcher --config config/config.yaml reject example-project 123
 ```
 
+Команды `queue`, `show`, `poll` и `poll --watch` выводят JSON с читаемым Unicode
+(например, `"title": "Написать тесты"` внутри `snapshot`).
+В Ubuntu/WSL2 используйте UTF-8 для stdout; при необходимости задайте
+`PYTHONIOENCODING=utf-8`. Каждый опрос `poll --watch` печатает отдельную строку JSON.
+Структура, типы полей и коды завершения сохранены. Поля `snapshot` и `observed`
+остаются JSON-строками: CLI разбирает только эти известные вложенные JSON и
+повторно сериализует их для отображения без ASCII-экранирования. Для чтения
+названия задачи используйте `json.loads(row["snapshot"])["title"]` после разбора
+внешнего JSON. Буквальные последовательности вроде `\u041d` в исходном тексте
+сохраняются; SQLite, JSONL и внутренние протоколы не меняются.
+
 Queue и show работают при остановленной службе и выводят JSON; show включает журнал
 решений. Обработка доступна только подготовленным проектам. Approve/reject сначала
 повторно получают Issues из GitHub и сверяют ожидаемую локальную версию. Если версия
