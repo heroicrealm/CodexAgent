@@ -11,22 +11,7 @@ import time
 from dispatcher.config import ConfigError, load
 from dispatcher.doctor import diagnose
 from dispatcher.runtime import prepare, running, serve
-
-
-def _display_task(row):
-    """Render known embedded JSON as Unicode, keeping the public string types.
-
-    Only the display copy changes; SQLite snapshots and literal escapes in
-    source fields retain their meaning. Never decode arbitrary text escapes.
-    """
-    value = dict(row)
-    for key in ('snapshot', 'observed'):
-        try:
-            value[key] = json.dumps(json.loads(value[key]), ensure_ascii=False)
-        except (json.JSONDecodeError, TypeError):
-            # Preserve legacy/non-JSON diagnostic values verbatim.
-            pass
-    return value
+from dispatcher.rendering import display_task as _display_task, render_queue, render_show
 
 
 def main(argv=None):
@@ -35,13 +20,18 @@ def main(argv=None):
     sub = parser.add_subparsers(dest='command', required=True)
     for command in ('start', 'status', 'doctor', '_serve'):
         sub.add_parser(command, help=argparse.SUPPRESS if command == '_serve' else None)
-    sub.add_parser('queue')
+    queue = sub.add_parser('queue', help='Display local queue (table by default)')
+    queue.add_argument('--format', choices=('table', 'json'), default='table',
+                       help='Output format (default: table; json preserves the machine contract)')
     init = sub.add_parser('init')
     init.add_argument('--update', action='store_true')
     for command in ('show', 'approve', 'reject'):
         task = sub.add_parser(command)
         task.add_argument('project')
         task.add_argument('issue', type=int)
+        if command == 'show':
+            task.add_argument('--format', choices=('table', 'json'), default='table',
+                              help='Local Issue text or legacy JSON (default: table)')
     poll_parser = sub.add_parser('poll')
     poll_parser.add_argument('--watch', action='store_true', help='Poll until SIGINT/SIGTERM')
     stop = sub.add_parser('stop')
@@ -85,8 +75,9 @@ def main(argv=None):
             store = Store(root / 'tasks.sqlite3')
             try:
                 if args.command == 'queue':
-                    repos = {p.repository.casefold() for p in config.projects if ready(p)}
-                    print(json.dumps([_display_task(r) for r in store.queue() if r['repository'] in repos], ensure_ascii=False))
+                    projects = {p.repository.casefold(): p.id for p in config.projects if ready(p)}
+                    render_queue([_display_task(r) for r in store.queue() if r['repository'] in projects],
+                                 projects, args.format)
                 elif args.command == 'show':
                     row = store.get(project.repository, args.issue)
                     if row is None:
@@ -107,7 +98,7 @@ def main(argv=None):
                     value['result_publication'] = [dict(r) for r in store.db.execute(
                         'SELECT o.attempt_id,o.published,o.comment_id FROM result_outbox o JOIN attempts a USING(attempt_id) '
                         'WHERE a.repository=? AND a.number=?', (project.repository.casefold(), args.issue))]
-                    print(json.dumps(value, ensure_ascii=False))
+                    render_show(value, args.format)
                 else:
                     from dispatcher.queue import decide_cli
                     result, synced = decide_cli(store, Adapter(config.github_executable), project, args.issue, args.command)
