@@ -3,6 +3,7 @@ import sqlite3
 import sys
 
 from dispatcher.github import Adapter, GitHubError
+from dispatcher.pr_monitor import PullRequestMonitor
 from dispatcher.initialization import ready
 from dispatcher.logging import event
 from dispatcher.queue import commands, REASONS
@@ -43,6 +44,9 @@ class SyncService:
                                                      error=REASONS[receipt['reason']], reason=receipt['reason'], retry=receipt['retry']))
                         self.log('command_verification_failed', project, task=receipt['issue'],
                                  reason=receipt['reason'], action=receipt['action'])
+                for number in PullRequestMonitor(self.store, self.adapter).poll(project):
+                    result['errors'].append(dict(project=project.id, issue=number, error='PR sync failed; will retry'))
+                    self.log('pr_sync_failed', project, task=number)
                 # Always reconcile, even when a command was rejected. DB is authoritative.
                 for row in self.store.queue(project.repository):
                     try:

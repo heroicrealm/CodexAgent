@@ -133,9 +133,12 @@ def render_queue(rows, projects, format='table', stream=None):
 DETAIL_FIELDS = {
     'decisions': ('id', 'version', 'action', 'source', 'result', 'event_id', 'created_at'),
     'command_diagnostics': ('action', 'event_id', 'reason'),
-    'attempts': ('attempt_id', 'version', 'branch', 'state', 'started_at', 'finished_at',
+    'attempts': ('attempt_id', 'iteration_id', 'previous_attempt_id', 'version', 'branch', 'state', 'started_at', 'finished_at',
                  'duration', 'initial_sha', 'result_sha', 'remote_sha', 'exit_code',
                  'error_code', 'category', 'codex_started', 'pushed', 'recovery_diagnostic'),
+    'pull_requests': ('pr_id', 'pr_number', 'iteration_id', 'url', 'state', 'head', 'head_sha', 'merged_at'),
+    'pr_sync_operations': ('operation_key', 'iteration_id', 'phase', 'outcome', 'retry_count', 'updated_at'),
+    'pr_resolutions': ('pr_id', 'target', 'metadata', 'issue_closed_at', 'comment_id', 'error'),
     'quota': ('state', 'observed_at', 'diagnostic'),
     'result_publication': ('attempt_id', 'published', 'comment_id'),
 }
@@ -152,7 +155,7 @@ def render_show(value, format='table', stream=None):
     lines = [f'Issue: #{value.get("number", "(unavailable)")}']
     for label, data, key in [('Title', issue, 'title'), ('Status', value, 'state'),
                              ('Branch', issue, 'target_branch'), ('Author', issue, 'author'),
-                             ('Version', value, 'version'), ('Approved version', value, 'approved_version'),
+                             ('Version', value, 'version'), ('Current iteration', value, 'current_iteration_id'), ('Approved version', value, 'approved_version'),
                              ('Available', value, 'available'), ('Created', value, 'created_at'),
                              ('Synced', value, 'synced_at')]:
         if data.get(key) is not None:

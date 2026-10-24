@@ -115,7 +115,7 @@ CREATE TABLE IF NOT EXISTS task_pull_requests(
  pr_number INTEGER NOT NULL CHECK(pr_number>0), head TEXT NOT NULL, base TEXT NOT NULL,
  head_sha TEXT NOT NULL, state TEXT NOT NULL, merged_at TEXT,
  FOREIGN KEY(issue_id,repository_id) REFERENCES tasks(issue_id,repository_id),
- UNIQUE(repository_id,pr_number), UNIQUE(issue_id));
+ UNIQUE(repository_id,pr_number));
 CREATE TABLE IF NOT EXISTS task_transitions(
  event_key TEXT PRIMARY KEY, issue_id INTEGER NOT NULL REFERENCES tasks(issue_id), actor TEXT NOT NULL,
  from_state TEXT NOT NULL, to_state TEXT NOT NULL, version INTEGER NOT NULL,
@@ -173,6 +173,14 @@ SCHEMA += """
 
             """
 
+SCHEMA += """
+CREATE TABLE IF NOT EXISTS pr_resolutions(
+ pr_id INTEGER PRIMARY KEY REFERENCES task_pull_requests(pr_id),
+ iteration_id INTEGER NOT NULL REFERENCES task_iterations(iteration_id),
+ target TEXT NOT NULL, metadata TEXT NOT NULL, issue_closed_at TEXT,
+ comment_id INTEGER, error TEXT);
+"""
+
 TRIGGERS = (
     """CREATE TRIGGER IF NOT EXISTS attempt_iteration_identity BEFORE INSERT ON attempts
     WHEN NEW.iteration_id IS NOT NULL AND NOT EXISTS (
@@ -184,3 +192,30 @@ TRIGGERS = (
         WHERE i.iteration_id=NEW.iteration_id AND p.pr_id=NEW.pr_id)
     BEGIN SELECT RAISE(ABORT,'PR iteration identity mismatch'); END""",
 )
+
+
+def upgrade604(db):
+    """Remove the old one-PR-per-Issue constraint without losing PR history."""
+    if not db.execute("SELECT 1 FROM sqlite_master WHERE name='task_pull_requests'").fetchone():
+        return
+    unique_issue = any([r[2] for r in db.execute('PRAGMA index_info(' + index[1] + ')')] == ['issue_id']
+                       for index in db.execute('PRAGMA index_list(task_pull_requests)') if index[2])
+    if not unique_issue:
+        return
+    db.execute('PRAGMA foreign_keys=OFF')
+    try:
+        db.execute('BEGIN IMMEDIATE')
+        statement = next(s for s in SCHEMA.split(';') if 'CREATE TABLE IF NOT EXISTS task_pull_requests(' in s)
+        db.execute(statement.replace('task_pull_requests(', 'pr_upgrade604('))
+        db.execute('INSERT INTO pr_upgrade604 SELECT * FROM task_pull_requests')
+        db.execute('DROP TRIGGER IF EXISTS pr_iteration_identity')
+        db.execute('DROP TABLE task_pull_requests')
+        db.execute('ALTER TABLE pr_upgrade604 RENAME TO task_pull_requests')
+        if db.execute('PRAGMA foreign_key_check').fetchall():
+            raise MigrationError('PR history migration validation failed')
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.execute('PRAGMA foreign_keys=ON')

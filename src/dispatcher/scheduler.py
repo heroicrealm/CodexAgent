@@ -16,7 +16,7 @@ from dispatcher.storage import Store
 from dispatcher.workspace import GitWorkspaceManager, TaskError
 
 SAFE_CODES = frozenset('''attachment_download_failed git_unavailable git_operation_failed
-    no_diff non_fast_forward publication_conflict publication_unavailable origin_changed default_branch_unavailable invalid_branch default_branch_protected worktree_already_exists clone_url_unavailable
+    retry_sha_unavailable retry_workspace_conflict no_diff non_fast_forward publication_conflict publication_unavailable origin_changed default_branch_unavailable invalid_branch default_branch_protected worktree_already_exists clone_url_unavailable
     unexpected_branch dirty_worktree no_commit rewritten_history unsupported_codex_cli
     codex_failed codex_timeout force_stop stop_requested quota_exhausted crash_recovery internal_error unsafe_path'''.split())
 
@@ -98,6 +98,19 @@ class Dispatcher:
                         continue
                     issue = json.loads(current['snapshot'])
                     branch = self.git.branch(project, issue)
+                    previous = self.store.db.execute(
+                        'SELECT * FROM attempts WHERE repository=? AND number=? ORDER BY rowid DESC LIMIT 1',
+                        (current['repository'], current['number'])).fetchone()
+                    if previous:
+                        source = self.store.db.execute("""SELECT p.head_sha FROM task_pull_requests p
+                            JOIN iteration_pr_history h USING(pr_id) JOIN pr_resolutions r USING(pr_id)
+                            WHERE h.iteration_id=? AND r.target='rejected' ORDER BY h.id DESC LIMIT 1""",
+                            (previous['iteration_id'],)).fetchone()
+                        sha = source['head_sha'] if source else previous['result_sha']
+                        self.git.retry_source(project, issue['number'], sha)
+                        issue['retry_sha'] = sha
+                        issue['previous_attempt'] = previous['attempt_id']
+                        branch = f'codex/issue-{issue["number"]}-iteration-{current["current_iteration_id"]}'
                     if self.lifecycle.stopping:
                         return
                     attempt = self.execution.reserve(current, branch, self.config.max_parallel_tasks,
@@ -109,6 +122,10 @@ class Dispatcher:
                     try:
                         worktree, sha = self.git.prepare(project, issue, branch)
                         self.execution.update(attempt, worktree=str(worktree), initial_sha=sha)
+                        if issue.get('previous_attempt'):
+                            archived = worktree.parent / ('previous-' + issue['previous_attempt'])
+                            if archived.exists():
+                                self.execution.update(issue['previous_attempt'], worktree=str(archived))
                         _, task, _ = self.git.paths(project, issue['number'])
                         origin = self.git.git(worktree, 'remote', 'get-url', 'origin').stdout.strip()
                         self.execution.update(attempt, origin_url=origin)
@@ -127,8 +144,9 @@ class Dispatcher:
                     except (OSError, RuntimeError):
                         self.execution.finish(attempt, 'failed', 'internal_error', 'DISPATCHER', time.monotonic() - started)
                     break
-                except (GitHubError, TaskError):
-                    event(self.config.logs / 'dispatcher.jsonl', 'admission_unavailable', level='WARN', project=project.id)
+                except (GitHubError, TaskError) as exc:
+                    event(self.config.logs / 'dispatcher.jsonl', 'admission_unavailable', level='WARN', project=project.id,
+                          task=candidate['number'], reason=exc.code if isinstance(exc, TaskError) else 'github_unavailable')
                     break
 
     def collect(self):

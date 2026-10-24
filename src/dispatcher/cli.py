@@ -94,6 +94,18 @@ def main(argv=None):
                     value['attempts'] = [dict(r) for r in store.db.execute(
                         'SELECT * FROM attempts WHERE repository=? AND number=? ORDER BY started_at',
                         (project.repository.casefold(), args.issue))]
+                    previous_attempt = None
+                    for attempt in value['attempts']:
+                        attempt['previous_attempt_id'] = previous_attempt
+                        previous_attempt = attempt['attempt_id']
+                    value['pr_sync_operations'] = [dict(r) for r in store.db.execute(
+                        "SELECT o.* FROM publication_operations o JOIN task_iterations i USING(iteration_id) WHERE i.issue_id=? AND o.operation_key LIKE 'resolution:%'", (row['issue_id'],))]
+                    value['pull_requests'] = [dict(r) for r in store.db.execute(
+                        'SELECT p.*,h.iteration_id FROM task_pull_requests p JOIN iteration_pr_history h USING(pr_id) WHERE p.issue_id=? ORDER BY h.id', (row['issue_id'],))]
+                    value['pr_resolutions'] = [dict(r) for r in store.db.execute(
+                        'SELECT r.* FROM pr_resolutions r JOIN task_pull_requests p USING(pr_id) WHERE p.issue_id=?', (row['issue_id'],))]
+                    for pr in value['pull_requests']:
+                        pr['url'] = f'https://github.com/{project.repository}/pull/{pr["pr_number"]}'
                     value['quota'] = [dict(r) for r in store.db.execute('SELECT * FROM quota_observation')]
                     value['result_publication'] = [dict(r) for r in store.db.execute(
                         'SELECT o.attempt_id,o.published,o.comment_id FROM result_outbox o JOIN attempts a USING(attempt_id) '

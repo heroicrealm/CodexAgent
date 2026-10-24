@@ -20,6 +20,9 @@ class ExecutionStore:
             return None
         if self.db.execute("SELECT count(*) FROM attempts WHERE state='running'").fetchone()[0] >= maximum:
             return None
+        if self.db.execute("SELECT 1 FROM attempts WHERE repository=? AND number=? AND state='running'",
+                           (row['repository'], row['number'])).fetchone():
+            return None
         if self.db.execute("SELECT 1 FROM attempts WHERE repository=? AND branch=? AND state='running'",
                            (row['repository'], branch)).fetchone():
             return None

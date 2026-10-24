@@ -1,5 +1,6 @@
 """Approval boundaries shared by CLI and GitHub polling. Never executes tasks."""
 from datetime import datetime
+import json
 
 from dispatcher.github import GitHubError
 
@@ -42,6 +43,12 @@ def _reason(store, project, issue, previous, row, events, proof, event):
         return 'stale_version'
     # All ordered times originate at GitHub. Local time is audit metadata only.
     boundary = [timestamp(guard['server_at'])]
+    if row['state'] == 'rejected':
+        rejected = store.db.execute("SELECT evidence FROM task_transitions WHERE issue_id=? AND to_state='rejected' ORDER BY rowid DESC LIMIT 1", (row['issue_id'],)).fetchone()
+        rejected_at = json.loads(rejected['evidence']).get('observed_at') if rejected else None
+        if rejected_at:
+            boundary.append(timestamp(rejected_at))
+
     if proof['lastEditedAt'] is not None:
         boundary.append(timestamp(proof['lastEditedAt']))
     for change in events:
@@ -109,7 +116,7 @@ def commands(store, adapter, project, items, before, observation=None):
                 result = store.decide(project.repository, issue['number'], row['version'], action,
                                       'github', event_id, valid=reason is None,
                                       expected_observation=row.get('observation_token') if isinstance(row, dict) else None,
-                                      expected_synced_at=row['synced_at'])
+                                      expected_synced_at=row['synced_at'], expected_state=row['state'])
             if result == 'duplicate':
                 block = store.blocked(project.repository, issue['number'], action)
                 reports.append(dict(issue=issue['number'], action=action, version=row['version'], outcome='duplicate',
@@ -142,7 +149,7 @@ def decide_cli(store, adapter, project, number, action):
     store.apply(project, items, observation=observation)
     current = observation[number]
     result = store.decide(project.repository, number, expected, action,
-                          expected_synced_at=current['synced_at'], expected_observation=current['observation_token'])
+                          expected_synced_at=current['synced_at'], expected_observation=current['observation_token'], expected_state=previous['state'])
     if result not in ('applied', 'already_applied'):
         raise RuntimeError('Decision conflicts with current version, readiness or previous decision; inspect show')
     try:

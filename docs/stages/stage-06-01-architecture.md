@@ -13,8 +13,8 @@
 | review | GitHub PR merged | done | Зафиксировать merge, закрыть Issue completed, локальная очистка |
 | review | GitHub PR closed unmerged | rejected | Сохранить branch/worktree и замечания |
 | rejected | Свежий авторизованный approve | pending | Новая итерация, в том числе при неизменённом Issue |
-| pending | Повторная работа | running | Reuse branch/worktree |
-| running / publishing | Push и повторное открытие исходного PR | review | Подтвердить head/base/PR ID |
+| pending | Повторная работа | running | Новая ветка/worktree от SHA предыдущей попытки |
+| running / publishing | Push и создание нового PR | review | Подтвердить head/base/PR ID |
 | rejected | Авторизованная окончательная отмена | cancelled | Терминальное решение; закрыть Issue not_planned; безопасно удалить ресурсы |
 | done / cancelled | Любые изменения Issue/меток | то же | Не запускать Codex; восстановить терминальные индикаторы |
 
@@ -54,7 +54,7 @@ CREATE TABLE task_pull_requests (
 - Создавать PR только при реальном diff между head и base; no-op без PR не считается `review`, выдаётся явная диагностика.
 - Сохранять `issue_id`, `pr_id`, repo, номера, head/base, SHA и URL. Связь PR с Issue не выводить лишь по имени ветки.
 - Перед созданием искать существующий связанный PR; после ошибки записи сверять GitHub, проверяя repo/head/base, идентичность Issue и служебный marker в PR body. Маркер — дополнительное доказательство, не единственный источник истины.
-- При доработке открыть тот же закрытый PR через GitHub API после push. Если GitHub не позволяет повторно открыть PR, не создавать новый молча: остановить публикацию с диагностикой и операторским решением.
+- При доработке создать новую ветку от сохранённого SHA предыдущей попытки и новый PR после push. Старые ветки и PR сохранять. При недоступности SHA остановиться с диагностикой без запуска Codex.
 - Удалённую ветку можно удалять только при подтверждённом ownership; пользовательская/общая/целевая ветка никогда не удаляется автоматически.
 
 ## 5. Порядок и восстановление
@@ -74,4 +74,4 @@ CREATE TABLE task_pull_requests (
 - Параллельные изменения PR/Issue между чтением и записью требуют повторной проверки, а не предположения.
 
 ## 7. Проверки
-Автотесты с mock Git/GitHub: обязательный PR; отсутствие diff; PR API timeout после фактического создания; дубликаты; merged→done; closed unmerged→rejected; approve неизменённого Issue; stale approve; reuse worktree/branch; reopen PR; ошибка reopen; отмена и защита чужой ветки; повторный запуск после crash; закрытый Issue; терминальная защита; multi-project одинаковые issue_number; миграция SQLite; stop/force; outbox. Ручные интеграционные сценарии — на выделенном тестовом репозитории, без автоматического merge.
+Автотесты с mock Git/GitHub: обязательный PR; отсутствие diff; PR API timeout после фактического создания; дубликаты; merged→done; closed unmerged→rejected; approve неизменённого Issue; stale approve; новая ветка от SHA; новый PR; недоступный SHA; отмена и защита чужой ветки; повторный запуск после crash; закрытый Issue; терминальная защита; multi-project одинаковые issue_number; миграция SQLite; stop/force; outbox. Ручные интеграционные сценарии — на выделенном тестовом репозитории, без автоматического merge.

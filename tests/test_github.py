@@ -91,7 +91,7 @@ def test_revocation_restore(store, project, replacement, confirmed):
     assert store.db.execute('SELECT count(*) FROM tasks').fetchone()[0] == 1
 
 
-@pytest.mark.parametrize('state', ['running','review','done','failed','rejected','cancelled','interrupted'])
+@pytest.mark.parametrize('state', ['running','review','done','failed','cancelled','interrupted'])
 def test_frozen_attempts(store, project, state):
     poll(store, project, [raw()])
     with store.db:
