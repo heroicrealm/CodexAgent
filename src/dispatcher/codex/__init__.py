@@ -2,7 +2,7 @@
 import json
 import subprocess
 import time
-from dispatcher.workspace import TaskError, private_file
+from dispatcher.workspace import TaskError, private_file, register_artifacts
 
 
 class CodexExecutor:
@@ -31,6 +31,7 @@ class CodexExecutor:
                   'Use the following local attachments (outside the repository):\n' + json.dumps(paths) +
                   '\nApproved title:\n' + issue['title'] + '\nApproved body:\n' + issue['body'])
         # Keep Issue text out of argv and the shared structured log.
+        register_artifacts(self.config.workspace, task, f'{attempt}.prompt', f'{attempt}.codex.log')
         prompt_path = task / f'{attempt}.prompt'
         with private_file(prompt_path) as stream:
             stream.write(prompt)

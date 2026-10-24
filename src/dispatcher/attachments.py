@@ -24,10 +24,26 @@ class IssueAttachmentManager:
 
     @staticmethod
     def recognized(url):
-        value = urlsplit(url)
-        return ((value.hostname == 'github.com' and
-                 (value.path.startswith('/user-attachments/') or '/files/' in value.path or '/assets/' in value.path))
-                or value.hostname in ('user-images.githubusercontent.com', 'private-user-images.githubusercontent.com'))
+        try:
+            value = urlsplit(url)
+            if not IssueAttachmentManager.allowed(url):
+                return False
+        except ValueError:
+            return False
+        uuid = r'[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}'
+        if value.hostname == 'github.com':
+            # Current Issue uploads and legacy repository-scoped uploads.
+            patterns = (
+                rf'/user-attachments/assets/{uuid}',
+                r'/user-attachments/files/[1-9][0-9]*/[^/]+',
+                r'/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/files/[1-9][0-9]*/[^/]+',
+                rf'/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/assets/[1-9][0-9]*/{uuid}',
+            )
+            return any(re.fullmatch(pattern, value.path) for pattern in patterns)
+        if value.hostname in ('user-images.githubusercontent.com', 'private-user-images.githubusercontent.com'):
+            return bool(re.fullmatch(r'/[1-9][0-9]*/[^/]+\.[A-Za-z0-9]+', value.path))
+        # Other allowed hosts serve redirects only, including release asset CDNs.
+        return False
 
     @staticmethod
     def allowed(url):
@@ -41,7 +57,7 @@ class IssueAttachmentManager:
     def urls(self, body):
         # GitHub's generated Markdown, HTML images, and reference destinations.
         candidates = re.findall(r'https?://[^\s<>"\)\]]+', body)
-        return list(dict.fromkeys(url.rstrip("'") for url in candidates if self.recognized(url)))
+        return list(dict.fromkeys(url.rstrip("'") for url in candidates if self.recognized(url.rstrip("'"))))
 
     def token(self):
         try:

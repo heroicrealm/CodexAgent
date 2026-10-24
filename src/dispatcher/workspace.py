@@ -1,7 +1,7 @@
 """Dispatcher-owned Git clones and conservative, done-only cleanup."""
 from pathlib import Path
 import os
-import shutil
+import json
 import shlex
 import subprocess
 
@@ -14,7 +14,7 @@ class TaskError(RuntimeError):
 
 def safe_path(root, path):
     root, path = Path(root).absolute(), Path(path).absolute()
-    if not path.is_relative_to(root) or path == root:
+    if '..' in path.parts or not path.is_relative_to(root) or path == root:
         raise TaskError('unsafe_path')
     current = Path(path.anchor)
     for part in path.parts[1:]:
@@ -38,6 +38,23 @@ def private_file(path, mode='w'):
     import os
     fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
     return os.fdopen(fd, mode)
+
+
+def register_artifacts(root, task, *names):
+    """Persist task-local ownership before creating dispatcher temporary files."""
+    registry = safe_path(root, task / '.dispatcher-artifacts.jsonl')
+    for name in names:
+        if not isinstance(name, str) or Path(name).name != name or name in ('', '.', '..'):
+            raise TaskError('unsafe_path')
+        path = safe_path(root, task / name)
+        if path.exists() or name in ('worktree', 'attachments', registry.name):
+            raise TaskError('artifact_already_exists')
+    fd = os.open(registry, os.O_CREAT | os.O_APPEND | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, 'a') as stream:
+        for name in names:
+            stream.write(json.dumps(name) + '\n')
+        stream.flush()
+        os.fsync(stream.fileno())
 
 
 class GitWorkspaceManager:
@@ -159,27 +176,81 @@ class TaskWorkspaceCleanup:
     def cleanup(self, project, row):
         try:
             return self._cleanup(project, row)
-        except (TaskError, OSError):
+        except (TaskError, OSError) as exc:
             from dispatcher.logging import event
             event(self.manager.config.logs / 'dispatcher.jsonl', 'cleanup_failed', level='WARN',
                   project=project.id, task=row['number'] if type(row['number']) is int else None,
-                  reason='cleanup_preserved_artifacts')
+                  reason=exc.code if isinstance(exc, TaskError) else 'cleanup_preserved_artifacts')
             raise
 
     def _cleanup(self, project, row):
         if row['state'] != 'done':
             raise TaskError('cleanup_requires_done')
         repo, task, worktree = self.manager.paths(project, row['number'])
-        # Check the entire tree before deleting anything, including attachments.
-        if task.exists():
-            for path in task.rglob('*'):
-                safe_path(self.manager.config.workspace, path)
+        root = self.manager.config.workspace
+        if not task.exists():
+            return
+        # Preflight everything before removing the worktree or any artifacts.
+        for path in task.rglob('*'):
+            safe_path(root, path)
+        registry = task / '.dispatcher-artifacts.jsonl'
+        owned = set()
+        if registry.exists():
+            try:
+                owned = {json.loads(line) for line in registry.read_text().splitlines()}
+            except (ValueError, TypeError):
+                raise TaskError('cleanup_invalid_registry') from None
+            for name in owned:
+                if (not isinstance(name, str) or Path(name).name != name
+                        or name in ('', '.', '..', 'worktree', 'attachments', registry.name)):
+                    raise TaskError('cleanup_invalid_registry')
+                safe_path(root, task / name)
+        # Compatibility with pre-registry attempts: only the supplied task attempt.
+        attempt = dict(row).get('attempt_id')
+        if attempt is not None:
+            import re
+            if not isinstance(attempt, str) or not re.fullmatch(r'[0-9a-f]{32}', attempt):
+                raise TaskError('cleanup_invalid_attempt')
+            owned.update((f'{attempt}.prompt', f'{attempt}.codex.log'))
+        for path in task.iterdir():
+            if path.name not in owned | {'worktree', 'attachments', registry.name}:
+                raise TaskError('cleanup_unexpected_file')
+            if path.name in owned | {registry.name} and not path.is_file():
+                raise TaskError('cleanup_unexpected_file')
+        attachments = safe_path(root, task / 'attachments')
+        attachment_files = set()
+        manifest = attachments / 'manifest.json'
+        if attachments.exists():
+            if not attachments.is_dir():
+                raise TaskError('cleanup_unexpected_file')
+            if manifest.exists():
+                try:
+                    entries = json.loads(manifest.read_text())
+                    if not isinstance(entries, list):
+                        raise ValueError
+                    for index, entry in enumerate(entries, 1):
+                        local = entry.get('local_path')
+                        if local is None:
+                            continue
+                        path = safe_path(root, local)
+                        if path.parent != attachments or not path.name.startswith(f'{index:03d}-'):
+                            raise ValueError
+                        attachment_files.add(path)
+                except (ValueError, TypeError, AttributeError):
+                    raise TaskError('cleanup_invalid_manifest') from None
+            for path in attachments.iterdir():
+                if path not in attachment_files | {manifest} or not path.is_file():
+                    raise TaskError('cleanup_unexpected_file')
         if worktree.exists():
-            if self.manager.git(worktree, 'status', '--porcelain').stdout.strip():
+            if self.manager.git(worktree, 'status', '--porcelain', '--untracked-files=all', '--ignored').stdout.strip():
                 raise TaskError('dirty_worktree', 'GIT')
             self.manager.git(repo, 'worktree', 'remove', str(worktree))
-        attachments = safe_path(self.manager.config.workspace, task / 'attachments')
+        for path in attachment_files:
+            path.unlink(missing_ok=True)
+        manifest.unlink(missing_ok=True)
         if attachments.exists():
-            shutil.rmtree(attachments)
-        if task.exists():
-            task.rmdir()
+            attachments.rmdir()
+        for name in owned:
+            (task / name).unlink(missing_ok=True)
+        registry.unlink(missing_ok=True)
+        task.rmdir()

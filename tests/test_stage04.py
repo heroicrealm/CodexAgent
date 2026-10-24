@@ -309,7 +309,7 @@ def test_push_conflict_preserves_local_commit(env):
 
 class Response(io.BytesIO):
     status = 200
-    def __init__(self, data=b'file', url='https://github.com/user-attachments/files/id/file.txt', headers=None):
+    def __init__(self, data=b'file', url='https://github.com/user-attachments/files/123/file.txt', headers=None):
         super().__init__(data)
         self.url = url
         self.headers = headers or {}
@@ -321,12 +321,12 @@ def test_attachments_manifest_auth_limits_and_failure(env, failure):
     config, _, _, _, _ = env
     config = replace(config, attachment_max_bytes=8, attachment_max_files=2)
     opener = Mock()
-    url = 'https://github.com/user-attachments/files/id/file.txt'
+    url = 'https://github.com/user-attachments/files/123/file.txt'
     body = f'![image]({url}) [file]({url}?second) [external](https://example.com/a.txt)'
     opener.open.side_effect = lambda request, **_: Response(url=request.full_url)
     if failure in (403,404): opener.open.side_effect = HTTPError(url, failure, 'SECRET', {}, None)
     if failure == 'oversize': opener.open.side_effect = lambda *a, **k: Response(b'0123456789')
-    if failure == 'path': body = '![x](https://github.com/user-attachments/files/id/%2e%2e%2fevil)'
+    if failure == 'path': body = '![x](https://github.com/user-attachments/files/123/%2e%2e%2fevil)'
     if failure == 'redirect': opener.open.side_effect = HTTPError(url, 302, 'redirect', {'Location':'https://evil.invalid/file'}, None)
     if failure == 'html': opener.open.side_effect = lambda *a, **k: Response(headers={'Content-Type':'text/html'})
     if failure == 'count': body += f' [extra]({url}?third)'
@@ -349,7 +349,7 @@ def test_attachments_manifest_auth_limits_and_failure(env, failure):
 def test_attachment_redirect_drops_token_and_symlink_rejected(env):
     config, _, _, _, _ = env
     opener = Mock()
-    url = 'https://github.com/user-attachments/files/id/file'
+    url = 'https://github.com/user-attachments/files/123/file'
     cdn = 'https://objects.githubusercontent.com/file?signature=private'
     opener.open.side_effect = [HTTPError(url, 302, '', {'Location':cdn}, None), Response(url=cdn)]
     manager = IssueAttachmentManager(config, opener)
@@ -365,7 +365,7 @@ def test_attachment_redirect_drops_token_and_symlink_rejected(env):
 
 def test_one_failed_attachment_never_starts_codex(env):
     config, project, _, _, _ = env
-    item = issue(project, body='![x](https://github.com/user-attachments/assets/id)')
+    item = issue(project, body='![x](https://github.com/user-attachments/assets/12345678-1234-1234-1234-123456789abc)')
     dispatcher = Dispatcher(config, Lifecycle(), adapter([item]))
     dispatcher.attachments.token = lambda: 'test-token'
     dispatcher.attachments.opener = Mock()
@@ -754,7 +754,7 @@ def test_comment_never_includes_raw_error_token_or_private_path():
 
 def test_partial_attachment_success_still_blocks_execution(env):
     config,project,_,_,_=env
-    url='https://github.com/user-attachments/files/id/file.txt'
+    url='https://github.com/user-attachments/files/123/file.txt'
     item=issue(project,body=f'[first]({url}) [second]({url}?second)')
     dispatcher=Dispatcher(config,Lifecycle(),adapter([item]))
     dispatcher.attachments.token=lambda:'test-token'
@@ -814,3 +814,170 @@ else:
     worktree,_=manager.prepare(project,issue(project),'codex/issue-1')
     assert (worktree/'initial').exists()
     assert repo.stat().st_mode & 0o777==0o700
+
+
+@pytest.mark.parametrize('url', [
+    'https://github.com/user-attachments/assets/12345678-1234-1234-1234-123456789abc',
+    'https://github.com/user-attachments/files/123/report.pdf',
+    'https://github.com/owner/repo/files/123/report.pdf?download=1',
+    'https://github.com/owner/repo/assets/123/12345678-1234-1234-1234-123456789abc',
+    'https://user-images.githubusercontent.com/123/456-abc.png',
+    'https://private-user-images.githubusercontent.com/123/456-abc.png?jwt=signed',
+])
+def test_attachment_url_formats(url):
+    assert IssueAttachmentManager.recognized(url)
+    manager = IssueAttachmentManager(None)
+    assert manager.urls(f'[file]({url}) <img src="{url}">') == [url]
+
+
+@pytest.mark.parametrize('url', [
+    'https://github.com/owner/repo/blob/main/files/report.pdf',
+    'https://github.com/owner/repo/tree/main/assets/image.png',
+    'https://github.com/owner/repo/blob/main/README.md',
+    'https://github.com/owner/repo/blob/main/src/main.py',
+    'https://github.com/owner/repo/releases/download/v1/report.pdf',
+    'https://github.com/owner/repo/files/arbitrary/report.pdf',
+    'https://github.com/user-attachments/assets/not-a-uuid',
+    'https://github.com/user-attachments/files/123',
+    'https://github.com/user-attachments/anything',
+    'https://user-images.githubusercontent.com/arbitrary/path',
+    'https://private-user-images.githubusercontent.com/',
+    'https://example.com/files/123/report.pdf',
+    'https://github.com.evil.invalid/user-attachments/files/123/report.pdf',
+    'https://objects.githubusercontent.com/github-production-release-asset/file',
+    'http://github.com/user-attachments/files/123/report.pdf',
+    'https://token@github.com/user-attachments/files/123/report.pdf',
+    'https://github.com:invalid/user-attachments/files/123/report.pdf',
+    'https://github.com:444/user-attachments/files/123/report.pdf',
+    'https://[broken',
+])
+def test_non_attachment_urls(url):
+    assert not IssueAttachmentManager.recognized(url)
+    assert IssueAttachmentManager(None).urls(f'[link]({url})') == []
+
+
+def test_repository_file_link_does_not_download_or_block_codex(env):
+    config, project, _, _, _ = env
+    item = issue(project, body='Read https://github.com/owner/repo/blob/main/files/spec.md')
+    dispatcher = Dispatcher(config, Lifecycle(), adapter([item]))
+    dispatcher.attachments.download = Mock(side_effect=AssertionError('unexpected download'))
+    dispatcher.attachments.token = Mock(side_effect=AssertionError('unexpected token lookup'))
+    try:
+        register(dispatcher, project, [item])
+        dispatcher.admit()
+        finish(dispatcher)
+        row = dispatcher.execution.db.execute('SELECT * FROM attempts').fetchone()
+        assert row['state'] == 'review' and row['codex_started'] == 1
+        dispatcher.attachments.download.assert_not_called()
+        dispatcher.attachments.token.assert_not_called()
+    finally:
+        dispatcher.close()
+
+
+@pytest.mark.parametrize('case', [
+    'normal', 'partial', 'unknown', 'other_attempt', 'artifact_symlink',
+    'attachment_unknown', 'bad_manifest', 'bad_registry', 'ignored', 'failed', 'interrupted',
+])
+def test_cleanup_registered_artifacts_and_preservation(env, case, monkeypatch):
+    from dispatcher.workspace import register_artifacts
+    config, project, _, seed, remote = env
+    manager = GitWorkspaceManager(config)
+    worktree, sha = manager.prepare(project, issue(project), 'codex/issue-1')
+    task = worktree.parent
+    attempt = 'a' * 32
+    names = [f'{attempt}.prompt', f'{attempt}.codex.log', 'dispatcher.tmp']
+    register_artifacts(config.workspace, task, *names)
+    for name in names:
+        (task / name).write_text('owned')
+    attachments = task / 'attachments'
+    attachments.mkdir()
+    attachment = attachments / '001-report.txt'
+    attachment.write_text('data')
+    (attachments / 'manifest.json').write_text(json.dumps([dict(local_path=str(attachment))]))
+    row = dict(number=1, state='done', attempt_id=attempt)
+    if case == 'unknown': (task / 'keep.txt').write_text('user data')
+    if case == 'other_attempt': (task / ('b' * 32 + '.prompt')).write_text('other task')
+    if case == 'artifact_symlink':
+        (task / names[0]).unlink()
+        (task / names[0]).symlink_to(seed / 'initial')
+    if case == 'attachment_unknown': (attachments / 'keep.txt').write_text('user data')
+    if case == 'bad_manifest':
+        (attachments / 'manifest.json').write_text(json.dumps([dict(local_path=str(seed / 'initial'))]))
+    if case == 'bad_registry': (task / '.dispatcher-artifacts.jsonl').write_text('"../outside"\n')
+    if case == 'ignored':
+        (worktree / '.gitignore').write_text('ignored\n')
+        git(worktree, 'add', '.gitignore')
+        git(worktree, 'commit', '-m', 'Ignore file')
+        (worktree / 'ignored').write_text('preserve')
+    if case in ('failed', 'interrupted'): row['state'] = case
+    cleanup = TaskWorkspaceCleanup(manager)
+    if case == 'partial':
+        original = Path.unlink
+        def fail_once(path, *args, **kwargs):
+            if path == task / names[0]:
+                raise OSError('simulated interruption after worktree and attachments removal')
+            return original(path, *args, **kwargs)
+        with monkeypatch.context() as patch:
+            patch.setattr(Path, 'unlink', fail_once)
+            with pytest.raises(OSError): cleanup.cleanup(project, row)
+        assert not worktree.exists() and not attachments.exists()
+    if case in ('normal', 'partial'):
+        cleanup.cleanup(project, row)
+        cleanup.cleanup(project, row)
+        assert not task.exists()
+        assert git(config.workspace / project.id / 'repository', 'rev-parse', 'codex/issue-1') == sha
+        assert git(remote, 'rev-parse', 'main') == sha
+    else:
+        with pytest.raises(TaskError): cleanup.cleanup(project, row)
+        assert worktree.exists() and attachment.exists()
+        assert (seed / 'initial').read_text() == 'initial'
+
+
+def test_cleanup_legacy_attempt_artifacts(env):
+    config, project, _, _, _ = env
+    manager = GitWorkspaceManager(config)
+    worktree, _ = manager.prepare(project, issue(project), 'codex/issue-1')
+    attempt = 'a' * 32
+    for suffix in ('.prompt', '.codex.log'):
+        (worktree.parent / (attempt + suffix)).write_text('legacy')
+    TaskWorkspaceCleanup(manager).cleanup(project, dict(number=1, state='done', attempt_id=attempt))
+    assert not worktree.parent.exists()
+
+
+def test_real_executor_artifacts_cleanup_after_done(env):
+    config, project, _, _, remote = env
+    dispatcher = Dispatcher(config, Lifecycle(), adapter([issue(project)]))
+    try:
+        register(dispatcher, project, [issue(project)])
+        dispatcher.admit()
+        finish(dispatcher)
+        row = dict(dispatcher.execution.db.execute('SELECT * FROM attempts').fetchone())
+        assert row['state'] == 'review'
+        task = Path(row['worktree']).parent
+        registry = task / '.dispatcher-artifacts.jsonl'
+        assert registry.stat().st_mode & 0o777 == 0o600
+        assert {json.loads(line) for line in registry.read_text().splitlines()} == {
+            row['attempt_id'] + '.prompt', row['attempt_id'] + '.codex.log'}
+        row['number'] = 1
+        row['state'] = 'done'
+        cleanup = TaskWorkspaceCleanup(dispatcher.git)
+        cleanup.cleanup(project, row)
+        cleanup.cleanup(project, row)
+        assert not task.exists()
+        assert git(remote, 'rev-parse', row['branch']) == row['result_sha']
+    finally:
+        dispatcher.close()
+
+
+def test_artifact_registration_does_not_claim_existing_files(env):
+    from dispatcher.workspace import register_artifacts, safe_path
+    config, project, _, seed, _ = env
+    _, task, _ = GitWorkspaceManager(config).paths(project, 1)
+    task.mkdir(parents=True)
+    (task / 'foreign.prompt').write_text('preserve')
+    with pytest.raises(TaskError, match='artifact_already_exists'):
+        register_artifacts(config.workspace, task, 'foreign.prompt')
+    assert not (task / '.dispatcher-artifacts.jsonl').exists()
+    for path in (seed / 'initial', task / '..' / 'outside', config.workspace):
+        with pytest.raises(TaskError, match='unsafe_path'):
+            safe_path(config.workspace, path)
