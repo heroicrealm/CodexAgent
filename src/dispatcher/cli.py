@@ -13,6 +13,22 @@ from dispatcher.doctor import diagnose
 from dispatcher.runtime import prepare, running, serve
 
 
+def _display_task(row):
+    """Render known embedded JSON as Unicode, keeping the public string types.
+
+    Only the display copy changes; SQLite snapshots and literal escapes in
+    source fields retain their meaning. Never decode arbitrary text escapes.
+    """
+    value = dict(row)
+    for key in ('snapshot', 'observed'):
+        try:
+            value[key] = json.dumps(json.loads(value[key]), ensure_ascii=False)
+        except (json.JSONDecodeError, TypeError):
+            # Preserve legacy/non-JSON diagnostic values verbatim.
+            pass
+    return value
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog='codex-dispatcher')
     parser.add_argument('--config', default='config/config.yaml', help='YAML path (default: config/config.yaml)')
@@ -70,19 +86,28 @@ def main(argv=None):
             try:
                 if args.command == 'queue':
                     repos = {p.repository.casefold() for p in config.projects if ready(p)}
-                    print(json.dumps([dict(r) for r in store.queue() if r['repository'] in repos]))
+                    print(json.dumps([_display_task(r) for r in store.queue() if r['repository'] in repos], ensure_ascii=False))
                 elif args.command == 'show':
                     row = store.get(project.repository, args.issue)
                     if row is None:
                         raise RuntimeError('Unknown issue')
-                    value = dict(row)
+                    value = _display_task(row)
                     value['decisions'] = [dict(r) for r in store.db.execute(
                         'SELECT * FROM decisions WHERE repository=? AND number=? ORDER BY id',
                         (project.repository.casefold(), args.issue))]
                     value['command_diagnostics'] = [dict(r) for r in store.db.execute(
                         'SELECT action,event_id,reason FROM command_quarantine WHERE repository=? AND number=?',
                         (project.repository.casefold(), args.issue))]
-                    print(json.dumps(value))
+                    from dispatcher.execution_store import ExecutionStore
+                    execution = ExecutionStore(store)
+                    value['attempts'] = [dict(r) for r in store.db.execute(
+                        'SELECT * FROM attempts WHERE repository=? AND number=? ORDER BY started_at',
+                        (project.repository.casefold(), args.issue))]
+                    value['quota'] = [dict(r) for r in store.db.execute('SELECT * FROM quota_observation')]
+                    value['result_publication'] = [dict(r) for r in store.db.execute(
+                        'SELECT o.attempt_id,o.published,o.comment_id FROM result_outbox o JOIN attempts a USING(attempt_id) '
+                        'WHERE a.repository=? AND a.number=?', (project.repository.casefold(), args.issue))]
+                    print(json.dumps(value, ensure_ascii=False))
                 else:
                     from dispatcher.queue import decide_cli
                     result, synced = decide_cli(store, Adapter(config.github_executable), project, args.issue, args.command)
@@ -109,11 +134,11 @@ def main(argv=None):
                     signal.signal(signal.SIGINT, lambda *_: stop_event.set())
                     signal.signal(signal.SIGTERM, lambda *_: stop_event.set())
                     while not stop_event.is_set():
-                        print(json.dumps(service.poll()), flush=True)
+                        print(json.dumps(service.poll(), ensure_ascii=False), flush=True)
                         stop_event.wait(config.poll_interval_seconds)
                     return 0
                 result = service.poll()
-                print(json.dumps(result))
+                print(json.dumps(result, ensure_ascii=False))
                 return int(bool(result['errors']))
             finally:
                 store.close()
