@@ -208,6 +208,8 @@ def transition(store, *, repository, number, expected_state, version, iteration_
         if not store._set_state(row, target, version if target == 'pending' else row['approved_version'],
                                 current_iteration=iteration_id):
             raise RuntimeError('Transition CAS failed inside serialized transaction')
+        if target == 'cancelled':
+            db.execute('INSERT INTO cancellations(issue_id) VALUES(?)', (row['issue_id'],))
         store._record_transition(row, target, event_key, authority.actor, dict(asdict(evidence), expected_iteration_id=request_iteration), iteration_id)
         store._history(repository.casefold(), number, version, target, row['snapshot'], stamp)
         return Outcome.APPLIED

@@ -77,9 +77,9 @@ class Store:
                                    (repository.casefold(),)).fetchall()
         return self.db.execute('SELECT * FROM tasks ORDER BY repository,number').fetchall()
 
-    def decide(self, repository, number, version, action, source='cli', event_id=None, valid=True, expected_synced_at=None, expected_observation=None, expected_state=None):
+    def decide(self, repository, number, version, action, source='cli', event_id=None, valid=True, expected_synced_at=None, expected_observation=None, expected_state=None, evidence=None, actor=None):
         """First committed decision wins, including across independent connections."""
-        if action not in ('approve', 'reject') or source not in ('cli', 'github'):
+        if action not in ('approve', 'reject', 'cancel') or source not in ('cli', 'github'):
             raise ValueError('Invalid decision')
         repository = repository.casefold()
         with self.db:
@@ -96,17 +96,19 @@ class Store:
             valid = valid and (expected_observation is None or (guard is not None and guard['observation_token'] == expected_observation))
             result = 'unverified' if not valid else 'conflict'
             repeat = (row is not None and row['state'] == 'rejected'
-                      and action == 'approve' and expected_state == 'rejected')
+                      and action in ('approve', 'cancel') and expected_state == 'rejected')
             if (valid and row and row['version'] == version and row['available']
-                    and (row['state'] == 'discovered' or repeat)):
-                state = 'pending' if action == 'approve' else 'rejected'
+                    and ((row['state'] == 'discovered' and action != 'cancel') or repeat)):
+                state = {'approve': 'pending', 'reject': 'rejected', 'cancel': 'cancelled'}[action]
                 self._set_state(row, state, version if action == 'approve' else None)
                 iteration = self._new_iteration(row, version) if action == 'approve' else row['current_iteration_id']
                 self._record_transition(row, state, f'{repository}:event:{event_id}' if event_id is not None else 'cli:' + uuid.uuid4().hex,
-                                        'verified_github_operator' if source == 'github' else 'local_operator', iteration_id=iteration)
+                                        actor or ('verified_github_operator' if source == 'github' else 'local_operator'), evidence=evidence, iteration_id=iteration)
+                if action == 'cancel':
+                    self.db.execute('INSERT INTO cancellations(issue_id) VALUES(?)', (row['issue_id'],))
                 self._history(repository, number, version, action, row['snapshot'], now())
                 result = 'applied'
-            elif valid and row and row['version'] == version and row['state'] == ('pending' if action == 'approve' else 'rejected'):
+            elif valid and row and row['version'] == version and row['state'] == {'approve': 'pending', 'reject': 'rejected', 'cancel': 'cancelled'}[action]:
                 result = 'already_applied'
             receipt = self.db.execute('INSERT INTO decisions(repository,number,version,source,action,result,created_at,event_id) VALUES(?,?,?,?,?,?,?,?)',
                             (repository, number, version, source, action, result, now(),

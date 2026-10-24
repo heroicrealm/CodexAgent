@@ -1,4 +1,4 @@
-"""Dispatcher-owned Git clones and conservative, done-only cleanup."""
+"""Dispatcher-owned Git clones and conservative terminal cleanup."""
 from pathlib import Path
 import os
 import json
@@ -216,7 +216,7 @@ class GitWorkspaceManager:
 
 
 class TaskWorkspaceCleanup:
-    """Next stage calls cleanup only after the persisted acceptance decision."""
+    """Remove verified artifacts only after a persisted terminal decision."""
     def __init__(self, manager):
         self.manager = manager
 
@@ -231,12 +231,21 @@ class TaskWorkspaceCleanup:
             raise
 
     def _cleanup(self, project, row):
-        if row['state'] != 'done':
+        if row['state'] not in ('done', 'cancelled'):
             raise TaskError('cleanup_requires_done')
         repo, task, worktree = self.manager.paths(project, row['number'])
         root = self.manager.config.workspace
         if not task.exists():
             return
+        archived = dict(row).get('owned_worktrees', ())
+        if any(not isinstance(name, str) or not name.startswith('previous-')
+               or Path(name).name != name for name in archived):
+            raise TaskError('cleanup_invalid_registry')
+        archived_attachments = dict(row).get('owned_attachments', ())
+        if any(not isinstance(name, str) or not name.startswith('attachments-')
+               or Path(name).name != name for name in archived_attachments):
+            raise TaskError('cleanup_invalid_registry')
+        worktrees = [worktree] + [safe_path(root, task / name) for name in archived]
         # Preflight everything before removing the worktree or any artifacts.
         for path in task.rglob('*'):
             safe_path(root, path)
@@ -260,43 +269,50 @@ class TaskWorkspaceCleanup:
                 raise TaskError('cleanup_invalid_attempt')
             owned.update((f'{attempt}.prompt', f'{attempt}.codex.log'))
         for path in task.iterdir():
-            if path.name not in owned | {'worktree', 'attachments', registry.name}:
+            if path.name not in owned | {'worktree', 'attachments', registry.name} | set(archived) | set(archived_attachments):
                 raise TaskError('cleanup_unexpected_file')
             if path.name in owned | {registry.name} and not path.is_file():
                 raise TaskError('cleanup_unexpected_file')
-        attachments = safe_path(root, task / 'attachments')
         attachment_files = set()
-        manifest = attachments / 'manifest.json'
-        if attachments.exists():
-            if not attachments.is_dir():
-                raise TaskError('cleanup_unexpected_file')
-            if manifest.exists():
-                try:
-                    entries = json.loads(manifest.read_text())
-                    if not isinstance(entries, list):
-                        raise ValueError
-                    for index, entry in enumerate(entries, 1):
-                        local = entry.get('local_path')
-                        if local is None:
-                            continue
-                        path = safe_path(root, local)
-                        if path.parent != attachments or not path.name.startswith(f'{index:03d}-'):
-                            raise ValueError
-                        attachment_files.add(path)
-                except (ValueError, TypeError, AttributeError):
-                    raise TaskError('cleanup_invalid_manifest') from None
-            for path in attachments.iterdir():
-                if path not in attachment_files | {manifest} or not path.is_file():
+        attachment_dirs = [safe_path(root, task / name) for name in ('attachments', *archived_attachments)]
+        for attachments in attachment_dirs:
+            manifest = attachments / 'manifest.json'
+            if attachments.exists():
+                if not attachments.is_dir():
                     raise TaskError('cleanup_unexpected_file')
-        if worktree.exists():
-            if self.manager.git(worktree, 'status', '--porcelain', '--untracked-files=all', '--ignored').stdout.strip():
+                if manifest.exists():
+                    try:
+                        entries = json.loads(manifest.read_text())
+                        if not isinstance(entries, list):
+                            raise ValueError
+                        for index, entry in enumerate(entries, 1):
+                            local = entry.get('local_path')
+                            if local is None:
+                                continue
+                            original = safe_path(root, local)
+                            path = safe_path(root, attachments / original.name)
+                            if original.parent != task / 'attachments':
+                                raise ValueError
+                            if path.parent != attachments or not path.name.startswith(f'{index:03d}-'):
+                                raise ValueError
+                            attachment_files.add(path)
+                    except (ValueError, TypeError, AttributeError):
+                        raise TaskError('cleanup_invalid_manifest') from None
+                for path in attachments.iterdir():
+                    if path not in attachment_files | {manifest} or not path.is_file():
+                        raise TaskError('cleanup_unexpected_file')
+        for path in worktrees:
+            if path.exists() and self.manager.git(path, 'status', '--porcelain', '--untracked-files=all', '--ignored').stdout.strip():
                 raise TaskError('dirty_worktree', 'GIT')
-            self.manager.git(repo, 'worktree', 'remove', str(worktree))
+        for path in worktrees:
+            if path.exists():
+                self.manager.git(repo, 'worktree', 'remove', str(path))
         for path in attachment_files:
             path.unlink(missing_ok=True)
-        manifest.unlink(missing_ok=True)
-        if attachments.exists():
-            attachments.rmdir()
+        for attachments in attachment_dirs:
+            (attachments / 'manifest.json').unlink(missing_ok=True)
+            if attachments.exists():
+                attachments.rmdir()
         for name in owned:
             (task / name).unlink(missing_ok=True)
         registry.unlink(missing_ok=True)

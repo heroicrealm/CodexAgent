@@ -219,3 +219,10 @@ def upgrade604(db):
         raise
     finally:
         db.execute('PRAGMA foreign_keys=ON')
+
+SCHEMA += """
+CREATE TABLE IF NOT EXISTS cancellations(
+ issue_id INTEGER PRIMARY KEY REFERENCES tasks(issue_id),
+ issue_closed INTEGER NOT NULL DEFAULT 0,
+ cleaned INTEGER NOT NULL DEFAULT 0, error TEXT);
+"""
