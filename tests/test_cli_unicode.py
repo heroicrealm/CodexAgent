@@ -41,7 +41,7 @@ def unicode_task(tmp_path):
 @pytest.mark.parametrize('command', ['queue', 'show'])
 def test_task_json_utf8_and_unchanged_storage(unicode_task, command):
     config, item, before = unicode_task
-    args = [command] if command == 'queue' else [command, item['project_id'], '1']
+    args = [command, '--format', 'json'] if command == 'queue' else [command, item['project_id'], '1', '--format', 'json']
     env = dict(os.environ, PYTHONIOENCODING='utf-8')
     result = subprocess.run([sys.executable, '-m', 'dispatcher', '--config', str(config.source), *args],
                             capture_output=True, env=env, check=False)
@@ -132,7 +132,7 @@ def test_unicode_project_display_with_mock_config(unicode_task, monkeypatch, cap
     store.db.execute('UPDATE tasks SET project_id=?', (project.id,))
     store.db.commit()
     store.close()
-    args = [command] if command == 'queue' else [command, project.id, '1']
+    args = [command, '--format', 'json'] if command == 'queue' else [command, project.id, '1', '--format', 'json']
     assert main(['--config', str(config.source), *args]) == 0
     output = capsys.readouterr().out
     assert 'Русский проект' in output and 'Написать тесты 🚀' in output
