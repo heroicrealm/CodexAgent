@@ -71,10 +71,14 @@ def test_cli_decisions_repeat_conflict_and_labels(setup, action, state):
     assert decide_cli(store, adapter, project, 1, action) == ('applied', True)
     assert store.get(project.repository, 1)['state'] == state
     assert decide_cli(store, adapter, project, 1, action) == ('already_applied', True)
-    with pytest.raises(RuntimeError, match='conflicts'):
-        decide_cli(store, adapter, project, 1, 'reject' if action == 'approve' else 'approve')
+    if action == 'approve':
+        with pytest.raises(RuntimeError, match='conflicts'):
+            decide_cli(store, adapter, project, 1, 'reject')
+    else:
+        assert decide_cli(store, adapter, project, 1, 'approve') == ('applied', True)
+        assert store.get(project.repository, 1)['state'] == 'pending'
     assert store.db.execute('SELECT count(*) FROM decisions').fetchone()[0] == 3
-    assert adapter.reconcile.call_count == 2
+    assert adapter.reconcile.call_count == (2 if action == 'approve' else 3)
 
 
 def test_cli_stale_unavailable_and_sync_retry(setup):

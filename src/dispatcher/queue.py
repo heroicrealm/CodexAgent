@@ -1,5 +1,6 @@
 """Approval boundaries shared by CLI and GitHub polling. Never executes tasks."""
 from datetime import datetime
+import json
 
 from dispatcher.github import GitHubError
 
@@ -17,6 +18,7 @@ REASONS = {
     'ambiguous_event_time': 'command is not strictly newer than the server revision/eligibility boundary',
     'eligibility_changed': 'Issue readiness or content changed during verification',
     'conflicting_decision': 'another decision or observation won the SQLite transaction',
+    'conflicting_labels': 'multiple command labels are present',
     'already_processed': 'this event was already recorded and cannot be applied again',
 }
 RETRY = 'Inspect show; remove the command labels, poll until their absence is observed, then reapply for the current version; or use CLI approve/reject.'
@@ -35,6 +37,9 @@ def _reason(store, project, issue, previous, row, events, proof, event):
             or proof['databaseId'] != issue['id'] or proof['title'] != issue['title'] or proof['body'] != issue['body']
             or proof['author']['login'].casefold() != issue['author'].casefold()):
         return 'eligibility_changed'
+    if (row['state'] == 'rejected' and project.label('cancelled').name.casefold() in names
+            and any(project.label(k).name.casefold() in names for k in ('approve', 'reject'))):
+        return 'conflicting_labels'
     guard = store.guard(project.repository, issue['number'])
     if not guard or not guard['server_at']:
         return 'missing_server_fence'
@@ -42,6 +47,12 @@ def _reason(store, project, issue, previous, row, events, proof, event):
         return 'stale_version'
     # All ordered times originate at GitHub. Local time is audit metadata only.
     boundary = [timestamp(guard['server_at'])]
+    if row['state'] == 'rejected':
+        rejected = store.db.execute("SELECT evidence FROM task_transitions WHERE issue_id=? AND to_state='rejected' ORDER BY rowid DESC LIMIT 1", (row['issue_id'],)).fetchone()
+        rejected_at = json.loads(rejected['evidence']).get('observed_at') if rejected else None
+        if rejected_at:
+            boundary.append(timestamp(rejected_at))
+
     if proof['lastEditedAt'] is not None:
         boundary.append(timestamp(proof['lastEditedAt']))
     for change in events:
@@ -70,6 +81,8 @@ def commands(store, adapter, project, items, before, observation=None):
                else store.get(project.repository, issue['number']))
         if row is None:
             continue
+        if row['state'] == 'rejected':
+            actions[project.label('cancelled').name.casefold()] = 'cancel'
         active = []
         for name, action in actions.items():
             if name not in names:
@@ -94,7 +107,8 @@ def commands(store, adapter, project, items, before, observation=None):
             events, proof, latest = [], None, {}
         for name, action in active:
             event = latest.get(name)
-            reason = 'proof_unavailable' if proof is None else None
+            reason = ('conflicting_labels' if len(active) > 1 and any(a == 'cancel' for _, a in active)
+                      else 'proof_unavailable' if proof is None else None)
             event_id = None
             if reason is None and (not event or event['event'] != 'labeled' or type(event.get('id')) is not int):
                 reason = 'no_event_proof'
@@ -102,6 +116,9 @@ def commands(store, adapter, project, items, before, observation=None):
                 event_id = event['id']
                 try:
                     reason = _reason(store, project, issue, before.get(issue['number']), row, events, proof, event)
+                    if reason is None and action == 'cancel':
+                        if timestamp(event['created_at']) > timestamp(adapter.response_date):
+                            reason = 'ambiguous_event_time'
                 except (KeyError, TypeError, ValueError, AttributeError):
                     reason = 'proof_unavailable'
             result = None
@@ -109,7 +126,10 @@ def commands(store, adapter, project, items, before, observation=None):
                 result = store.decide(project.repository, issue['number'], row['version'], action,
                                       'github', event_id, valid=reason is None,
                                       expected_observation=row.get('observation_token') if isinstance(row, dict) else None,
-                                      expected_synced_at=row['synced_at'])
+                                      expected_synced_at=row['synced_at'], expected_state=row['state'],
+                                      actor=(event.get('actor') or {}).get('login'),
+                                      evidence=dict(event=event, observed_at=issue.get('server_observed_at'),
+                                                    content_hash=row['content_hash'], iteration_id=row['current_iteration_id']))
             if result == 'duplicate':
                 block = store.blocked(project.repository, issue['number'], action)
                 reports.append(dict(issue=issue['number'], action=action, version=row['version'], outcome='duplicate',
@@ -142,7 +162,7 @@ def decide_cli(store, adapter, project, number, action):
     store.apply(project, items, observation=observation)
     current = observation[number]
     result = store.decide(project.repository, number, expected, action,
-                          expected_synced_at=current['synced_at'], expected_observation=current['observation_token'])
+                          expected_synced_at=current['synced_at'], expected_observation=current['observation_token'], expected_state=previous['state'])
     if result not in ('applied', 'already_applied'):
         raise RuntimeError('Decision conflicts with current version, readiness or previous decision; inspect show')
     try:

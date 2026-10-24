@@ -128,7 +128,7 @@ def test_evidence_guards(store, change, outcome):
     assert move(store, 'pending', 'approve', evidence=evidence(store, **change)) == outcome
 
 
-def test_same_version_new_iteration_same_pr_and_sha_history(store):
+def test_same_version_new_iteration_new_pr_and_sha_history(store):
     review(store)
     assert move(store, 'rejected', 'pr:closed', evidence=pr(store, pr_state='closed')) == 'applied'
     first = store.get('owner/repo', 1)['current_iteration_id']
@@ -139,10 +139,11 @@ def test_same_version_new_iteration_same_pr_and_sha_history(store):
     assert row['version'] == 1 and row['current_iteration_id'] != first
     assert [r[0] for r in store.db.execute('SELECT iteration_number FROM task_iterations ORDER BY iteration_number')] == [1, 2]
     execution = ExecutionStore(store)
-    attempt = execution.reserve(row, 'feature', 1, store.guard('owner/repo', 1)['observation_token'])
+    attempt = execution.reserve(row, 'feature-2', 1, store.guard('owner/repo', 1)['observation_token'])
     assert attempt
-    assert move(store, 'review', 'pr:reopened', evidence=pr(store)) == 'applied'
-    assert store.db.execute('SELECT count(*) FROM task_pull_requests').fetchone()[0] == 1
+    assert move(store, 'review', 'pr:reopened', evidence=pr(store)) == 'conflict'
+    assert move(store, 'review', 'pr:new', evidence=replace(pr(store), pr_id=302, pr_number=3, head='feature-2')) == 'applied'
+    assert store.db.execute('SELECT count(*) FROM task_pull_requests').fetchone()[0] == 2
     assert store.db.execute('SELECT count(*) FROM iteration_pr_history').fetchone()[0] == 3
     assert store.db.execute('SELECT count(*) FROM attempts').fetchone()[0] == 2
 

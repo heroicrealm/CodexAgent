@@ -23,7 +23,7 @@ def content_hash(issue):
 
 class Store:
     def __init__(self, path):
-        from .migrations import prepare, initialize, VERSION
+        from .migrations import prepare, initialize, upgrade604, VERSION
         prepare(path)
         self.db = sqlite3.connect(path, timeout=30)
         os.chmod(path, 0o600)
@@ -31,11 +31,12 @@ class Store:
         self.db.execute('PRAGMA foreign_keys=ON')
         self.db.execute('PRAGMA journal_mode=WAL')
         try:
+            upgrade604(self.db)
             with self.db:
                 self.db.execute('BEGIN IMMEDIATE')
                 initialize(self.db)
                 self.db.execute('CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY)')
-                self.db.executemany('INSERT OR IGNORE INTO schema_migrations VALUES(?)', [(1,), (2,), (3,), (VERSION,)])
+                self.db.executemany('INSERT OR IGNORE INTO schema_migrations VALUES(?)', [(1,), (2,), (3,), (VERSION,), (604,)])
         except Exception:
             self.db.close()
             raise
@@ -76,9 +77,9 @@ class Store:
                                    (repository.casefold(),)).fetchall()
         return self.db.execute('SELECT * FROM tasks ORDER BY repository,number').fetchall()
 
-    def decide(self, repository, number, version, action, source='cli', event_id=None, valid=True, expected_synced_at=None, expected_observation=None):
+    def decide(self, repository, number, version, action, source='cli', event_id=None, valid=True, expected_synced_at=None, expected_observation=None, expected_state=None, evidence=None, actor=None):
         """First committed decision wins, including across independent connections."""
-        if action not in ('approve', 'reject') or source not in ('cli', 'github'):
+        if action not in ('approve', 'reject', 'cancel') or source not in ('cli', 'github'):
             raise ValueError('Invalid decision')
         repository = repository.casefold()
         with self.db:
@@ -87,21 +88,27 @@ class Store:
                     'SELECT 1 FROM decisions WHERE repository=? AND event_id=?', (repository, str(event_id))).fetchone():
                 return 'duplicate'
             row = self.get(repository, number)
+            valid = valid and (expected_state is None or (row is not None and row['state'] == expected_state))
             valid = valid and (expected_synced_at is None or (row is not None and row['synced_at'] == expected_synced_at))
             blocked = self.blocked(repository, number, action) if source == 'github' else None
             valid = valid and not (blocked is not None and blocked['event_id'] is None)
             guard = self.guard(repository, number)
             valid = valid and (expected_observation is None or (guard is not None and guard['observation_token'] == expected_observation))
             result = 'unverified' if not valid else 'conflict'
-            if valid and row and row['version'] == version and row['available'] and row['state'] == 'discovered':
-                state = 'pending' if action == 'approve' else 'rejected'
+            repeat = (row is not None and row['state'] == 'rejected'
+                      and action in ('approve', 'cancel') and expected_state == 'rejected')
+            if (valid and row and row['version'] == version and row['available']
+                    and ((row['state'] == 'discovered' and action != 'cancel') or repeat)):
+                state = {'approve': 'pending', 'reject': 'rejected', 'cancel': 'cancelled'}[action]
                 self._set_state(row, state, version if action == 'approve' else None)
                 iteration = self._new_iteration(row, version) if action == 'approve' else row['current_iteration_id']
                 self._record_transition(row, state, f'{repository}:event:{event_id}' if event_id is not None else 'cli:' + uuid.uuid4().hex,
-                                        'verified_github_operator' if source == 'github' else 'local_operator', iteration_id=iteration)
+                                        actor or ('verified_github_operator' if source == 'github' else 'local_operator'), evidence=evidence, iteration_id=iteration)
+                if action == 'cancel':
+                    self.db.execute('INSERT INTO cancellations(issue_id) VALUES(?)', (row['issue_id'],))
                 self._history(repository, number, version, action, row['snapshot'], now())
                 result = 'applied'
-            elif valid and row and row['version'] == version and row['state'] == ('pending' if action == 'approve' else 'rejected'):
+            elif valid and row and row['version'] == version and row['state'] == {'approve': 'pending', 'reject': 'rejected', 'cancel': 'cancelled'}[action]:
                 result = 'already_applied'
             receipt = self.db.execute('INSERT INTO decisions(repository,number,version,source,action,result,created_at,event_id) VALUES(?,?,?,?,?,?,?,?)',
                             (repository, number, version, source, action, result, now(),
@@ -213,9 +220,10 @@ class Store:
                     self.db.execute('UPDATE tasks SET repository_id=? WHERE repository=? AND number=?',
                                     (repository_id, repository, number))
                 changed = row['content_hash'] != digest
-                if row['state'] in MUTABLE:
+                if row['state'] in (*MUTABLE, 'rejected'):
                     version = row['version'] + int(changed)
-                    state = 'discovered' if changed or not row['available'] or row['state'] == 'revoked' else row['state']
+                    state = ('rejected' if row['state'] == 'rejected' else
+                             'discovered' if changed or not row['available'] or row['state'] == 'revoked' else row['state'])
                     approved = row['approved_version'] if state == 'pending' else None
                     self.db.execute('''UPDATE tasks SET snapshot=?,observed=?,content_hash=?,version=?,
                         state=?,available=1,approved_version=?,synced_at=? WHERE repository=? AND number=?''',

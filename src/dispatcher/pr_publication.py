@@ -123,7 +123,7 @@ class PullRequestPublisher:
             if not isinstance(pr, dict):
                 raise GitHubError(kind='invalid_response')
             stamp = self.adapter.response_date
-            linked = self.store.db.execute('SELECT * FROM task_pull_requests WHERE issue_id=?', (task['issue_id'],)).fetchone()
+            linked = self.store.db.execute('SELECT * FROM task_pull_requests WHERE pr_id=?', (pr.get('id'),)).fetchone()
             owned = marker in (pr.get('body') or '') or (linked and linked['pr_id'] == pr.get('id'))
             if (not owned or not rest_id(pr.get('id')) or pr.get('number') != found['number'] or pr.get('state') != 'open'
                     or pr.get('draft') is not False or pr.get('merged') is not False

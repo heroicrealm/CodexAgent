@@ -171,8 +171,16 @@ def transition(store, *, repository, number, expected_state, version, iteration_
                 return Outcome.MISSING_EVIDENCE
             if target == 'rejected' and (evidence.pr_state != 'closed' or evidence.merged is not False or evidence.merged_at):
                 return Outcome.MISSING_EVIDENCE
-            linked = db.execute('SELECT * FROM task_pull_requests WHERE issue_id=? OR pr_id=? OR (repository_id=? AND pr_number=?)',
-                                (row['issue_id'], evidence.pr_id, row['repository_id'], evidence.pr_number)).fetchall()
+            linked = db.execute('SELECT * FROM task_pull_requests WHERE pr_id=? OR (repository_id=? AND pr_number=?)',
+                                (evidence.pr_id, row['repository_id'], evidence.pr_number)).fetchall()
+            if target == 'review' and linked and db.execute(
+                    'SELECT 1 FROM iteration_pr_history WHERE pr_id=? AND iteration_id!=?',
+                    (evidence.pr_id, iteration_id)).fetchone():
+                return Outcome.CONFLICT
+            if target == 'review' and db.execute(
+                    'SELECT 1 FROM task_pull_requests WHERE issue_id=? AND head=? AND pr_id!=?',
+                    (row['issue_id'], evidence.head, evidence.pr_id)).fetchone():
+                return Outcome.CONFLICT
             if linked:
                 if len(linked) != 1 or any(linked[0][k] != v for k, v in {
                         'issue_id': row['issue_id'], 'pr_id': evidence.pr_id, 'repository_id': row['repository_id'],
@@ -180,6 +188,10 @@ def transition(store, *, repository, number, expected_state, version, iteration_
                     return Outcome.CONFLICT
             elif target != 'review':
                 return Outcome.MISSING_EVIDENCE
+            if target != 'review' and not db.execute(
+                    'SELECT 1 FROM iteration_pr_history WHERE iteration_id=? AND pr_id=?',
+                    (iteration_id, evidence.pr_id)).fetchone():
+                return Outcome.CONFLICT
             db.execute('''INSERT INTO task_pull_requests VALUES(?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(pr_id) DO UPDATE SET head_sha=excluded.head_sha,state=excluded.state,merged_at=excluded.merged_at''',
                 (evidence.pr_id, row['issue_id'], row['repository_id'], evidence.pr_number,
@@ -196,6 +208,8 @@ def transition(store, *, repository, number, expected_state, version, iteration_
         if not store._set_state(row, target, version if target == 'pending' else row['approved_version'],
                                 current_iteration=iteration_id):
             raise RuntimeError('Transition CAS failed inside serialized transaction')
+        if target == 'cancelled':
+            db.execute('INSERT INTO cancellations(issue_id) VALUES(?)', (row['issue_id'],))
         store._record_transition(row, target, event_key, authority.actor, dict(asdict(evidence), expected_iteration_id=request_iteration), iteration_id)
         store._history(repository.casefold(), number, version, target, row['snapshot'], stamp)
         return Outcome.APPLIED
