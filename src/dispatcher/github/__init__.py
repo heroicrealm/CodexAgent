@@ -3,11 +3,25 @@ import json
 import re
 import subprocess
 import time
+from email.utils import parsedate_to_datetime
 from urllib.parse import urlencode
 
 
 class GitHubError(RuntimeError):
-    pass
+    """Only structured, allowlisted metadata may reach operator diagnostics."""
+    def __init__(self, message='GitHub request failed', *, status=None, kind='request'):
+        super().__init__(message)
+        self.status = status if type(status) is int and 100 <= status <= 599 else None
+        self.kind = kind
+
+    def safe_reason(self):
+        meanings = {401: 'authentication failed', 403: 'forbidden (permissions, policy or rate limit)',
+                    404: 'resource not found or access denied', 422: 'request validation failed',
+                    429: 'rate limited'}
+        if self.status is not None:
+            return f'HTTP {self.status}: ' + meanings.get(self.status, 'GitHub request failed')
+        return {'timeout': 'request timed out', 'transport': 'GitHub transport unavailable',
+                'invalid_response': 'invalid GitHub response'}.get(self.kind, 'GitHub request failed')
 
 
 def valid_branch(value):
@@ -20,26 +34,39 @@ def valid_branch(value):
 class Adapter:
     def __init__(self, executable='gh', run=subprocess.run, sleep=time.sleep, attempts=3):
         self.executable, self.run, self.sleep, self.attempts = executable, run, sleep, attempts
+        self.response_date = None
 
     def request(self, endpoint):
+        last_status, last_kind = None, "transport"
         for attempt in range(self.attempts):
+            self.response_date = None
             try:
-                response = self.run([self.executable, 'api', '--method', 'GET', '--include', endpoint],
+                response = self.run([self.executable, 'api', '--method', 'GET', '--include', '-H', 'Cache-Control: no-cache', endpoint],
                                     capture_output=True, text=True, timeout=30, shell=False)
                 raw = response.stdout or ''
                 headers, separator, body = raw.replace('\r\n', '\n').partition('\n\n')
                 if not separator or not headers.startswith('HTTP/'):
                     if response.returncode:
                         raise OSError('GitHub transport failure')
-                    raise GitHubError('Invalid GitHub response')
+                    raise GitHubError('Invalid GitHub response', kind='invalid_response')
                 status = int(headers.splitlines()[0].split()[1])
+                last_status, last_kind = status, 'http'
+                for header in headers.splitlines()[1:]:
+                    key, _, value = header.partition(':')
+                    if key.casefold() == 'date':
+                        try:
+                            stamp = parsedate_to_datetime(value.strip())
+                            if stamp.tzinfo is not None:
+                                self.response_date = stamp.isoformat()
+                        except (ValueError, TypeError, OverflowError):
+                            pass
                 if response.returncode == 0 and status == 200:
                     try:
                         return json.loads(body)
                     except ValueError:
-                        raise GitHubError('Invalid GitHub JSON') from None
+                        raise GitHubError('Invalid GitHub JSON', kind='invalid_response') from None
                 if status not in (403, 429) and status < 500:
-                    raise GitHubError('GitHub authorization or request failure')
+                    raise GitHubError('GitHub authorization or request failure', status=status)
                 delay = min(2 ** attempt, 60)
                 for line in headers.splitlines()[1:]:
                     key, _, value = line.partition(':')
@@ -51,13 +78,14 @@ class Adapter:
                             delay = max(delay, min(max(seconds, 0), 60))
                         except ValueError:
                             pass
-            except (OSError, subprocess.TimeoutExpired):
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                last_status, last_kind = None, "timeout" if isinstance(exc, subprocess.TimeoutExpired) else "transport"
                 delay = 2 ** attempt
             except (ValueError, IndexError):
-                raise GitHubError('Invalid GitHub headers') from None
+                raise GitHubError('Invalid GitHub headers', kind='invalid_response') from None
             if attempt + 1 < self.attempts:
                 self.sleep(delay)
-        raise GitHubError('GitHub unavailable after bounded retries')
+        raise GitHubError('GitHub unavailable after bounded retries', status=last_status, kind=last_kind)
 
     def fetch(self, project):
         """Fetch all open issues, including non-ready ones for safe revocation.
@@ -68,6 +96,7 @@ class Adapter:
         issues = {}
         for page in range(1, 10001):
             data = self.request(f'repos/{project.repository}/issues?' + urlencode(dict(state='open', per_page=100, page=page)))
+            observed_at = self.response_date
             if not isinstance(data, list) or len(data) > 100:
                 raise GitHubError('Invalid GitHub issue page')
             for raw in data:
@@ -97,7 +126,7 @@ class Adapter:
                     item = dict(id=raw['id'], number=number, repository=project.repository.casefold(),
                                 project_id=project.id, title=title, body=body, author=author,
                                 state=raw['state'], labels=labels, updated_at=raw['updated_at'],
-                                url=raw['html_url'], target_branch=branch)
+                                url=raw['html_url'], target_branch=branch, server_observed_at=observed_at)
                     item['eligible'] = (raw['state'] == 'open'
                         and project.task_label.casefold() in {label.casefold() for label in labels}
                         and author.casefold() in {a.casefold() for a in project.allowed_authors})
@@ -111,15 +140,23 @@ class Adapter:
         raise GitHubError('Pagination limit exceeded')
 
     def write(self, endpoint, method, payload):
-        """Bounded write. Retrying is delegated to idempotent reconciliation."""
+        """Bounded write with safe HTTP metadata, never raw gh stderr/body."""
         try:
-            reply = self.run([self.executable, 'api', '--method', method, endpoint, '--input', '-'],
+            reply = self.run([self.executable, 'api', '--method', method, '--include', endpoint, '--input', '-'],
                              input=json.dumps(payload), capture_output=True, text=True, timeout=30, shell=False)
-            if reply.returncode:
-                raise GitHubError('GitHub write failed')
-            return json.loads(reply.stdout) if reply.stdout.strip() else None
-        except (OSError, subprocess.TimeoutExpired, ValueError):
-            raise GitHubError('GitHub request failed') from None
+            headers, separator, body = (reply.stdout or '').replace('\r\n', '\n').partition('\n\n')
+            if not separator or not headers.startswith('HTTP/'):
+                raise GitHubError(kind='transport' if reply.returncode else 'invalid_response')
+            status = int(headers.splitlines()[0].split()[1])
+            if reply.returncode or not 200 <= status < 300:
+                raise GitHubError(status=status)
+            return json.loads(body) if body.strip() else None
+        except subprocess.TimeoutExpired:
+            raise GitHubError(kind='timeout') from None
+        except OSError:
+            raise GitHubError(kind='transport') from None
+        except (ValueError, IndexError):
+            raise GitHubError(kind='invalid_response') from None
 
     def pages(self, endpoint):
         result = []
@@ -147,10 +184,9 @@ class Adapter:
         Without lastEditedAt we cannot bind a label to a content version safely.
         A bot is never an authorized operator, even when its login is allowlisted.
         """
-        events = self.pages(f'repos/{project.repository}/issues/{number}/events')
         owner, repo = project.repository.split('/')
         query = ('query($owner:String!,$repo:String!,$number:Int!){repository(owner:$owner,name:$repo)'
-                 '{issue(number:$number){databaseId lastEditedAt title body author{login}}}}')
+                 '{issue(number:$number){databaseId lastEditedAt title body state author{login} labels(first:100){nodes{name} pageInfo{hasNextPage}}}}}')
         result = self.write('graphql', 'POST', dict(query=query, variables=dict(owner=owner, repo=repo, number=number)))
         try:
             if result.get('errors'):
@@ -159,8 +195,14 @@ class Adapter:
             if (not isinstance(issue['title'], str) or not isinstance(issue['body'], str)
                     or type(issue['databaseId']) is not int
                     or not isinstance(issue['author']['login'], str)
+                    or issue['state'] not in ('OPEN', 'CLOSED')
+                    or type(issue['labels']['pageInfo']['hasNextPage']) is not bool
+                    or any(not isinstance(label['name'], str) for label in issue['labels']['nodes'])
                     or (issue['lastEditedAt'] is not None and not isinstance(issue['lastEditedAt'], str))):
                 raise KeyError
+            # Read history after the content proof, covering title/ready churn
+            # between the REST snapshot and GraphQL read (including edit/revert).
+            events = self.pages(f'repos/{project.repository}/issues/{number}/events')
             return events, issue
         except (KeyError, TypeError, AttributeError):
             raise GitHubError('Cannot verify command version') from None

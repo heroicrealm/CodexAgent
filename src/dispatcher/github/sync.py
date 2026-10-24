@@ -5,7 +5,7 @@ import sys
 from dispatcher.github import Adapter, GitHubError
 from dispatcher.initialization import ready
 from dispatcher.logging import event
-from dispatcher.queue import commands
+from dispatcher.queue import commands, REASONS
 
 
 class SyncService:
@@ -13,12 +13,12 @@ class SyncService:
         self.config, self.store = config, store
         self.adapter = adapter or Adapter(config.github_executable)
 
-    def log(self, name, project):
+    def log(self, name, project, *, task=None, reason=None, action=None):
         self.config.logs.mkdir(parents=True, exist_ok=True)
-        event(self.config.logs / 'dispatcher.jsonl', name, level='WARN', project=project.id)
+        event(self.config.logs / 'dispatcher.jsonl', name, level='WARN', project=project.id, task=task, reason=reason, action=action)
 
     def poll(self):
-        result = dict(discovered=0, updated=0, unchanged=0, revoked=0, skipped_untrusted=0, errors=[], skipped=[])
+        result = dict(discovered=0, updated=0, unchanged=0, revoked=0, skipped_untrusted=0, errors=[], skipped=[], commands=[])
         for project in self.config.projects:
             if not project.enabled:
                 continue
@@ -34,11 +34,15 @@ class SyncService:
                 counts = self.store.apply(project, items, observation=observation)
                 for key, count in counts.items():
                     result[key] += count
-                try:
-                    commands(self.store, self.adapter, project, items, before, observation)
-                except GitHubError:
-                    result['errors'].append(dict(project=project.id, error='GitHub command verification failed'))
-                    self.log('command_verification_failed', project)
+                receipts = commands(self.store, self.adapter, project, items, before, observation)
+                for receipt in receipts:
+                    notify = receipt.pop('notify')
+                    result['commands'].append(dict(project=project.id, **receipt))
+                    if notify:
+                        result['errors'].append(dict(project=project.id, issue=receipt['issue'],
+                                                     error=REASONS[receipt['reason']], reason=receipt['reason'], retry=receipt['retry']))
+                        self.log('command_verification_failed', project, task=receipt['issue'],
+                                 reason=receipt['reason'], action=receipt['action'])
                 # Always reconcile, even when a command was rejected. DB is authoritative.
                 for row in self.store.queue(project.repository):
                     try:

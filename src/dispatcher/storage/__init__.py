@@ -2,6 +2,7 @@
 import hashlib
 import json
 import sqlite3
+import uuid
 from datetime import datetime, timezone
 
 
@@ -45,6 +46,14 @@ class Store:
             ''')
         with self.db:
             self.db.executescript("""
+            CREATE TABLE IF NOT EXISTS command_guards(
+                repository TEXT NOT NULL, number INTEGER NOT NULL, version INTEGER NOT NULL,
+                content_hash TEXT NOT NULL, available INTEGER NOT NULL, server_at TEXT,
+                observation_token TEXT NOT NULL, PRIMARY KEY(repository,number));
+            CREATE TABLE IF NOT EXISTS command_quarantine(
+                repository TEXT NOT NULL, number INTEGER NOT NULL, action TEXT NOT NULL,
+                server_at TEXT, event_id TEXT, reason TEXT NOT NULL,
+                PRIMARY KEY(repository,number,action));
             CREATE TABLE IF NOT EXISTS decisions(
                 id INTEGER PRIMARY KEY, repository TEXT NOT NULL, number INTEGER NOT NULL,
                 version INTEGER NOT NULL, source TEXT NOT NULL, action TEXT NOT NULL,
@@ -109,7 +118,7 @@ class Store:
                                    (repository.casefold(),)).fetchall()
         return self.db.execute('SELECT * FROM tasks ORDER BY repository,number').fetchall()
 
-    def decide(self, repository, number, version, action, source='cli', event_id=None, valid=True, expected_synced_at=None):
+    def decide(self, repository, number, version, action, source='cli', event_id=None, valid=True, expected_synced_at=None, expected_observation=None):
         """First committed decision wins, including across independent connections."""
         if action not in ('approve', 'reject') or source not in ('cli', 'github'):
             raise ValueError('Invalid decision')
@@ -121,6 +130,10 @@ class Store:
                 return 'duplicate'
             row = self.get(repository, number)
             valid = valid and (expected_synced_at is None or (row is not None and row['synced_at'] == expected_synced_at))
+            blocked = self.blocked(repository, number, action) if source == 'github' else None
+            valid = valid and not (blocked is not None and blocked['event_id'] is None)
+            guard = self.guard(repository, number)
+            valid = valid and (expected_observation is None or (guard is not None and guard['observation_token'] == expected_observation))
             result = 'unverified' if not valid else 'conflict'
             if valid and row and row['version'] == version and row['available'] and row['state'] == 'discovered':
                 state = 'pending' if action == 'approve' else 'rejected'
@@ -145,6 +158,59 @@ class Store:
                 (repository.casefold(), number, expected_version))
             return cursor.rowcount == 1
 
+    def guard(self, repository, number):
+        return self.db.execute('SELECT * FROM command_guards WHERE repository=? AND number=?',
+                               (repository.casefold(), number)).fetchone()
+
+    def quarantine(self, repository, number, action, server_at, event_id, reason):
+        """Persist a rejection; unknown events stay blocked until label absence.
+
+        Returns whether the diagnostic changed, suppressing repeated warnings.
+        """
+        repository = repository.casefold()
+        identity = str(event_id) if event_id is not None else None
+        with self.db:
+            self.db.execute('BEGIN IMMEDIATE')
+            prior = self.blocked(repository, number, action)
+            if prior:
+                if prior['event_id'] is None:
+                    return False
+                if prior['event_id'] == identity and prior['reason'] == reason:
+                    return False
+            self.db.execute('INSERT OR REPLACE INTO command_quarantine VALUES(?,?,?,?,?,?)',
+                            (repository, number, action, server_at, identity, reason))
+        return True
+
+    def blocked(self, repository, number, action):
+        return self.db.execute('SELECT * FROM command_quarantine WHERE repository=? AND number=? AND action=?',
+                               (repository.casefold(), number, action)).fetchone()
+
+    def clear_block(self, repository, number, action, server_at=None, expected_observation=None):
+        """Only a newer, current observation of absence clears an unknown event."""
+        with self.db:
+            self.db.execute('BEGIN IMMEDIATE')
+            block = self.blocked(repository, number, action)
+            if block is None:
+                return
+            guard = self.guard(repository, number)
+            if expected_observation is not None and (guard is None or guard['observation_token'] != expected_observation):
+                return
+            if block['event_id'] is None:
+                try:
+                    if server_at is None:
+                        return
+                    stamp = datetime.fromisoformat(server_at.replace('Z', '+00:00'))
+                    if block['server_at'] is None:
+                        self.db.execute('UPDATE command_quarantine SET server_at=? WHERE repository=? AND number=? AND action=?',
+                                        (server_at, repository.casefold(), number, action))
+                        return
+                    if stamp <= datetime.fromisoformat(block['server_at'].replace('Z', '+00:00')):
+                        return
+                except (ValueError, TypeError):
+                    return
+            self.db.execute('DELETE FROM command_quarantine WHERE repository=? AND number=? AND action=?',
+                            (repository.casefold(), number, action))
+
     def apply(self, project, issues, *, observation=None):
         counts = dict(discovered=0, updated=0, unchanged=0, revoked=0, skipped_untrusted=0)
         repository, stamp = project.repository.casefold(), now()
@@ -155,13 +221,14 @@ class Store:
                 number = issue['number']
                 seen.add(number)
                 row = self.get(repository, number)
+                persisted = {key: value for key, value in issue.items() if key != 'server_observed_at'}
                 if not issue['eligible']:
                     if issue['author'].casefold() not in {a.casefold() for a in project.allowed_authors}:
                         counts['skipped_untrusted'] += 1
                     if row:
-                        self._revoke(row, stamp, json.dumps(issue), counts)
+                        self._revoke(row, stamp, json.dumps(persisted), counts)
                     continue
-                snapshot, digest = json.dumps(issue, sort_keys=True), content_hash(issue)
+                snapshot, digest = json.dumps(persisted, sort_keys=True), content_hash(issue)
                 if row is None:
                     self.db.execute('INSERT INTO tasks VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
                         (repository, number, issue['id'], project.id, 'discovered', 1, 1, digest,
@@ -189,8 +256,22 @@ class Store:
             for row in self.db.execute('SELECT * FROM tasks WHERE repository=?', (repository,)).fetchall():
                 if row['number'] not in seen:
                     self._revoke(row, stamp, row['observed'], counts)
-            if observation is not None:
-                observation.update({row['number']: dict(row) for row in self.queue(repository)})
+            by_number = {issue['number']: issue for issue in issues}
+            for current in self.queue(repository):
+                prior = self.guard(repository, current['number'])
+                raw = by_number.get(current['number'], {})
+                reset = (not prior or prior['version'] != current['version']
+                         or prior['content_hash'] != current['content_hash']
+                         or prior['available'] != current['available'])
+                server_at = None if reset else prior['server_at']
+                if current['available'] and server_at is None:
+                    server_at = raw.get('server_observed_at')
+                token = uuid.uuid4().hex
+                self.db.execute('INSERT OR REPLACE INTO command_guards VALUES(?,?,?,?,?,?,?)',
+                                (repository, current['number'], current['version'], current['content_hash'],
+                                 current['available'], server_at, token))
+                if observation is not None:
+                    observation[current['number']] = dict(current, observation_token=token)
         return counts
 
     def _history(self, repository, number, version, event, snapshot, stamp):

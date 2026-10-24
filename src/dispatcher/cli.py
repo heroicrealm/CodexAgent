@@ -37,9 +37,14 @@ def main(argv=None):
         from dispatcher.github import Adapter
         from dispatcher.storage import Store
         if args.command == 'init':
-            results = initialize(config, args.update)
-            for project, success in results:
-                print(f'{project}: {"success" if success else "fail; check GitHub access, YAML permissions/concurrent edits and rerun init"}')
+            reports = []
+            results = initialize(config, args.update, reports=reports)
+            for report in reports:
+                if report['success']:
+                    print(f'{report["project"]}: success')
+                else:
+                    persistence = 'failure saved in YAML' if report['saved'] else 'YAML save not confirmed'
+                    print(f'{report["project"]}: fail: {report["message"]} ({persistence})')
             return int(any(not success for _, success in results))
         if args.command == 'doctor':
             checks = diagnose(config)
@@ -73,6 +78,9 @@ def main(argv=None):
                     value = dict(row)
                     value['decisions'] = [dict(r) for r in store.db.execute(
                         'SELECT * FROM decisions WHERE repository=? AND number=? ORDER BY id',
+                        (project.repository.casefold(), args.issue))]
+                    value['command_diagnostics'] = [dict(r) for r in store.db.execute(
+                        'SELECT action,event_id,reason FROM command_quarantine WHERE repository=? AND number=?',
                         (project.repository.casefold(), args.issue))]
                     print(json.dumps(value))
                 else:

@@ -154,7 +154,7 @@ projects:
         config = load(self.path)
         run = Mock(return_value=subprocess.CompletedProcess([], 0, stdout='SECRET'))
         checks = diagnose(config, which=lambda _: '/stub', run=run)
-        self.assertTrue(any('GitHub access/labels' in message for _, message in checks))
+        self.assertTrue(any('repository read access cannot be verified' in message for _, message in checks))
         run.assert_any_call(['gh', 'auth', 'status'], capture_output=True, timeout=15)
         for binary in ('git', 'gh', 'codex'):
             run.assert_any_call([binary, '--version'], capture_output=True, timeout=15)
