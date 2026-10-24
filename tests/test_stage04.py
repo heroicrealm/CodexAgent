@@ -453,7 +453,7 @@ def test_outbox_uncertain_write_recovery_and_migration(env):
     try:
         execution = ExecutionStore(store)
         ExecutionStore(store)
-        assert [r[0] for r in store.db.execute('SELECT version FROM schema_migrations ORDER BY version')] == [1,2,3]
+        assert [r[0] for r in store.db.execute('SELECT version FROM schema_migrations ORDER BY version')] == [1,2,3,602]
         assert store.get(project.repository,1)['approved_version'] == 1
         api.pages.return_value = [dict(id=456,body=body)]
         TaskResultPublisher(execution,api).flush()
@@ -551,7 +551,8 @@ state=json.loads(path.read_text())
 method=sys.argv[sys.argv.index('--method')+1]
 endpoint=next(arg for arg in sys.argv if arg.startswith('repos/'))
 if method=='GET':
-    if '/comments' in endpoint: result=state['comments']
+    if endpoint=='repos/owner/repo': result=dict(id=11,full_name='owner/repo')
+    elif '/comments' in endpoint: result=state['comments']
     elif '/labels' in endpoint: result=state['issue']['labels']
     else: result=[state['issue']]
 else:
@@ -722,7 +723,7 @@ def test_scheduler_project_round_robin(env):
     git(repo,'config','user.name','Test')
     git(repo,'config','user.email','test@example.invalid')
     first_items=[issue(project),issue(project,id=2,number=2)]
-    second_items=[issue(second)]
+    second_items=[issue(second,id=3)]
     api=adapter([])
     api.fetch.side_effect=lambda p: first_items if p.id==project.id else second_items
     dispatcher=Dispatcher(config,Lifecycle(),api)

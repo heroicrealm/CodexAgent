@@ -238,6 +238,8 @@ def serve(config):
         raise RuntimeError('No initialized enabled projects; run init')
     os.umask(0o077)
     root = prepare(config)
+    from dispatcher.storage.migrations import prepare as migrate
+    migrate(root / 'tasks.sqlite3')
     fd = lock(root)
     if fd is None:
         return

@@ -23,72 +23,22 @@ def content_hash(issue):
 
 class Store:
     def __init__(self, path):
+        from .migrations import prepare, initialize, VERSION
+        prepare(path)
         self.db = sqlite3.connect(path, timeout=30)
         os.chmod(path, 0o600)
         self.db.row_factory = sqlite3.Row
         self.db.execute('PRAGMA foreign_keys=ON')
         self.db.execute('PRAGMA journal_mode=WAL')
-        with self.db:
-            self.db.executescript('''
-            CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY);
-            CREATE TABLE IF NOT EXISTS tasks(
-                repository TEXT NOT NULL, number INTEGER NOT NULL, issue_id INTEGER NOT NULL,
-                project_id TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'discovered',
-                available INTEGER NOT NULL CHECK(available IN (0,1)),
-                version INTEGER NOT NULL, content_hash TEXT NOT NULL, snapshot TEXT NOT NULL,
-                observed TEXT NOT NULL, approved_version INTEGER,
-                created_at TEXT NOT NULL, synced_at TEXT NOT NULL,
-                PRIMARY KEY(repository, number));
-            CREATE TABLE IF NOT EXISTS history(
-                id INTEGER PRIMARY KEY, repository TEXT NOT NULL, number INTEGER NOT NULL,
-                version INTEGER NOT NULL, event TEXT NOT NULL, snapshot TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                FOREIGN KEY(repository,number) REFERENCES tasks(repository,number));
-            INSERT OR IGNORE INTO schema_migrations VALUES(1);
-            ''')
-        with self.db:
-            self.db.executescript("""
-            CREATE TABLE IF NOT EXISTS command_guards(
-                repository TEXT NOT NULL, number INTEGER NOT NULL, version INTEGER NOT NULL,
-                content_hash TEXT NOT NULL, available INTEGER NOT NULL, server_at TEXT,
-                observation_token TEXT NOT NULL, PRIMARY KEY(repository,number));
-            CREATE TABLE IF NOT EXISTS command_quarantine(
-                repository TEXT NOT NULL, number INTEGER NOT NULL, action TEXT NOT NULL,
-                server_at TEXT, event_id TEXT, reason TEXT NOT NULL,
-                PRIMARY KEY(repository,number,action));
-            CREATE TABLE IF NOT EXISTS decisions(
-                id INTEGER PRIMARY KEY, repository TEXT NOT NULL, number INTEGER NOT NULL,
-                version INTEGER NOT NULL, source TEXT NOT NULL, action TEXT NOT NULL,
-                result TEXT NOT NULL, created_at TEXT NOT NULL, event_id TEXT,
-                UNIQUE(repository,event_id));
-            """)
         try:
-            self._migrate_states()
-        except sqlite3.Error:
+            with self.db:
+                self.db.execute('BEGIN IMMEDIATE')
+                initialize(self.db)
+                self.db.execute('CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY)')
+                self.db.executemany('INSERT OR IGNORE INTO schema_migrations VALUES(?)', [(1,), (2,), (3,), (VERSION,)])
+        except Exception:
             self.db.close()
             raise
-
-    def _migrate_states(self):
-        """Version 2: pending means a current, available, confirmed snapshot.
-
-        Serialize the marker check with conversion so concurrent opens cannot
-        repeat migration. Execution snapshots, versions and history stay intact.
-        """
-        with self.db:
-            self.db.execute('BEGIN IMMEDIATE')
-            if self.db.execute('SELECT 1 FROM schema_migrations WHERE version=2').fetchone():
-                return
-            self.db.execute('''UPDATE tasks SET
-                state=CASE
-                    WHEN available=0 THEN 'revoked'
-                    WHEN approved_version=version THEN 'pending'
-                    ELSE 'discovered' END,
-                approved_version=CASE
-                    WHEN available=1 AND approved_version=version THEN approved_version
-                    ELSE NULL END
-                WHERE state IN ('approved','pending')''')
-            self.db.execute("UPDATE tasks SET approved_version=NULL WHERE state IN ('discovered','revoked')")
-            self.db.execute('INSERT INTO schema_migrations VALUES(2)')
 
     def close(self):
         self.db.close()
@@ -106,13 +56,19 @@ class Store:
         repository = repository.casefold()
         with self.db:
             self.db.execute('BEGIN IMMEDIATE')
-            cursor = self.db.execute("""UPDATE tasks SET state='pending',approved_version=version
-                WHERE repository=? AND number=? AND version=? AND available=1
-                AND state='discovered'""", (repository, number, expected_version))
-            if cursor.rowcount:
+            before = self.get(repository, number)
+            applied = (before is not None and before['version'] == expected_version
+                       and before['available'] and before['state'] == 'discovered'
+                       and self._set_state(before, 'pending', expected_version))
+            if applied:
                 row = self.get(repository, number)
+                key = 'confirm:' + uuid.uuid4().hex
+                receipt = self.db.execute("INSERT INTO decisions(repository,number,version,source,action,result,created_at,event_id) VALUES(?,?,?,'internal','approve','applied',?,?)",
+                                          (repository, number, expected_version, now(), key))
+                iteration = self._new_iteration(row, expected_version, receipt.lastrowid)
+                self._record_transition(before, 'pending', key, 'local_operator', iteration_id=iteration)
                 self._history(repository, number, row['version'], 'confirmed', row['snapshot'], now())
-            return cursor.rowcount == 1
+            return bool(applied)
 
     def queue(self, repository=None):
         if repository:
@@ -139,15 +95,19 @@ class Store:
             result = 'unverified' if not valid else 'conflict'
             if valid and row and row['version'] == version and row['available'] and row['state'] == 'discovered':
                 state = 'pending' if action == 'approve' else 'rejected'
-                self.db.execute('UPDATE tasks SET state=?,approved_version=? WHERE repository=? AND number=?',
-                                (state, version if action == 'approve' else None, repository, number))
+                self._set_state(row, state, version if action == 'approve' else None)
+                iteration = self._new_iteration(row, version) if action == 'approve' else row['current_iteration_id']
+                self._record_transition(row, state, f'{repository}:event:{event_id}' if event_id is not None else 'cli:' + uuid.uuid4().hex,
+                                        'verified_github_operator' if source == 'github' else 'local_operator', iteration_id=iteration)
                 self._history(repository, number, version, action, row['snapshot'], now())
                 result = 'applied'
             elif valid and row and row['version'] == version and row['state'] == ('pending' if action == 'approve' else 'rejected'):
                 result = 'already_applied'
-            self.db.execute('INSERT INTO decisions(repository,number,version,source,action,result,created_at,event_id) VALUES(?,?,?,?,?,?,?,?)',
+            receipt = self.db.execute('INSERT INTO decisions(repository,number,version,source,action,result,created_at,event_id) VALUES(?,?,?,?,?,?,?,?)',
                             (repository, number, version, source, action, result, now(),
                              str(event_id) if event_id is not None else None))
+            if result == 'applied' and action == 'approve':
+                self.db.execute('UPDATE task_iterations SET decision_id=? WHERE iteration_id=?', (receipt.lastrowid, iteration))
             return result
 
     def reset_confirmation(self, repository, number, expected_version):
@@ -220,7 +180,13 @@ class Store:
         with self.db:
             self.db.execute('BEGIN IMMEDIATE')
             for issue in issues:
+                from .transitions import rest_id
                 number = issue['number']
+                if not rest_id(issue['id']) or not rest_id(number) or (issue.get('repository_id') is not None and not rest_id(issue['repository_id'])):
+                    raise sqlite3.IntegrityError('Unresolved GitHub identity')
+                if issue.get('repository_id') is not None and self.db.execute(
+                        'SELECT 1 FROM tasks WHERE repository_id=? AND repository!=?', (issue['repository_id'], repository)).fetchone():
+                    raise sqlite3.IntegrityError('Repository identity conflict')
                 seen.add(number)
                 row = self.get(repository, number)
                 persisted = {key: value for key, value in issue.items() if key != 'server_observed_at'}
@@ -232,12 +198,20 @@ class Store:
                     continue
                 snapshot, digest = json.dumps(persisted, sort_keys=True), content_hash(issue)
                 if row is None:
-                    self.db.execute('INSERT INTO tasks VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                    self.db.execute('INSERT INTO tasks(repository,number,issue_id,project_id,state,available,version,content_hash,snapshot,observed,approved_version,created_at,synced_at,repository_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
                         (repository, number, issue['id'], project.id, 'discovered', 1, 1, digest,
-                         snapshot, snapshot, None, stamp, stamp))
+                         snapshot, snapshot, None, stamp, stamp, issue.get("repository_id")))
                     self._history(repository, number, 1, 'discovered', snapshot, stamp)
                     counts['discovered'] += 1
                     continue
+                if row['issue_id'] != issue['id']:
+                    raise sqlite3.IntegrityError('GitHub issue identity conflict')
+                repository_id = issue.get('repository_id')
+                if repository_id is not None:
+                    if row['repository_id'] not in (None, repository_id):
+                        raise sqlite3.IntegrityError('GitHub repository identity conflict')
+                    self.db.execute('UPDATE tasks SET repository_id=? WHERE repository=? AND number=?',
+                                    (repository_id, repository, number))
                 changed = row['content_hash'] != digest
                 if row['state'] in MUTABLE:
                     version = row['version'] + int(changed)
@@ -289,3 +263,47 @@ class Store:
         if row['available']:
             self._history(row['repository'], row['number'], row['version'], 'revoked', observed, stamp)
             counts['revoked'] += 1
+
+    def _new_iteration(self, row, version, decision_id=None):
+        number = self.db.execute('SELECT COALESCE(MAX(iteration_number),0)+1 FROM task_iterations WHERE issue_id=?',
+                                 (row['issue_id'],)).fetchone()[0]
+        cursor = self.db.execute('INSERT INTO task_iterations(issue_id,iteration_number,approved_version,decision_id,created_at) VALUES(?,?,?,?,?)',
+                                (row['issue_id'], number, version, decision_id, now()))
+        self.db.execute('UPDATE tasks SET current_iteration_id=? WHERE issue_id=?', (cursor.lastrowid, row['issue_id']))
+        return cursor.lastrowid
+
+    def transition(self, **request):
+        from .transitions import transition
+        return transition(self, **request)
+
+    def _set_state(self, row, target, approved_version, *, current_iteration=None):
+        """Shared CAS primitive; caller verifies authority/evidence and journals atomically."""
+        if row is None or row['state'] in ('done', 'cancelled'):
+            return False
+        expected_iteration = row['current_iteration_id'] if current_iteration is None else current_iteration
+        cursor = self.db.execute("""UPDATE tasks SET state=?,approved_version=?
+            WHERE issue_id=? AND state=? AND version=? AND current_iteration_id IS ?""",
+            (target, approved_version, row['issue_id'], row['state'], row['version'], expected_iteration))
+        return cursor.rowcount == 1
+
+    def _record_transition(self, row, target, event_key, actor, evidence=None, iteration_id=None):
+        """Shared transactional journal for legacy and guarded runtime paths."""
+        self.db.execute('INSERT INTO task_transitions VALUES(?,?,?,?,?,?,?,?,?)',
+                        (event_key, row['issue_id'], actor, row['state'], target, row['version'],
+                         iteration_id if iteration_id is not None else row['current_iteration_id'],
+                         json.dumps(evidence or {}, sort_keys=True), now()))
+
+    def publication(self, operation_key, iteration_id, phase='intent', outcome='pending', *, retry=False):
+        """Persist publication progress without reserving or starting Codex."""
+        with self.db:
+            self.db.execute('BEGIN IMMEDIATE')
+            prior = self.db.execute('SELECT * FROM publication_operations WHERE operation_key=?', (operation_key,)).fetchone()
+            if prior and prior['iteration_id'] != iteration_id:
+                return 'conflict'
+            if prior and prior['outcome'] == 'completed':
+                return 'already_applied'
+            self.db.execute("""INSERT INTO publication_operations VALUES(?,?,?,?,?,?)
+                ON CONFLICT(operation_key) DO UPDATE SET phase=excluded.phase,outcome=excluded.outcome,
+                retry_count=publication_operations.retry_count+?,updated_at=excluded.updated_at""",
+                (operation_key, iteration_id, phase, outcome, 0, now(), int(retry)))
+            return 'applied'
