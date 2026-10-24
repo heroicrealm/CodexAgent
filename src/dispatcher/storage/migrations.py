@@ -35,15 +35,15 @@ def prepare(path):
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 raise MigrationBusy('Schema migration requires a stopped dispatcher') from None
-            # Serialize migration opens separately from normal application transactions.
-            db.execute('BEGIN IMMEDIATE')
+            # Recheck under the workspace lock: another opener may have
+            # completed the migration since our initial schema read.
             if db.execute("SELECT 1 FROM sqlite_master WHERE name='schema_migrations'").fetchone() and db.execute(
                     'SELECT 1 FROM schema_migrations WHERE version=?', (VERSION,)).fetchone():
-                db.rollback()
                 return
             backup = path.with_name(path.name + '.pre-602-' + uuid.uuid4().hex + '.bak')
-            # A separate reader sees the complete committed pre-migration database,
-            # including WAL pages, while this writer prevents other writes.
+            # No SQLite write transaction may be held during backup. The
+            # workspace lock excludes the dispatcher and other migrators, while
+            # SQLite backup supplies a consistent snapshot including WAL pages.
             backup_fd = os.open(backup, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
             os.close(backup_fd)
             with closing(sqlite3.connect(path)) as source, closing(sqlite3.connect(backup)) as target:
@@ -57,6 +57,13 @@ def prepare(path):
                 os.fsync(directory_fd)
             finally:
                 os.close(directory_fd)
+            # Reserve the writer only after the backup is verified and durable.
+            # DDL, reset, validation and the marker remain one transaction.
+            db.execute('BEGIN IMMEDIATE')
+            if db.execute("SELECT 1 FROM sqlite_master WHERE name='schema_migrations'").fetchone() and db.execute(
+                    'SELECT 1 FROM schema_migrations WHERE version=?', (VERSION,)).fetchone():
+                db.rollback()
+                return
             for name in ('result_outbox', 'attempts', 'history', 'decisions', 'command_guards',
                          'command_quarantine', 'quota_observation', 'tasks'):
                 db.execute(f'DROP TABLE IF EXISTS {name}')
