@@ -45,15 +45,17 @@ def test_narrow_unicode_table(monkeypatch, columns):
     out = io.StringIO()
     render_queue([task('Очень длинный 中文 e\u0301 🚀' * 30), dict(task(), number=2)],
                  {'o/r': 'проект'}, stream=out)
-    assert len(out.getvalue().splitlines()) == 3
-    assert all(width(line) <= max(7, columns) for line in out.getvalue().splitlines())
+    assert len(out.getvalue().splitlines()) == 5
+    assert all(width(line) <= max(17, columns) for line in out.getvalue().splitlines())
     assert '\033' not in out.getvalue()
 
 
 def test_empty():
     out = io.StringIO()
     render_queue([], {}, stream=out)
-    assert out.getvalue() == 'Queue is empty.\n'
+    lines = out.getvalue().splitlines()
+    assert lines[0].startswith('┌') and lines[-1].endswith('┘')
+    assert '│ Queue is empty. │' in lines
 
 
 @pytest.mark.parametrize('raw', [None, 'broken', '[]', 'null', '{}', '{"body": 42}'])
@@ -72,7 +74,7 @@ def test_complete_body_and_sections():
     out = io.StringIO()
     render_show(row, stream=out)
     output = out.getvalue()
-    assert json.loads(row['snapshot'])['body'] in output
+    assert json.loads(row['snapshot'])['body'] in unframe(output)
     for text in ('approve', 'stale_version', 'abc', 'available', 'published=1'):
         assert text in output
     assert 'secret' not in output
@@ -89,7 +91,7 @@ def test_cli_offline_and_configured_projects(unicode_task, monkeypatch, capsys):
     config, item, _ = unicode_task
     monkeypatch.setattr('dispatcher.github.Adapter.__init__', lambda *_: pytest.fail('network adapter'))
     assert main(['--config', str(config.source), 'show', 'ru-project', '1']) == 0
-    assert item['body'] in capsys.readouterr().out
+    assert item['body'] in unframe(capsys.readouterr().out)
     store = Store(config.workspace / '.runtime/tasks.sqlite3')
     # Add a repository absent from configuration; preserve Store ordering.
     with store.db:
@@ -135,6 +137,109 @@ def test_queue_multiple_projects_order(monkeypatch):
     out = io.StringIO()
     render_queue(rows, {'a/repo': 'alpha', 'b/repo': 'beta'}, stream=out)
     lines = out.getvalue().splitlines()
-    assert '#2' in lines[1] and 'alpha' in lines[1]
-    assert '#10' in lines[2] and 'Второй' in lines[2]
-    assert '#1' in lines[3] and 'beta' in lines[3]
+    assert '#2' in lines[2] and 'alpha' in lines[2]
+    assert '#10' in lines[3] and 'Второй' in lines[3]
+    assert '#1' in lines[4] and 'beta' in lines[4]
+
+
+def unframe(output):
+    return '\n'.join(line[2:-2].rstrip() for line in output.splitlines()
+                     if line.startswith('│'))
+
+
+def test_queue_single_frame(monkeypatch):
+    monkeypatch.setenv('COLUMNS', '100')
+    out = io.StringIO()
+    render_queue([task(), task()], {'o/r': 'local'}, stream=out)
+    lines = out.getvalue().splitlines()
+    assert lines[0].startswith('┌') and lines[0].endswith('┐')
+    assert lines[-1].startswith('└') and lines[-1].endswith('┘')
+    assert lines[0].count('┬') == lines[-1].count('┴') == 3
+    assert all(line.startswith('│') and line.endswith('│') and line.count('│') == 5
+               for line in lines[1:-1])
+    assert len({width(line) for line in lines}) == 1
+
+
+@pytest.mark.parametrize('columns', [1, 6, 10, 25, 100])
+def test_show_four_sections_and_lossless_wrap(monkeypatch, columns):
+    monkeypatch.setenv('COLUMNS', str(columns))
+    body = '# Заголовок\n\n' + '中文 e\u0301 🚀 текст ' * 30 + '\n\nend\n'
+    out = io.StringIO()
+    render_show(task(body=body), stream=out)
+    lines = out.getvalue().splitlines()
+    assert lines[0].startswith('┌') and lines[0].endswith('┐')
+    assert lines[-1].startswith('└') and lines[-1].endswith('┘')
+    separators = [i for i, line in enumerate(lines) if line.startswith('├')]
+    assert len(separators) == 3
+    assert all(line.endswith('┤') for line in lines if line.startswith('├'))
+    assert len({width(line) for line in lines}) == 1
+    assert all(width(line) <= max(6, columns) for line in lines)
+    # Compare content without frame padding; whitespace-only logical lines survive.
+    body_rows = lines[separators[1] + 1:separators[2]]
+    recovered = ''.join(line[2:-2].rstrip() for line in body_rows)
+    assert ''.join(recovered.split()) == ''.join(('Issue body:' + body).split())
+    assert sum(line[2:-2].strip() == '' for line in body_rows) >= 3
+
+
+def test_show_section_contents(monkeypatch):
+    monkeypatch.setenv('COLUMNS', '100')
+    row = dict(task(), version=2, approved_version=1, available=0,
+               created_at='yesterday', synced_at='today')
+    out = io.StringIO()
+    render_show(row, stream=out)
+    sections = out.getvalue().split('├')
+    assert 'Project: local' in sections[0] and 'Repository: o/r' in sections[0]
+    for label in ('Issue: #1', 'Title:', 'Status:', 'Branch:', 'Version: 2',
+                  'Approved version: 1', 'Available: 0', 'Created:', 'Synced:'):
+        assert label in sections[1]
+    assert 'Issue body:' in sections[2]
+    assert '└' in sections[3]
+    assert 'Author:' not in out.getvalue()
+
+
+@pytest.mark.parametrize('title', [None, 42, True, ['中文', None], {'key': 'value'}])
+def test_nonstandard_titles_and_json(title):
+    row = task(title=title)
+    for renderer, value, args in [(render_queue, [row], ({'o/r': 'local'},)),
+                                   (render_show, row, ())]:
+        out = io.StringIO()
+        renderer(value, *args, stream=out)
+        assert '┌' in out.getvalue()
+        out = io.StringIO()
+        renderer(value, *args, format='json', stream=out)
+        assert out.getvalue() == json.dumps(value, ensure_ascii=False) + '\n'
+
+
+def test_colored_queue_aligned(monkeypatch):
+    import re
+    monkeypatch.setenv('TERM', 'xterm')
+    monkeypatch.setenv('COLUMNS', '45')
+    monkeypatch.delenv('NO_COLOR', raising=False)
+    out = Terminal()
+    render_queue([task()], {'o/r': 'local'}, stream=out)
+    plain = re.sub(r'\x1b\[[0-9;]*m', '', out.getvalue())
+    assert len({width(line) for line in plain.splitlines()}) == 1
+    assert all(width(line) <= 45 for line in plain.splitlines())
+
+
+def test_invalid_details_and_surrogates():
+    out = io.StringIO()
+    render_show(dict(task(body='bad\ud800\x1b\x00\tend'),
+                     attempts=[None, 42, {'state': 'running'}], quota=42), stream=out)
+    assert '\x1b' not in out.getvalue() and '\ud800' not in out.getvalue()
+    out.getvalue().encode('utf-8')
+    assert 'state=running' in out.getvalue()
+
+
+def test_wrap_preserves_whitespace_and_blank_lines():
+    from dispatcher.rendering import wrap_text
+    assert list(wrap_text('a  \n\n中文\n', 2)) == ['a ', ' ', '', '中', '文', '']
+    assert list(wrap_text('a\tb', 4)) == ['a   ', 'b']
+    assert list(wrap_text('e\u0301e\u0301', 1)) == ['e\u0301', 'e\u0301']
+
+
+def test_show_empty_body_is_available():
+    out = io.StringIO()
+    render_show(task(body=''), stream=out)
+    assert '(body unavailable)' not in out.getvalue()
+    assert 'Issue body:' in out.getvalue()

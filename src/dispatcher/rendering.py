@@ -33,7 +33,7 @@ def snapshot(row):
 
 def safe_text(value):
     """Keep body layout but neutralize terminal control sequences from stored text."""
-    return ''.join(c if c in '\n\t' or unicodedata.category(c) != 'Cc' else '\ufffd'
+    return ''.join(c if c in '\n\t' or unicodedata.category(c) not in ('Cc', 'Cs', 'Zl', 'Zp') else '\ufffd'
                    for c in str(value))
 
 
@@ -57,13 +57,51 @@ def color_enabled(stream):
     return stream.isatty() and 'NO_COLOR' not in os.environ and os.environ.get('TERM') not in (None, '', 'dumb')
 
 
+def border(widths, left, junction, right):
+    return left + junction.join('─' * (size + 2) for size in widths) + right
+
+
+def framed_row(cells):
+    # Cells may already contain renderer-owned ANSI; padding is done beforehand.
+    return '│ ' + ' │ '.join(cells) + ' │'
+
+
+def wrap_text(text, limit):
+    """Wrap by display cells without dropping whitespace or logical blank lines."""
+    for logical in safe_text(text).expandtabs(4).split('\n'):
+        line = ''
+        used = 0
+        for char in logical:
+            size = width(char)
+            if used + size > limit and line:
+                yield line
+                line, used = '', 0
+            line += char
+            used += size
+        yield line
+
+
+def render_frame(sections, stream):
+    limit = max(2, shutil.get_terminal_size(fallback=(100, 24)).columns - 4)
+    sections = [[line for text in section for line in wrap_text(text, limit)]
+                for section in sections]
+    size = max(2, max((width(line) for section in sections for line in section), default=0))
+    print(border([size], '┌', '┬', '┐'), file=stream)
+    for index, section in enumerate(sections):
+        if index:
+            print(border([size], '├', '┼', '┤'), file=stream)
+        for line in section:
+            print(framed_row([line + ' ' * (size - width(line))]), file=stream)
+    print(border([size], '└', '┴', '┘'), file=stream)
+
+
 def render_queue(rows, projects, format='table', stream=None):
     stream = stream if stream is not None else sys.stdout
     if format == 'json':
         print(json.dumps(rows, ensure_ascii=False), file=stream)
         return
     if not rows:
-        print('Queue is empty.', file=stream)
+        render_frame([['Queue is empty.']], stream)
         return
     cells = [['Issue', 'Project', 'Title', 'Status']]
     for row in rows:
@@ -71,13 +109,14 @@ def render_queue(rows, projects, format='table', stream=None):
                       snapshot(row).get('title', '(title unavailable)'), row['state']])
     cells = [[' '.join(safe_text(c).split()) for c in row] for row in cells]
     widths = [max(width(row[i]) for row in cells) for i in range(4)]
-    available = max(7, shutil.get_terminal_size(fallback=(100, 24)).columns)
-    while sum(widths) + 3 > available:
+    available = max(17, shutil.get_terminal_size(fallback=(100, 24)).columns)
+    while sum(widths) + 13 > available:
         index = max(range(4), key=lambda i: widths[i])
         if widths[index] <= 1:
             break
         widths[index] -= 1
     colors = color_enabled(stream)
+    print(border(widths, '┌', '┬', '┐'), file=stream)
     for index, row in enumerate(cells):
         rendered = []
         for col, cell in enumerate(row):
@@ -86,7 +125,8 @@ def render_queue(rows, projects, format='table', stream=None):
             if index and col == 3 and colors and cell in STATUS_COLORS:
                 padded = f'\033[{STATUS_COLORS[cell]}m{padded}\033[0m'
             rendered.append(padded)
-        print(' '.join(rendered).rstrip(), file=stream)
+        print(framed_row(rendered), file=stream)
+    print(border(widths, '└', '┴', '┘'), file=stream)
 
 
 # Explicit fields avoid dumping internal snapshots, remote credentials or process data.
@@ -107,8 +147,9 @@ def render_show(value, format='table', stream=None):
         print(json.dumps(value, ensure_ascii=False), file=stream)
         return
     issue = snapshot(value)
-    lines = [f'Issue: #{value["number"]}', f'Project: {value["project_id"]}',
-             f'Repository: {value["repository"]}']
+    header = [f'Project: {value.get("project_id", "(unavailable)")}',
+              f'Repository: {value.get("repository", "(unavailable)")}']
+    lines = [f'Issue: #{value.get("number", "(unavailable)")}']
     for label, data, key in [('Title', issue, 'title'), ('Status', value, 'state'),
                              ('Branch', issue, 'target_branch'), ('Author', issue, 'author'),
                              ('Version', value, 'version'), ('Approved version', value, 'approved_version'),
@@ -117,11 +158,18 @@ def render_show(value, format='table', stream=None):
         if data.get(key) is not None:
             lines.append(f'{label}: {data[key]}')
     body = issue.get('body')
-    lines.extend(['', 'Issue body:', body if isinstance(body, str) else '(body unavailable)'])
+    metadata = lines
+    body_lines = ['Issue body:', body if isinstance(body, str) else '(body unavailable)']
+    lines = []
     for section, fields in DETAIL_FIELDS.items():
         if value.get(section):
             lines.extend(['', section.replace('_', ' ').capitalize() + ':'])
-            for record in value[section]:
+            records = value[section]
+            if not isinstance(records, (list, tuple)):
+                records = [records]
+            for record in records:
+                if not isinstance(record, dict):
+                    continue
                 lines.append('  ' + ', '.join(f'{key}={record[key]}' for key in fields
                                               if record.get(key) is not None))
-    print(safe_text('\n'.join(lines)), file=stream)
+    render_frame([header, metadata, body_lines, lines], stream)
