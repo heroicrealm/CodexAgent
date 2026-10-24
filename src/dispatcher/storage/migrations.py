@@ -161,6 +161,9 @@ SCHEMA += """
                 UNIQUE(iteration_id,attempt_number));
             CREATE UNIQUE INDEX IF NOT EXISTS attempt_branch ON attempts(repository,branch)
                 WHERE state = 'running';
+            CREATE TABLE IF NOT EXISTS attempt_summaries(
+                attempt_id TEXT PRIMARY KEY REFERENCES attempts(attempt_id),
+                body TEXT NOT NULL CHECK(length(CAST(body AS BLOB))<=8192));
             CREATE TABLE IF NOT EXISTS result_outbox(
                 attempt_id TEXT PRIMARY KEY REFERENCES attempts(attempt_id), body TEXT NOT NULL,
                 published INTEGER NOT NULL DEFAULT 0, comment_id TEXT);

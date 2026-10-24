@@ -6,6 +6,7 @@ import sqlite3
 from pathlib import Path
 from urllib.parse import urlencode
 
+from dispatcher.codex_summary import final_summary
 from dispatcher.github import GitHubError
 from dispatcher.storage.transitions import Authority, Evidence, rest_id
 from dispatcher.workspace import TaskError
@@ -55,6 +56,20 @@ class PullRequestPublisher:
         def progress(value, outcome='pending'):
             self.store.publication(key, iteration, value, outcome)
         try:
+            # Persist once, including fallback, before any Git/HTTP publication.
+            # The operation flock serializes selection across publisher processes.
+            saved = self.store.db.execute(
+                'SELECT body FROM attempt_summaries WHERE attempt_id=?', (attempt['attempt_id'],)).fetchone()
+            if saved is None:
+                summary = f'implementation for Issue #{attempt["number"]}.'
+                if attempt['exit_code'] == 0 and attempt['codex_started'] and attempt['worktree']:
+                    summary = final_summary(Path(attempt['worktree']).parent /
+                        (attempt['attempt_id'] + '.codex.log'), summary)
+                with self.store.db:
+                    self.store.db.execute('INSERT INTO attempt_summaries VALUES(?,?)',
+                                          (attempt['attempt_id'], summary))
+            else:
+                summary = saved['body']
             progress('verify')
             task = self.store.get(attempt['repository'], attempt['number'])
             if task['version'] != attempt['version'] or task['current_iteration_id'] != iteration:
@@ -93,7 +108,7 @@ class PullRequestPublisher:
                     issue = json.loads(task['snapshot'])
                     body = (f'https://github.com/{repo}/issues/{task["number"]}\nRepository: {repo}\n'
                             f'Iteration: {iteration}\nBranch: {attempt["branch"]}\nSHA: {sha}\n'
-                            f'Summary: implementation for Issue #{task["number"]}.\n{marker}')
+                            f'Summary: {summary}\n{marker}')
                     try:
                         found = self.adapter.write(f'repos/{repo}/pulls', 'POST', dict(
                             title=f'[Issue #{task["number"]}] {issue["title"]}', body=body,
