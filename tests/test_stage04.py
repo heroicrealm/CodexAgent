@@ -105,7 +105,7 @@ if mode != 'dirty':
 
 
 def issue(project, **changes):
-    item = dict(id=1, number=1, project_id=project.id, repository=project.repository,
+    item = dict(id=1, repository_id=11 if project.repository == 'owner/repo' else 12, server_observed_at='2026-10-24T00:00:00Z', number=1, project_id=project.id, repository=project.repository,
                 title='Task', body='Requirements', author='alice', target_branch='main', eligible=True,
                 state='open', labels=[project.task_label], updated_at='2026-10-24T00:00:00Z')
     item.update(changes)
@@ -116,7 +116,24 @@ def adapter(items):
     result = Mock(spec=Adapter)
     result.fetch.return_value = items
     result.pages.return_value = []
+    result.repository_identity.return_value = 11
+    result.response_date = '2026-10-24T00:10:00Z'
     result.write.return_value = {'id': 123}
+    original_write = result.write
+    def write(endpoint, method, payload):
+        if endpoint.endswith('/pulls'):
+            result._pr = dict(id=301, number=2, body=payload['body'], state='open', draft=False,
+                              merged=False, changed_files=1, base=dict(ref='main', repo=dict(id=11)),
+                              head=dict(ref=payload['head'], repo=dict(id=11)))
+            return result._pr
+        return {'id': 123}
+    original_write.side_effect = write
+    def request(endpoint):
+        pr = dict(result._pr)
+        import re
+        pr['head']['sha'] = re.search(r'SHA: ([0-9a-f]+)', pr['body'])[1]
+        return pr
+    result.request.side_effect = request
     return result
 
 
@@ -158,8 +175,8 @@ def test_worktree_existing_missing_default_and_push(env, branch):
 
 
 @pytest.mark.parametrize('mode,state,code', [
-    ('success','review',None), ('fail','failed','codex_failed'), ('dirty','failed','dirty_worktree'),
-    ('noop','failed','no_commit'), ('quota','interrupted','quota_exhausted')])
+    ('success','review',None), ('fail','failed','codex_failed'), ('dirty','review',None),
+    ('noop','failed','no_diff'), ('quota','interrupted','quota_exhausted')])
 def test_executor_pipeline_and_final_comment(env, mode, state, code):
     config, project, control, _, remote = env
     control.write_text(json.dumps(dict(exec=mode)))
@@ -183,7 +200,7 @@ def test_executor_pipeline_and_final_comment(env, mode, state, code):
         assert 'Started:' in body and 'Finished:' in body and 'Duration:' in body and 'UTC' in body
         assert 'SECRET' not in body and str(config.workspace) not in body
         dispatcher.publisher.flush()
-        assert api.write.call_count == 1
+        assert api.write.call_count == (2 if state == 'review' else 1)
         assert (Path(row['worktree']).parent / f'{row["attempt_id"]}.codex.log').stat().st_mode & 0o777 == 0o600
     finally:
         lifecycle.cancel()
@@ -199,7 +216,7 @@ def test_approved_explained_noop(env):
         register(dispatcher, project, api.fetch.return_value)
         dispatcher.admit()
         finish(dispatcher)
-        assert dispatcher.store.get(project.repository, 1)['state'] == 'review'
+        assert dispatcher.store.get(project.repository, 1)['state'] == 'failed'
     finally:
         dispatcher.close()
 
@@ -302,7 +319,8 @@ def test_push_conflict_preserves_local_commit(env):
         git(seed, 'push', str(remote), 'HEAD:refs/heads/codex/issue-1')
         finish(dispatcher)
         row = dispatcher.execution.db.execute('SELECT * FROM attempts').fetchone()
-        assert row['state'] == 'failed' and row['category'] == 'GIT'
+        assert row['state'] == 'running' and row['recovery_diagnostic'] == 'non_fast_forward'
+        assert dispatcher.store.db.execute("SELECT outcome FROM publication_operations WHERE operation_key LIKE 'pr:%'").fetchone()[0] == 'failed'
         assert row['result_sha'] == git(Path(row['worktree']), 'rev-parse', 'HEAD')
         assert row['result_sha'] != git(remote, 'rev-parse', row['branch'])
     finally: dispatcher.close()
@@ -458,7 +476,7 @@ def test_outbox_uncertain_write_recovery_and_migration(env):
         assert store.get(project.repository,1)['approved_version'] == 1
         api.pages.return_value = [dict(id=456,body=body)]
         TaskResultPublisher(execution,api).flush()
-        assert api.write.call_count == 1
+        assert api.write.call_count == 2
         assert execution.get(attempt['attempt_id'])['state'] == 'review'
         assert store.db.execute('SELECT comment_id FROM result_outbox').fetchone()[0] == '456'
     finally: store.close()
@@ -545,12 +563,20 @@ method=sys.argv[sys.argv.index('--method')+1]
 endpoint=next(arg for arg in sys.argv if arg.startswith('repos/'))
 if method=='GET':
     if endpoint=='repos/owner/repo': result=dict(id=11,full_name='owner/repo')
+    elif '/pulls?' in endpoint: result=[state['pr']] if 'pr' in state else []
+    elif '/pulls/' in endpoint: result=state['pr']
     elif '/comments' in endpoint: result=state['comments']
     elif '/labels' in endpoint: result=state['issue']['labels']
     else: result=[state['issue']]
 else:
     payload=json.load(sys.stdin)
-    if '/comments' in endpoint:
+    if endpoint.endswith('/pulls'):
+        import re
+        sha=re.search(r'SHA: ([0-9a-f]+)',payload['body'])[1]
+        result=dict(id=301,number=2,body=payload['body'],state='open',draft=False,merged=False,changed_files=1,
+                    head=dict(ref=payload['head'],sha=sha,repo=dict(id=11)),base=dict(ref=payload['base'],repo=dict(id=11)))
+        state['pr']=result
+    elif '/comments' in endpoint:
         result=dict(id=len(state['comments'])+1,body=payload['body'])
         state['comments'].append(result)
     elif method=='POST':
@@ -571,7 +597,7 @@ else:
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
-print('HTTP/2 200 OK\\nDate: Sat, 24 Oct 2026 00:00:00 GMT\\n\\n'+json.dumps(result))
+print('HTTP/2 200 OK\\nDate: Sat, 24 Oct 2026 '+('00:10:00' if '/pulls/' in endpoint else '00:00:00')+' GMT\\n\\n'+json.dumps(result))
 ''')
     gh.chmod(0o700)
 
@@ -885,6 +911,7 @@ def test_malformed_external_payloads_fail_safely(env, tmp_path):
         register(dispatcher,project,[issue(project)])
         dispatcher.admit()
         finish(dispatcher)
+        dispatcher.adapter.write.reset_mock()
         dispatcher.adapter.pages.return_value=['malformed']
         dispatcher.publisher.flush()
         assert dispatcher.execution.db.execute('SELECT published FROM result_outbox').fetchone()[0]==0

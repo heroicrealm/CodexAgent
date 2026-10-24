@@ -10,12 +10,13 @@ from dispatcher.github.sync import SyncService
 from dispatcher.initialization import ready
 from dispatcher.logging import event
 from dispatcher.publisher import TaskResultPublisher
+from dispatcher.pr_publication import PullRequestPublisher
 from dispatcher.runtime import identity
 from dispatcher.storage import Store
 from dispatcher.workspace import GitWorkspaceManager, TaskError
 
 SAFE_CODES = frozenset('''attachment_download_failed git_unavailable git_operation_failed
-    origin_changed default_branch_unavailable invalid_branch default_branch_protected worktree_already_exists clone_url_unavailable
+    no_diff non_fast_forward publication_conflict publication_unavailable origin_changed default_branch_unavailable invalid_branch default_branch_protected worktree_already_exists clone_url_unavailable
     unexpected_branch dirty_worktree no_commit rewritten_history unsupported_codex_cli
     codex_failed codex_timeout force_stop stop_requested quota_exhausted crash_recovery internal_error unsafe_path'''.split())
 
@@ -32,6 +33,7 @@ class Dispatcher:
         self.executor = CodexExecutor(config, lifecycle)
         self.quota = CodexQuotaProvider(config, lifecycle, self.execution.quota)
         self.publisher = TaskResultPublisher(self.execution, self.adapter)
+        self.pr_publisher = PullRequestPublisher(self.execution, self.adapter, self.git)
         self.active = {}
         self.projects = [p for p in config.projects if ready(p)]
         self.cursor = 0
@@ -39,6 +41,10 @@ class Dispatcher:
         self.next_publish = 0
         # The process-wide runtime lock is held by serve. Never retry execution.
         for row in self.execution.db.execute("SELECT * FROM attempts WHERE state='running'").fetchall():
+            if row['exit_code'] == 0 and row['codex_started'] and not self.pr_publisher.pending(row['attempt_id']):
+                self.pr_publisher.intent(row['attempt_id'])
+            if self.pr_publisher.pending(row["attempt_id"]):
+                continue
             self.inspect_recovery(row)
             self.execution.finish(row['attempt_id'], 'interrupted', 'crash_recovery', 'DISPATCHER')
 
@@ -150,15 +156,18 @@ class Dispatcher:
                     else:
                         state, code = 'failed', 'codex_failed'
                 else:
-                    sha = self.git.verify(task['worktree'], task['branch'], task['initial_sha'],
-                                          noop=self.executor.confirmed_noop(task['issue'], task['output']))
-                    self.execution.update(attempt, result_sha=sha)
-                    self.git.push(task['project'], task['worktree'], task['branch'], task['origin'])
-                    self.execution.update(attempt, pushed=1)
+                    self.pr_publisher.intent(attempt)
+                    self.pr_publisher.publish(task['project'], self.execution.get(attempt))
+                    del self.active[attempt]
+                    continue
             except TaskError as exc:
                 state, code, category = 'failed', exc.code, exc.category
             except (OSError, RuntimeError):
                 state, code, category = 'failed', 'internal_error', 'DISPATCHER'
+            if self.pr_publisher.pending(attempt):
+                self.execution.update(attempt, recovery_diagnostic='publication_unavailable')
+                del self.active[attempt]
+                continue
             self.execution.finish(attempt, state, code, category, time.monotonic() - task['started'])
             del self.active[attempt]
             try:
@@ -177,6 +186,7 @@ class Dispatcher:
                 self.quota.check()
                 self.admit()
             if time.monotonic() >= self.next_publish:
+                self.pr_publisher.flush(self.projects)
                 self.publisher.flush()
                 self.next_publish = time.monotonic() + min(30, self.config.poll_interval_seconds)
             time.sleep(.05)
