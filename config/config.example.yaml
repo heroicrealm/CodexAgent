@@ -15,10 +15,26 @@ projects:
     enabled: true
     repository: owner/repository
     base_branch: main
-    task_label: codex-task
     # Empty or missing allowlist denies all issues.
     labels:
-      ready: codex-ready
+      # Legacy string form "ready: codex-ready" is also supported.
+      ready: {name: codex-ready, color: '0E8A16', description: 'Задание готово к обработке'}
+      discovered: {name: 'dispatcher:discovered', color: 'D4C5F9', description: 'Ожидает подтверждения'}
+      approve: {name: 'dispatcher:approve', color: '0E8A16', description: 'Подтвердить выполнение'}
+      reject: {name: 'dispatcher:reject', color: 'B60205', description: 'Отклонить выполнение'}
+      pending: {name: 'dispatcher:pending', color: 'FBCA04', description: 'Подтверждено, ожидает запуска'}
+      running: {name: 'dispatcher:running', color: '1D76DB', description: 'Задание выполняется'}
+      review: {name: 'dispatcher:review', color: '5319E7', description: 'Ожидает приёмки'}
+      done: {name: 'dispatcher:done', color: '0E8A16', description: 'Задание принято'}
+      failed: {name: 'dispatcher:failed', color: 'D93F0B', description: 'Ошибка выполнения'}
+      rejected: {name: 'dispatcher:rejected', color: 'B60205', description: 'Задание отклонено'}
+      revoked: {name: 'dispatcher:revoked', color: 'C2E0C6', description: 'Задание отозвано'}
+      cancelled: {name: 'dispatcher:cancelled', color: 'E99695', description: 'Задание отменено'}
+      interrupted: {name: 'dispatcher:interrupted', color: 'F9D0C4', description: 'Выполнение прервано'}
+    # Written by init. Missing/stale status excludes this project from processing.
+    init_status: ''
+    init_message: ''
+    init_fingerprint: ''
     security:
       allowed_authors: [trusted-login]
 executables:

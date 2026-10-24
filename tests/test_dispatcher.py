@@ -36,6 +36,9 @@ projects:
     task_label: ready
 '''
         self.path.write_text(self.yaml)
+        from dispatcher.initialization import save_result
+        configured = load(self.path)
+        save_result(configured, configured.projects[0], True)
 
     def tearDown(self):
         self.temp.cleanup()
@@ -151,7 +154,7 @@ projects:
         config = load(self.path)
         run = Mock(return_value=subprocess.CompletedProcess([], 0, stdout='SECRET'))
         checks = diagnose(config, which=lambda _: '/stub', run=run)
-        self.assertFalse(any(level == 'FAIL' for level, _ in checks))
+        self.assertTrue(any('repository read access cannot be verified' in message for _, message in checks))
         run.assert_any_call(['gh', 'auth', 'status'], capture_output=True, timeout=15)
         for binary in ('git', 'gh', 'codex'):
             run.assert_any_call([binary, '--version'], capture_output=True, timeout=15)
@@ -159,7 +162,7 @@ projects:
         self.assertTrue(any(level == 'FAIL' for level, _ in diagnose(config, which=lambda _: None)))
         run.return_value = subprocess.CompletedProcess([], 1)
         self.assertIn(('FAIL', 'GitHub authentication: run gh auth login'), diagnose(config, which=lambda _: '/stub', run=run))
-        with unittest.mock.patch('dispatcher.doctor.prepare', side_effect=PermissionError):
+        with unittest.mock.patch('dispatcher.doctor.os.access', return_value=False):
             self.assertIn(('FAIL', 'Directories: check ownership and permissions'), diagnose(config, which=lambda _: None))
 
     def test_grace_timeout_validation(self):

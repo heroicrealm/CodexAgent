@@ -3,9 +3,9 @@ import os
 import shutil
 import subprocess
 import sys
-import tempfile
-from dispatcher.github import authenticated
-from dispatcher.runtime import prepare
+from dispatcher.github import authenticated, Adapter, GitHubError
+from dispatcher.config import COLORS
+from dispatcher.initialization import ready
 
 
 def ssh_diagnose(config, which, run, environ):
@@ -82,13 +82,38 @@ def diagnose(config, which=shutil.which, run=subprocess.run, environ=None):
     else:
         checks.append(('WARN', 'GitHub authentication: install gh first'))
     checks.extend(ssh_diagnose(config, which, run, os.environ if environ is None else environ))
-    try:
-        prepare(config)
-        for path in (config.workspace, config.logs):
-            with tempfile.TemporaryFile(dir=path):
-                pass
-        checks.append(('PASS', 'Directories: writable'))
-    except OSError:
-        checks.append(('FAIL', 'Directories: check ownership and permissions'))
+    # Read-only: inspect the closest existing parent, without creating directories.
+    writable = True
+    for path in (config.workspace, config.logs):
+        while not path.exists() and path != path.parent:
+            path = path.parent
+        writable &= os.access(path, os.W_OK | os.X_OK)
+    checks.append(('PASS' if writable else 'FAIL', 'Directories: writable' if writable else 'Directories: check ownership and permissions'))
+    adapter = Adapter(config.github_executable, run=run, attempts=1)
+    for project in config.projects:
+        if not project.enabled:
+            continue
+        checks.append(('PASS' if ready(project) else 'FAIL', f'{project.id}: initialization ' + ('current' if ready(project) else 'missing, failed or stale; run init')))
+        try:
+            repository = adapter.request(f'repos/{project.repository}')
+            if not isinstance(repository, dict):
+                raise GitHubError(kind='invalid_response')
+            checks.append(('PASS', f'{project.id}: repository accessible (read access)'))
+            permissions = repository.get('permissions')
+            if not isinstance(permissions, dict):
+                permissions = {}
+            flags = [key for key in ('push', 'maintain', 'admin') if permissions.get(key) is True]
+            checks.append(('INFO', f'{project.id}: GitHub repository permission flags: ' + (', '.join(flags) if flags else 'none reported')))
+        except (GitHubError, KeyError, TypeError, AttributeError):
+            checks.append(('FAIL', f'{project.id}: repository read access cannot be verified'))
+        else:
+            try:
+                labels = {v['name'].casefold() for v in adapter.labels(project)}
+                missing = any(project.label(k).name.casefold() not in labels for k in COLORS)
+                checks.append(('FAIL' if missing else 'PASS', f'{project.id}: required labels ' + ('missing; run init' if missing else 'present')))
+            except (GitHubError, KeyError, TypeError, AttributeError):
+                checks.append(('FAIL', f'{project.id}: required labels cannot be verified'))
+        checks.append(('WARN', f'{project.id}: label write permission is not confirmed by read-only checks; '
+                       'run init (or init --update for existing labels) to attempt the required operations'))
     checks.append(('PASS', 'YAML configuration valid'))
     return checks
