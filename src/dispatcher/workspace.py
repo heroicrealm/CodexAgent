@@ -139,7 +139,7 @@ class GitWorkspaceManager:
             raise TaskError('default_branch_protected', 'GIT')
         remote = f'refs/remotes/origin/{branch}'
         exists = self.git(repo, 'show-ref', '--verify', remote, check=False).returncode == 0
-        base = remote if exists else f'refs/remotes/origin/{actual_default}'
+        base = remote if exists else f'refs/remotes/origin/{project.base_branch}'
         # Never reset/reuse a pre-existing local branch or another task's history.
         self.git(repo, 'worktree', 'add', '-b', branch, str(worktree), base)
         worktree.chmod(0o700)
@@ -158,6 +158,23 @@ class GitWorkspaceManager:
             raise TaskError('rewritten_history', 'GIT')
         return sha
 
+    def publication_commit(self, worktree, branch, initial_sha, base):
+        safe_path(self.config.workspace, worktree)
+        if self.git(worktree, 'symbolic-ref', '--short', 'HEAD').stdout.strip() != branch:
+            raise TaskError('unexpected_branch', 'GIT')
+        if self.git(worktree, 'status', '--porcelain').stdout.strip():
+            self.git(worktree, 'add', '--all')
+            self.git(worktree, 'commit', '-m', 'Implement task')
+        sha = self.verify(worktree, branch, initial_sha, noop=True)
+        self.validate_branch(base)
+        self.git(worktree, 'fetch', 'origin', f'+refs/heads/{base}:refs/remotes/origin/{base}')
+        diff = self.git(worktree, 'diff', '--quiet', f'refs/remotes/origin/{base}...{sha}', check=False)
+        if diff.returncode == 0:
+            raise TaskError('no_diff', 'GIT')
+        if diff.returncode != 1:
+            raise TaskError('git_operation_failed', 'GIT')
+        return sha
+
     def push(self, project, worktree, branch, expected_origin=None):
         safe_path(self.config.workspace, worktree)
         if expected_origin is not None and self.git(worktree, 'remote', 'get-url', 'origin').stdout.strip() != expected_origin:
@@ -165,7 +182,10 @@ class GitWorkspaceManager:
         self.validate_branch(branch)
         if branch in (project.base_branch, self.default_branch(project)):
             raise TaskError('default_branch_protected', 'GIT')
-        self.git(worktree, 'push', 'origin', f'HEAD:refs/heads/{branch}')
+        result = self.git(worktree, 'push', 'origin', f'HEAD:refs/heads/{branch}', check=False)
+        if result.returncode:
+            rejected = any(token in result.stderr.lower() for token in ('non-fast-forward', 'fetch first'))
+            raise TaskError('non_fast_forward' if rejected else 'git_operation_failed', 'GIT')
 
 
 class TaskWorkspaceCleanup:

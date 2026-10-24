@@ -1,6 +1,6 @@
 """Guarded stage 6 API. Evidence is supplied by a verified GitHub read, never text commands.
 
-The runtime PR workflow is deliberately not wired until stage 6.3.
+The stage 6.3 publisher supplies verified REST evidence to this contract.
 """
 import json
 import re

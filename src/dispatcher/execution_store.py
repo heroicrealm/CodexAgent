@@ -67,6 +67,11 @@ class ExecutionStore:
             row = self.get(attempt)
             if row['state'] != 'running':
                 return
+            if state == 'review':
+                task = self.store.get(row['repository'], row['number'])
+                if task['state'] != 'review' or not self.db.execute(
+                        'SELECT 1 FROM iteration_pr_history WHERE iteration_id=?', (row['iteration_id'],)).fetchone():
+                    raise RuntimeError('Review requires verified PR evidence')
             finished = now()
             if duration is None:
                 duration = max(0, (datetime.fromisoformat(finished) - datetime.fromisoformat(row['started_at'])).total_seconds())
@@ -75,7 +80,7 @@ class ExecutionStore:
             before = self.store.get(row['repository'], row['number'])
             if before['state'] == 'running' and before['current_iteration_id'] == row['iteration_id']:
                 self.store._set_state(before, state, before['approved_version'])
-                self.store._record_transition(before, state, 'finish:' + attempt, 'scheduler', {'legacy_push_workflow': True})
+                self.store._record_transition(before, state, 'finish:' + attempt, 'scheduler', {'attempt_id': attempt, 'error_code': code})
             task = self.store.get(row['repository'], row['number'])
             self.store._history(row['repository'], row['number'], row['version'], state, task['snapshot'], finished)
             body = comment_body(self.get(attempt))

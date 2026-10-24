@@ -170,7 +170,8 @@ class Adapter:
     def pages(self, endpoint):
         result = []
         for page in range(1, 10001):
-            data = self.request(f'{endpoint}?per_page=100&page={page}')
+            separator = '&' if '?' in endpoint else '?'
+            data = self.request(f'{endpoint}{separator}per_page=100&page={page}')
             if not isinstance(data, list) or len(data) > 100:
                 raise GitHubError('Invalid GitHub page')
             result.extend(data)
