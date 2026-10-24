@@ -14,7 +14,9 @@ def ssh_diagnose(config, which, run, environ):
     for project in config.projects:
         if not project.enabled:
             continue
-        clone = config.workspace / project.id
+        clone = config.workspace / project.id / 'repository'
+        if not (clone / '.git').exists():
+            clone = config.workspace / project.id  # Stage 1 legacy diagnostic path
         if not (clone / '.git').exists():
             unknown = True
             continue

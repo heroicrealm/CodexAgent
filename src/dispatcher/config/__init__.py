@@ -49,6 +49,15 @@ class Config:
     projects: tuple[Project, ...]
     force_grace_timeout_seconds: int = 5
     github_executable: str = "gh"
+    timeout_seconds: int = 7200
+    execution_mode: str = 'full-auto'
+    quota_enabled: bool = True
+    quota_min_remaining_percent: int = 10
+    quota_check_interval_seconds: int = 300
+    quota_retry_after_reset_seconds: int = 60
+    attachment_max_files: int = 20
+    attachment_max_bytes: int = 20971520
+    attachment_timeout_seconds: int = 30
 
 
 def load(path: str | Path) -> Config:
@@ -88,6 +97,32 @@ def load(path: str | Path) -> Config:
             raise ConfigError(f'paths.{name} must be in the Linux filesystem, outside /mnt')
         return value
     executable = string(section('codex').get('executable', 'codex'), 'codex.executable')
+    codex = section('codex')
+    quota = codex.get('quota', {})
+    attachments = section('attachments')
+    if not isinstance(quota, dict):
+        raise ConfigError('codex.quota must be a mapping')
+    options = {}
+    for key, values, name, default in (
+        ('timeout_seconds', codex, 'timeout_seconds', 7200),
+        ('quota_check_interval_seconds', quota, 'check_interval_seconds', 300),
+        ('quota_retry_after_reset_seconds', quota, 'retry_after_reset_seconds', 60),
+        ('attachment_max_files', attachments, 'max_files', 20),
+        ('attachment_max_bytes', attachments, 'max_bytes', 20971520),
+        ('attachment_timeout_seconds', attachments, 'timeout_seconds', 30)):
+        value = values.get(name, default)
+        if type(value) is not int or value <= 0:
+            raise ConfigError(f'{key} must be a positive integer')
+        options[key] = value
+    options['execution_mode'] = codex.get('execution_mode', 'full-auto')
+    if options['execution_mode'] != 'full-auto':
+        raise ConfigError('codex.execution_mode must be full-auto')
+    options['quota_enabled'] = quota.get('enabled', True)
+    options['quota_min_remaining_percent'] = quota.get('min_remaining_percent', 10)
+    if type(options['quota_enabled']) is not bool:
+        raise ConfigError('codex.quota.enabled must be boolean')
+    if type(options['quota_min_remaining_percent']) is not int or not 0 <= options['quota_min_remaining_percent'] <= 100:
+        raise ConfigError('codex.quota.min_remaining_percent must be 0..100')
     projects = data.get('projects')
     if not isinstance(projects, list) or not projects:
         raise ConfigError('projects must be a nonempty array')
@@ -146,4 +181,4 @@ def load(path: str | Path) -> Config:
         if type(item.get('enabled')) is not bool:
             raise ConfigError('project.enabled must be boolean')
         result.append(Project(**{k: item[k] for k in Project.__dataclass_fields__}))
-    return Config(source, directory('workspace'), directory('logs'), interval, parallel, executable, tuple(result), grace, string(section('executables').get('github', 'gh'), 'executables.github'))
+    return Config(source, directory('workspace'), directory('logs'), interval, parallel, executable, tuple(result), grace, string(section('executables').get('github', 'gh'), 'executables.github'), **options)

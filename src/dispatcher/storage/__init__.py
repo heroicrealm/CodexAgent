@@ -1,4 +1,5 @@
 """Versioned SQLite snapshots. Transactions serialize polling and future approval."""
+import os
 import hashlib
 import json
 import sqlite3
@@ -23,6 +24,7 @@ def content_hash(issue):
 class Store:
     def __init__(self, path):
         self.db = sqlite3.connect(path, timeout=30)
+        os.chmod(path, 0o600)
         self.db.row_factory = sqlite3.Row
         self.db.execute('PRAGMA foreign_keys=ON')
         self.db.execute('PRAGMA journal_mode=WAL')

@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import signal
 import subprocess
+import sys
 import time
 
 from dispatcher.logging import event
@@ -23,10 +24,13 @@ def identity(pid):
 
 def prepare(config):
     for path in (config.workspace, config.logs, config.workspace / '.runtime'):
+        if path.is_symlink():
+            raise RuntimeError('Unsafe runtime directory')
         path.mkdir(parents=True, exist_ok=True, mode=0o700)
         path.chmod(0o700)
     for project in config.projects:
-        (config.workspace / project.id / 'tasks').mkdir(parents=True, exist_ok=True, mode=0o700)
+        from dispatcher.workspace import private_dir
+        private_dir(config.workspace, config.workspace / project.id / 'tasks')
     return config.workspace / '.runtime'
 
 
@@ -58,12 +62,81 @@ def running(root):
 
 class Lifecycle:
     """Future scheduler contract: stop admission, drain, or cancel process groups."""
-    def __init__(self, max_parallel_tasks=1, force_grace_timeout_seconds=5):
+    def __init__(self, max_parallel_tasks=1, force_grace_timeout_seconds=5, registry=None):
         self.max_parallel_tasks = max_parallel_tasks
         self.force_grace_timeout_seconds = force_grace_timeout_seconds
         self.stopping = False
         self.forced = False
         self.children = []
+        self.services = []
+        self.registry = registry
+
+    def save_registry(self):
+        values = []
+        for child in self.children:
+            if child.returncode is None:
+                try:
+                    start = Path(f'/proc/{child.pid}/stat').read_text().rsplit(')', 1)[1].split()[19]
+                    values.append(dict(pid=child.pid, identity=start))
+                except FileNotFoundError:
+                    pass
+        temporary = self.registry.with_suffix('.tmp')
+        fd = os.open(temporary, os.O_CREAT | os.O_TRUNC | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, 'w') as stream:
+            os.fchmod(stream.fileno(), 0o600)
+            json.dump(values, stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.replace(self.registry)
+        descriptor = os.open(self.registry.parent, os.O_DIRECTORY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+    def recover(self):
+        """Only signal old groups with a verified leader start identity.
+
+        Unknown surviving groups block daemon startup instead of risking PID reuse.
+        This is recovery of non-child processes, not Popen polling/reaping.
+        """
+        if not self.registry or not self.registry.exists():
+            return
+        values = json.loads(self.registry.read_text())
+        for value in values:
+            pid = value['pid']
+            if type(pid) is not int or pid <= 1:
+                raise RuntimeError('Invalid process recovery registry')
+            def members():
+                result = []
+                for stat in Path('/proc').glob('[0-9]*/stat'):
+                    try:
+                        fields = stat.read_text().rsplit(')', 1)[1].split()
+                        if int(fields[2]) == pid and fields[0] != 'Z':
+                            result.append(stat)
+                    except FileNotFoundError:
+                        pass
+                return result
+            if not members():
+                continue
+            try:
+                start = Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()[19]
+            except FileNotFoundError:
+                raise RuntimeError('Unverifiable surviving task group; inspect process registry') from None
+            if start != value['identity']:
+                raise RuntimeError('Recovery process identity mismatch; inspect process registry')
+            os.killpg(pid, signal.SIGTERM)
+            deadline = time.monotonic() + self.force_grace_timeout_seconds
+            while members() and time.monotonic() < deadline:
+                time.sleep(.02)
+            if members():
+                os.killpg(pid, signal.SIGKILL)
+            deadline = time.monotonic() + 5
+            while members():
+                if time.monotonic() >= deadline:
+                    raise RuntimeError('Recovered process group did not stop')
+                time.sleep(.02)
+        self.registry.unlink()
 
     def request_stop(self, force=False):
         self.stopping = True
@@ -95,16 +168,49 @@ class Lifecycle:
             else:
                 child.wait()
         self.children = active
+        self.services = [child for child in self.services if child in active]
         return active
 
-    def submit(self, argv):
+    def submit(self, argv, *, service=False, **kwargs):
         if self.stopping:
             raise RuntimeError('Dispatcher is stopping')
-        if len(self._active()) >= self.max_parallel_tasks:
+        if len([c for c in self._active() if c not in self.services]) >= self.max_parallel_tasks and not service:
             raise RuntimeError('Parallel task limit reached')
-        child = subprocess.Popen(argv, start_new_session=True)
-        self.children.append(child)
-        return child
+        gate_read = gate_write = None
+        if self.registry:
+            gate_read, gate_write = os.pipe()
+            kwargs['pass_fds'] = (*kwargs.get('pass_fds', ()), gate_read)
+            argv = [sys.executable, str(Path(__file__).with_name('_child.py')),
+                    str(gate_read), str(os.getpid()), *argv]
+        try:
+            child = subprocess.Popen(argv, start_new_session=True, **kwargs)
+            self.children.append(child)
+            if self.registry:
+                self.save_registry()
+                os.write(gate_write, b'1')
+            if service:
+                self.services.append(child)
+            return child
+        except OSError:
+            if 'child' in locals():
+                self.cancel_child(child)
+            raise
+        finally:
+            if gate_read is not None:
+                os.close(gate_read)
+                os.close(gate_write)
+
+    def cancel_child(self, child):
+        if child not in self._active():
+            return
+        os.killpg(child.pid, signal.SIGTERM)
+        deadline = time.monotonic() + self.force_grace_timeout_seconds
+        while child in self._active() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        if child in self._active():
+            os.killpg(child.pid, signal.SIGKILL)
+        while child in self._active():
+            time.sleep(0.02)
 
     def drain(self):
         while self._active():
@@ -135,21 +241,26 @@ def serve(config):
     fd = lock(root)
     if fd is None:
         return
-    lifecycle = Lifecycle(config.max_parallel_tasks, config.force_grace_timeout_seconds)
+    lifecycle = Lifecycle(config.max_parallel_tasks, config.force_grace_timeout_seconds, root / 'children.json')
     signal.signal(signal.SIGTERM, lambda *_: lifecycle.request_stop())
     signal.signal(signal.SIGINT, lambda *_: lifecycle.request_stop())
     signal.signal(signal.SIGUSR1, lambda *_: lifecycle.request_stop(True))
     state = root / 'state.json'
     temporary = root / 'state.tmp'
     try:
+        lifecycle.recover()
         state_fd = os.open(temporary, os.O_CREAT | os.O_TRUNC | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
         with os.fdopen(state_fd, 'w') as stream:
             os.fchmod(stream.fileno(), 0o600)
             stream.write(json.dumps(dict(pid=os.getpid(), identity=identity(os.getpid()))))
         temporary.replace(state)
         event(config.logs / 'dispatcher.jsonl', 'started')
-        while not lifecycle.stopping:
-            time.sleep(0.05)
+        from dispatcher.scheduler import Dispatcher
+        dispatcher = Dispatcher(config, lifecycle)
+        try:
+            dispatcher.run()
+        finally:
+            dispatcher.close()
         lifecycle.drain()
         event(config.logs / 'dispatcher.jsonl', 'stopped_force' if lifecycle.forced else 'stopped')
     finally:

@@ -82,6 +82,15 @@ def main(argv=None):
                     value['command_diagnostics'] = [dict(r) for r in store.db.execute(
                         'SELECT action,event_id,reason FROM command_quarantine WHERE repository=? AND number=?',
                         (project.repository.casefold(), args.issue))]
+                    from dispatcher.execution_store import ExecutionStore
+                    execution = ExecutionStore(store)
+                    value['attempts'] = [dict(r) for r in store.db.execute(
+                        'SELECT * FROM attempts WHERE repository=? AND number=? ORDER BY started_at',
+                        (project.repository.casefold(), args.issue))]
+                    value['quota'] = [dict(r) for r in store.db.execute('SELECT * FROM quota_observation')]
+                    value['result_publication'] = [dict(r) for r in store.db.execute(
+                        'SELECT o.attempt_id,o.published,o.comment_id FROM result_outbox o JOIN attempts a USING(attempt_id) '
+                        'WHERE a.repository=? AND a.number=?', (project.repository.casefold(), args.issue))]
                     print(json.dumps(value))
                 else:
                     from dispatcher.queue import decide_cli

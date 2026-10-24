@@ -10,6 +10,18 @@ github:
   auth_method: gh
 codex:
   executable: codex
+  timeout_seconds: 7200
+  # Dispatcher mode: codex exec bypasses approvals and the sandbox. Use a dedicated OS account.
+  execution_mode: full-auto
+  quota:
+    enabled: true
+    min_remaining_percent: 10
+    check_interval_seconds: 300
+    retry_after_reset_seconds: 60
+attachments:
+  max_files: 20
+  max_bytes: 20971520  # Per file; maximum total is max_files * max_bytes.
+  timeout_seconds: 30 # Per file including redirects and streaming.
 projects:
   - id: example-project
     enabled: true
