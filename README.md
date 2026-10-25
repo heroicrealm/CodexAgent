@@ -449,3 +449,6 @@ merge → `done` с закрытием Issue как `completed`; закрыти�
 
 Разбор `stale_version`, регрессионные тесты и точные шаги проверки в Playground:
 [отчёт Issue #27](docs/stages/stage-06-04-issue27.md).
+
+Параметры текущей Git-ветки Issue и безопасная additive-миграция SQLite **605**:
+[схема, API, владение веткой и проверки](docs/stages/sqlite-branches-605.md).

@@ -23,7 +23,7 @@ def content_hash(issue):
 
 class Store:
     def __init__(self, path):
-        from .migrations import prepare, initialize, upgrade604, VERSION
+        from .migrations import prepare, initialize, upgrade604, upgrade605, VERSION
         prepare(path)
         self.db = sqlite3.connect(path, timeout=30)
         os.chmod(path, 0o600)
@@ -37,6 +37,7 @@ class Store:
                 initialize(self.db)
                 self.db.execute('CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY)')
                 self.db.executemany('INSERT OR IGNORE INTO schema_migrations VALUES(?)', [(1,), (2,), (3,), (VERSION,), (604,)])
+                upgrade605(self.db)
         except Exception:
             self.db.close()
             raise
@@ -315,3 +316,52 @@ class Store:
                 retry_count=publication_operations.retry_count+?,updated_at=excluded.updated_at""",
                 (operation_key, iteration_id, phase, outcome, 0, now(), int(retry)))
             return 'applied'
+
+
+    def branches(self, repository, number):
+        """Read current Issue branch parameters; attempt.branch remains historical."""
+        from .migrations import BRANCH_COLUMNS
+        row = self.get(repository, number)
+        return None if row is None else {name: row[name] for name in BRANCH_COLUMNS}
+
+    def save_branches(self, repository, number, *, expected_version, expected_iteration_id,
+                      expected, base_branch=None, work_branch=None, branch_source=None,
+                      branch_status='unresolved', branch_error=None, branch_prepared_at=None):
+        """Compare-and-swap all branch fields and audit atomically.
+
+        `expected` is the complete result of branches(). False means stale or
+        frozen parameters. Constraint violations raise sqlite3.IntegrityError.
+        """
+        from .migrations import BRANCH_COLUMNS
+        from dispatcher.github import valid_branch
+        values = dict(base_branch=base_branch, work_branch=work_branch,
+                      branch_source=branch_source, branch_status=branch_status,
+                      branch_error=branch_error, branch_prepared_at=branch_prepared_at)
+        if expected is None or set(expected) != set(BRANCH_COLUMNS):
+            raise ValueError('Complete expected branch snapshot required')
+        if any(value is not None and (not isinstance(value, str) or not valid_branch(value))
+               for value in (base_branch, work_branch)):
+            raise ValueError('Invalid branch name')
+        if branch_status in ('resolved', 'prepared') and not (base_branch and work_branch and branch_source):
+            raise ValueError('Resolved branches require base, work and source')
+        if branch_status == 'prepared' and not branch_prepared_at:
+            raise ValueError('Prepared branch requires timestamp')
+        repository = repository.casefold()
+        with self.db:
+            self.db.execute('BEGIN IMMEDIATE')
+            row = self.get(repository, number)
+            if (row is None or row['version'] != expected_version
+                    or row['current_iteration_id'] != expected_iteration_id
+                    or self.branches(repository, number) != expected):
+                return False
+            if values == expected:
+                return True
+            if row['state'] in ('running', 'review', 'done', 'cancelled') or self.db.execute(
+                    "SELECT 1 FROM attempts WHERE repository=? AND number=? AND state='running'",
+                    (repository, number)).fetchone():
+                return False
+            self.db.execute('UPDATE tasks SET ' + ','.join(f'{name}=?' for name in values)
+                            + ' WHERE repository=? AND number=?', (*values.values(), repository, number))
+            self._history(repository, number, row['version'], 'branches_updated',
+                          json.dumps({'before': expected, 'after': values}, sort_keys=True), now())
+            return True

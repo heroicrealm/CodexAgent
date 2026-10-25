@@ -1,4 +1,4 @@
-"""One-time, offline operational reset for the stage 6 schema."""
+"""Legacy reset boundary 602 and additive, transactional stage migrations."""
 import fcntl
 import os
 import sqlite3
@@ -26,6 +26,8 @@ def prepare(path):
     db.execute('PRAGMA foreign_keys=ON')
     try:
         tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if 'tasks' in tables and {'repository_id', 'current_iteration_id'} <= {r[1] for r in db.execute('PRAGMA table_info(tasks)')}:
+            return
         if 'tasks' not in tables or ('schema_migrations' in tables and db.execute(
                 'SELECT 1 FROM schema_migrations WHERE version=?', (VERSION,)).fetchone()):
             return
@@ -226,3 +228,61 @@ CREATE TABLE IF NOT EXISTS cancellations(
  issue_closed INTEGER NOT NULL DEFAULT 0,
  cleaned INTEGER NOT NULL DEFAULT 0, error TEXT);
 """
+
+
+BRANCH_VERSION = 605
+BRANCH_COLUMNS = {
+    'base_branch': 'TEXT',
+    'work_branch': 'TEXT',
+    'branch_source': "TEXT CHECK(branch_source IN ('explicit','generated'))",
+    'branch_status': "TEXT DEFAULT 'unresolved' CHECK(branch_status IN ('unresolved','resolved','prepared','conflict','failed'))",
+    'branch_error': 'TEXT',
+    'branch_prepared_at': 'TEXT',
+}
+# Failed/rejected/interrupted Issues can be approved again and retain their claim.
+ACTIVE_BRANCH = "state NOT IN ('done','cancelled','revoked')"
+
+
+def validate(db):
+    if db.execute('PRAGMA foreign_key_check').fetchall() or [r[0] for r in db.execute('PRAGMA integrity_check')] != ['ok']:
+        raise MigrationError('SQLite schema validation failed')
+
+
+def upgrade605(db):
+    """Caller owns BEGIN IMMEDIATE; all DDL and marker roll back together.
+
+    Inspect columns even when a marker exists, repairing interrupted/manual schemas.
+    Historical attempt branches are deliberately never backfilled into tasks.
+    """
+    columns = {r[1] for r in db.execute('PRAGMA table_info(tasks)')}
+    for name, definition in BRANCH_COLUMNS.items():
+        if name not in columns:
+            db.execute(f'ALTER TABLE tasks ADD COLUMN {name} {definition}')
+    db.execute(f"""CREATE UNIQUE INDEX IF NOT EXISTS task_work_branch
+        ON tasks(repository,work_branch) WHERE work_branch IS NOT NULL AND {ACTIVE_BRANCH}""")
+    # Cross-table checks cover legacy attempts whose tasks have no work_branch.
+    # Guard both directions and state changes, including repeat iterations.
+    for operation in ('INSERT', 'UPDATE'):
+        db.execute(f"""CREATE TRIGGER IF NOT EXISTS task_branch_claim_{operation.lower()}
+            BEFORE {operation} ON tasks
+            WHEN NEW.work_branch IS NOT NULL AND NEW.state NOT IN ('done','cancelled','revoked')
+            AND EXISTS (SELECT 1 FROM attempts a JOIN tasks t
+                ON t.repository=a.repository AND t.number=a.number
+                WHERE a.repository=NEW.repository AND a.branch=NEW.work_branch AND a.number!=NEW.number
+                AND (a.state='running' OR t.state NOT IN ('done','cancelled','revoked')))
+            BEGIN SELECT RAISE(ABORT,'Work branch reserved by attempt'); END""")
+        db.execute(f"""CREATE TRIGGER IF NOT EXISTS attempt_branch_claim_{operation.lower()}
+            BEFORE {operation} ON attempts WHEN NEW.state='running' AND EXISTS (
+                SELECT 1 FROM tasks t WHERE t.repository=NEW.repository AND t.number!=NEW.number
+                AND t.work_branch=NEW.branch AND t.state NOT IN ('done','cancelled','revoked'))
+            BEGIN SELECT RAISE(ABORT,'Work branch reserved by Issue'); END""")
+    db.execute("""CREATE TRIGGER IF NOT EXISTS task_branch_reactivate BEFORE UPDATE OF state ON tasks
+        WHEN NEW.state NOT IN ('done','cancelled','revoked')
+        AND OLD.state IN ('done','cancelled','revoked') AND EXISTS (
+            SELECT 1 FROM attempts a JOIN tasks t ON t.repository=a.repository
+            AND t.number!=a.number AND t.work_branch=a.branch
+            WHERE a.repository=NEW.repository AND a.number=NEW.number
+            AND t.state NOT IN ('done','cancelled','revoked'))
+        BEGIN SELECT RAISE(ABORT,'Historical branch reserved by Issue'); END""")
+    validate(db)
+    db.execute('INSERT OR IGNORE INTO schema_migrations VALUES(?)', (BRANCH_VERSION,))
