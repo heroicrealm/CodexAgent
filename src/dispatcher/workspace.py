@@ -119,10 +119,11 @@ class GitWorkspaceManager:
     def prepare(self, project, issue, branch):
         repo, task, worktree = self.paths(project, issue['number'])
         private_dir(self.config.workspace, task)
-        if issue.get('retry_sha'):
-            self.retry_source(project, issue['number'], issue['retry_sha'])
+        if issue.get('retry_sha') or issue.get('repeat_branch'):
+            if issue.get('retry_sha'):
+                self.retry_source(project, issue['number'], issue['retry_sha'])
             if worktree.exists():
-                if self.git(worktree, 'status', '--porcelain', '--untracked-files=all').stdout.strip():
+                if self.git(worktree, 'status', '--porcelain', '--untracked-files=all', '--ignored').stdout.strip():
                     raise TaskError('retry_workspace_conflict', 'GIT')
                 preserved = safe_path(self.config.workspace, task / ('previous-' + issue['previous_attempt']))
                 self.git(repo, 'worktree', 'move', str(worktree), str(preserved))
@@ -146,12 +147,33 @@ class GitWorkspaceManager:
             except (ValueError, OSError, subprocess.TimeoutExpired):
                 raise TaskError('clone_url_unavailable', 'GIT') from None
         repo.chmod(0o700)
-        self.git(repo, 'fetch', 'origin')
+        try:
+            self.git(repo, 'fetch', '--prune', 'origin')
+        except TaskError:
+            raise TaskError('fetch_failed', 'GIT') from None
         actual_default = self.default_branch(project)
         if branch == actual_default:
             raise TaskError('default_branch_protected', 'GIT')
         remote = f'refs/remotes/origin/{branch}'
         exists = self.git(repo, 'show-ref', '--verify', remote, check=False).returncode == 0
+        if issue.get('repeat_branch'):
+            if not exists:
+                raise TaskError('remote_branch_missing', 'GIT')
+            sha = self.git(repo, 'rev-parse', remote).stdout.strip()
+            # Detached archives preserve the old commits; never reset the old branch.
+            for entry in self.git(repo, 'worktree', 'list', '--porcelain').stdout.split('\n\n'):
+                if 'branch refs/heads/' + branch in entry.splitlines():
+                    path = Path(entry.splitlines()[0].removeprefix('worktree '))
+                    expected = task / ('previous-' + issue['previous_attempt'])
+                    if path != expected:
+                        raise TaskError('retry_workspace_conflict', 'GIT')
+                    self.git(path, 'checkout', '--detach')
+            if self.git(repo, 'show-ref', '--verify', 'refs/heads/' + branch, check=False).returncode == 0:
+                # Keep the old local ref as a named archive before recreating it.
+                self.git(repo, 'branch', '-m', branch, 'archive/' + issue['previous_attempt'])
+            self.git(repo, 'worktree', 'add', '-b', branch, str(worktree), sha)
+            worktree.chmod(0o700)
+            return worktree, sha
         base = issue.get('retry_sha') or (remote if exists else f'refs/remotes/origin/{project.base_branch}')
         if issue.get('retry_sha') and (exists or self.git(repo, 'show-ref', '--verify', 'refs/heads/' + branch, check=False).returncode == 0):
             raise TaskError('retry_workspace_conflict', 'GIT')

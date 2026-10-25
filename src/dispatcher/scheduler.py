@@ -1,5 +1,6 @@
 """Single daemon loop combining polling, fair admission, execution and delivery."""
 import json
+import sqlite3
 import time
 from dispatcher.attachments import IssueAttachmentManager
 from dispatcher.codex import CodexExecutor
@@ -16,7 +17,7 @@ from dispatcher.storage import Store
 from dispatcher.workspace import GitWorkspaceManager, TaskError
 
 SAFE_CODES = frozenset('''attachment_download_failed git_unavailable git_operation_failed
-    retry_sha_unavailable retry_workspace_conflict no_diff non_fast_forward publication_conflict publication_unavailable origin_changed default_branch_unavailable invalid_branch default_branch_protected worktree_already_exists clone_url_unavailable
+    branch_ownership_conflict retry_identity_conflict remote_branch_missing fetch_failed remote_head_changed reopen_failed pr_merged pr_identity_conflict retry_sha_unavailable retry_workspace_conflict no_diff non_fast_forward publication_conflict publication_unavailable origin_changed default_branch_unavailable invalid_branch default_branch_protected worktree_already_exists clone_url_unavailable
     unexpected_branch dirty_worktree no_commit rewritten_history unsupported_codex_cli
     codex_failed codex_timeout force_stop stop_requested quota_exhausted crash_recovery internal_error unsafe_path'''.split())
 
@@ -96,21 +97,50 @@ class Dispatcher:
                     if (not current or current['state'] != 'pending' or not current['available']
                             or current['version'] != candidate['version']):
                         continue
+                    current = dict(current, **self.store.branches(project.repository, candidate['number']))
                     issue = json.loads(current['snapshot'])
                     branch = self.git.branch(project, issue)
                     previous = self.store.db.execute(
                         'SELECT * FROM attempts WHERE repository=? AND number=? ORDER BY rowid DESC LIMIT 1',
                         (current['repository'], current['number'])).fetchone()
                     if previous:
-                        source = self.store.db.execute("""SELECT p.head_sha FROM task_pull_requests p
-                            JOIN iteration_pr_history h USING(pr_id) JOIN pr_resolutions r USING(pr_id)
-                            WHERE h.iteration_id=? AND r.target='rejected' ORDER BY h.id DESC LIMIT 1""",
-                            (previous['iteration_id'],)).fetchone()
-                        sha = source['head_sha'] if source else previous['result_sha']
-                        self.git.retry_source(project, issue['number'], sha)
-                        issue['retry_sha'] = sha
+                        source = self.store.db.execute("""SELECT DISTINCT p.* FROM task_pull_requests p
+                            JOIN iteration_pr_history h USING(pr_id)
+                            WHERE h.iteration_id=? AND p.issue_id=? AND p.repository_id=?""",
+                            (previous['iteration_id'], current['issue_id'], current['repository_id'])).fetchall()
+                        rejected = self.store.db.execute('''SELECT 1 FROM task_transitions
+                            WHERE issue_id=? AND iteration_id=? AND to_state='rejected' ''',
+                            (current['issue_id'], previous['iteration_id'])).fetchone()
+                        if (not rejected or len(source) != 1 or source[0]['merged_at'] or
+                                source[0]['head'] != previous['branch'] or
+                                source[0]['base'] != project.base_branch or
+                                current['work_branch'] != previous['branch']):
+                            raise TaskError('retry_identity_conflict', 'GIT')
+                        remote_pr = self.adapter.request(
+                            f'repos/{project.repository}/pulls/{source[0]["pr_number"]}')
+                        if (not isinstance(remote_pr, dict) or remote_pr.get('id') != source[0]['pr_id']
+                                or remote_pr.get('number') != source[0]['pr_number']
+                                or remote_pr.get('head', {}).get('ref') != source[0]['head']
+                                or remote_pr.get('base', {}).get('ref') != source[0]['base']
+                                or remote_pr.get('head', {}).get('repo', {}).get('id') != current['repository_id']
+                                or remote_pr.get('base', {}).get('repo', {}).get('id') != current['repository_id']
+                                or remote_pr.get('state') not in ('open', 'closed')):
+                            raise TaskError('pr_identity_conflict', 'GITHUB')
+                        if remote_pr.get('merged') is not False or remote_pr.get('merged_at'):
+                            raise TaskError('pr_merged', 'GITHUB')
+                        issue['repeat_branch'] = True
                         issue['previous_attempt'] = previous['attempt_id']
-                        branch = f'codex/issue-{issue["number"]}-iteration-{current["current_iteration_id"]}'
+                        branch = current['work_branch']
+                    elif current['work_branch']:
+                        branch = current['work_branch']
+                    else:
+                        if not self.store.save_branches(project.repository, current['number'],
+                                expected_version=current['version'], expected_iteration_id=current['current_iteration_id'],
+                                expected=self.store.branches(project.repository, current['number']),
+                                base_branch=project.base_branch, work_branch=branch,
+                                branch_source='generated' if branch != issue['target_branch'] else 'explicit',
+                                branch_status='resolved'):
+                            continue
                     if self.lifecycle.stopping:
                         return
                     attempt = self.execution.reserve(current, branch, self.config.max_parallel_tasks,
@@ -143,6 +173,10 @@ class Dispatcher:
                         self.execution.finish(attempt, 'failed', exc.code, exc.category, time.monotonic() - started)
                     except (OSError, RuntimeError):
                         self.execution.finish(attempt, 'failed', 'internal_error', 'DISPATCHER', time.monotonic() - started)
+                    break
+                except sqlite3.IntegrityError:
+                    event(self.config.logs / 'dispatcher.jsonl', 'admission_unavailable', level='WARN',
+                          project=project.id, task=candidate['number'], reason='branch_ownership_conflict')
                     break
                 except (GitHubError, TaskError) as exc:
                     event(self.config.logs / 'dispatcher.jsonl', 'admission_unavailable', level='WARN', project=project.id,
