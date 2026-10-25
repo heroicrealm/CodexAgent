@@ -26,11 +26,18 @@ class ExecutionStore:
         if self.db.execute("SELECT 1 FROM attempts WHERE repository=? AND branch=? AND state='running'",
                            (row['repository'], branch)).fetchone():
             return None
-        if self.db.execute("SELECT 1 FROM attempts WHERE repository=? AND branch=? AND number!=? AND state!='done'",
+        if self.db.execute("""SELECT 1 FROM attempts a JOIN tasks t ON t.repository=a.repository AND t.number=a.number
+                           WHERE a.repository=? AND a.branch=? AND a.number!=?
+                           AND (a.state='running' OR t.state NOT IN ('done','cancelled','revoked'))""",
                            (row['repository'], branch, row['number'])).fetchone():
             return None
+        if self.db.execute("""SELECT 1 FROM tasks WHERE repository=? AND number!=?
+                AND work_branch=? AND state NOT IN ('done','cancelled','revoked')""",
+                (row['repository'], row['number'], branch)).fetchone():
+            return None
         current = self.store.get(row['repository'], row['number'])
-        if (not current or current['state'] != 'pending' or not current['available']
+        if (not current or (current['work_branch'] is not None and current['work_branch'] != branch)
+                or current['state'] != 'pending' or not current['available']
                 or current['approved_version'] != current['version'] or current['content_hash'] != row['content_hash']
                 or current['version'] != row['version'] or current['current_iteration_id'] != row['current_iteration_id']):
             return None
