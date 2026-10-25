@@ -131,6 +131,7 @@ def render_queue(rows, projects, format='table', stream=None):
 
 # Explicit fields avoid dumping internal snapshots, remote credentials or process data.
 DETAIL_FIELDS = {
+    'cleanup_jobs': ('cleanup_id', 'generation', 'state', 'attempts', 'created_at', 'updated_at', 'started_at', 'completed_at', 'next_retry_at', 'last_error'),
     'decisions': ('id', 'version', 'action', 'source', 'result', 'event_id', 'created_at'),
     'command_diagnostics': ('action', 'event_id', 'reason'),
     'attempts': ('attempt_id', 'iteration_id', 'previous_attempt_id', 'version', 'branch', 'state', 'started_at', 'finished_at',

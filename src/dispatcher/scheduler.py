@@ -229,6 +229,9 @@ class Dispatcher:
                 pass
 
     def run(self):
+        from dispatcher.cleanup import CleanupWorker
+        self.cleanup_worker = CleanupWorker(self.config)
+        self.cleanup_worker.start()
         while not self.lifecycle.stopping or self.active:
             self.collect()
             if not self.lifecycle.stopping:
@@ -245,5 +248,7 @@ class Dispatcher:
         self.publisher.flush()
 
     def close(self):
+        if hasattr(self, 'cleanup_worker'):
+            self.cleanup_worker.close()
         self.quota.close()
         self.store.close()

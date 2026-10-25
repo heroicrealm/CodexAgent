@@ -116,7 +116,8 @@ def test_delivery_retry_restart_no_double_cleanup(monitored, tmp_path, failure):
         return result
     api.write.side_effect = failed
     delivery.cleanup = Mock(side_effect=TaskError('dirty_worktree') if failure == 'cleanup' else None)
-    assert delivery.poll(PROJECT) == ([] if failure == 'none' else [1])
+    assert delivery.poll(PROJECT) == ([1] if failure in ('close', 'close_lost') else [])
+    delivery.cleanup.assert_not_called()
     path = db.db.execute('PRAGMA database_list').fetchone()[2]
     reopened = Store(path)
     try:
@@ -124,10 +125,10 @@ def test_delivery_retry_restart_no_double_cleanup(monitored, tmp_path, failure):
         retry = CancellationDelivery(config, reopened, api)
         retry.cleanup = Mock()
         assert retry.poll(PROJECT) == retry.poll(PROJECT) == []
-        assert retry.cleanup.call_count == (0 if failure == 'none' else 1)
+        retry.cleanup.assert_not_called()
         assert remote['state'] == 'closed' and remote['state_reason'] == 'not_planned'
         assert sum(w[1] == 'PATCH' for w in writes) == 1
-        assert reopened.db.execute('SELECT issue_closed,cleaned,error FROM cancellations').fetchone()[:] == (1, 1, None)
+        assert reopened.db.execute('SELECT issue_closed,cleaned,error FROM cancellations').fetchone()[:] == (1, 0, None)
     finally:
         reopened.close()
 
@@ -214,7 +215,7 @@ def test_label_presence_is_not_authorization(monitored, action, mutation, reason
     assert db.get(PROJECT.repository, 1)['state'] == 'rejected'
 
 
-def test_concurrent_cancel_delivery_cleans_once(monitored, tmp_path):
+def test_concurrent_cancel_delivery_closes_once(monitored, tmp_path):
     from concurrent.futures import ThreadPoolExecutor
     from threading import Event
     rejected(monitored)
@@ -224,15 +225,17 @@ def test_concurrent_cancel_delivery_cleans_once(monitored, tmp_path):
     path = db.db.execute('PRAGMA database_list').fetchone()[2]
     entered, release = Event(), Event()
     cleanup = Mock()
+    original_request = api.request.side_effect
     def paused(*args):
         entered.set()
         assert release.wait(5)
-        cleanup(*args)
+        return original_request(*args)
+    api.request.side_effect = paused
     def worker():
         connection = Store(path)
         try:
             delivery = CancellationDelivery(config, connection, api)
-            delivery.cleanup = paused
+            delivery.cleanup = cleanup
             return delivery.poll(PROJECT)
         finally:
             connection.close()
@@ -245,7 +248,8 @@ def test_concurrent_cancel_delivery_cleans_once(monitored, tmp_path):
         release.set()
         assert future.result(timeout=5) == []
         assert contender.poll(PROJECT) == []
-    assert cleanup.call_count == 1
+    cleanup.assert_not_called()
+    assert db.db.execute("SELECT issue_closed FROM cancellations").fetchone()[0] == 1
 
 
 def test_sync_poll_delivers_cancel_and_reconciles_cancelled(monitored, tmp_path, monkeypatch):

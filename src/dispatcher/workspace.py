@@ -126,12 +126,14 @@ class GitWorkspaceManager:
                 if self.git(worktree, 'status', '--porcelain', '--untracked-files=all', '--ignored').stdout.strip():
                     raise TaskError('retry_workspace_conflict', 'GIT')
                 preserved = safe_path(self.config.workspace, task / ('previous-' + issue['previous_attempt']))
+                register_artifacts(self.config.workspace, task, preserved.name)
                 self.git(repo, 'worktree', 'move', str(worktree), str(preserved))
             attachments = safe_path(self.config.workspace, task / 'attachments')
             if attachments.exists():
                 archived = safe_path(self.config.workspace, task / ('attachments-' + issue['previous_attempt']))
                 if archived.exists():
                     raise TaskError('retry_workspace_conflict', 'GIT')
+                register_artifacts(self.config.workspace, task, archived.name)
                 attachments.rename(archived)
         if worktree.exists():
             raise TaskError('worktree_already_exists', 'GIT')
@@ -257,8 +259,6 @@ class TaskWorkspaceCleanup:
             raise TaskError('cleanup_requires_done')
         repo, task, worktree = self.manager.paths(project, row['number'])
         root = self.manager.config.workspace
-        if not task.exists():
-            return
         archived = dict(row).get('owned_worktrees', ())
         if any(not isinstance(name, str) or not name.startswith('previous-')
                or Path(name).name != name for name in archived):
@@ -268,6 +268,18 @@ class TaskWorkspaceCleanup:
                or Path(name).name != name for name in archived_attachments):
             raise TaskError('cleanup_invalid_registry')
         worktrees = [worktree] + [safe_path(root, task / name) for name in archived]
+        registered = self.registered(repo)
+        for registered_path in registered:
+            candidate = Path(registered_path)
+            if candidate.is_relative_to(task) and candidate not in worktrees:
+                raise TaskError('cleanup_ownership_unproven')
+        self.verify_metadata(repo, worktrees)
+        if not task.exists():
+            # A crash may leave Git metadata after the worktree disappeared.
+            for path in worktrees:
+                if str(path) in self.registered(repo):
+                    self.manager.git(repo, 'worktree', 'remove', str(path))
+            return
         # Preflight everything before removing the worktree or any artifacts.
         for path in task.rglob('*'):
             safe_path(root, path)
@@ -275,7 +287,10 @@ class TaskWorkspaceCleanup:
         owned = set()
         if registry.exists():
             try:
-                owned = {json.loads(line) for line in registry.read_text().splitlines()}
+                entries = [json.loads(line) for line in registry.read_text().splitlines()]
+                if any(not isinstance(name, str) for name in entries):
+                    raise ValueError
+                owned = set(entries)
             except (ValueError, TypeError):
                 raise TaskError('cleanup_invalid_registry') from None
             for name in owned:
@@ -283,6 +298,17 @@ class TaskWorkspaceCleanup:
                         or name in ('', '.', '..', 'worktree', 'attachments', registry.name)):
                     raise TaskError('cleanup_invalid_registry')
                 safe_path(root, task / name)
+        # Archive entries are write-ahead ownership intents; SQLite history must
+        # independently confirm their attempt before treating them as directories.
+        archive_names = set(archived) | set(archived_attachments)
+        if any(name.startswith(('previous-', 'attachments-')) and name not in archive_names for name in owned):
+            raise TaskError('cleanup_ownership_unproven')
+        owned -= archive_names
+        for historical in dict(row).get('owned_attempts', ()):
+            import re
+            if not isinstance(historical, str) or not re.fullmatch('[0-9a-f]{32}', historical):
+                raise TaskError('cleanup_invalid_attempt')
+            owned.update((historical + '.prompt', historical + '.codex.log'))
         # Compatibility with pre-registry attempts: only the supplied task attempt.
         attempt = dict(row).get('attempt_id')
         if attempt is not None:
@@ -327,15 +353,67 @@ class TaskWorkspaceCleanup:
             if path.exists() and self.manager.git(path, 'status', '--porcelain', '--untracked-files=all', '--ignored').stdout.strip():
                 raise TaskError('dirty_worktree', 'GIT')
         for path in worktrees:
-            if path.exists():
+            if path.exists() or str(path) in self.registered(repo):
+                self.verify_metadata(repo, [path])
                 self.manager.git(repo, 'worktree', 'remove', str(path))
         for path in attachment_files:
+            safe_path(root, path)
             path.unlink(missing_ok=True)
         for attachments in attachment_dirs:
-            (attachments / 'manifest.json').unlink(missing_ok=True)
+            safe_path(root, attachments / 'manifest.json').unlink(missing_ok=True)
             if attachments.exists():
                 attachments.rmdir()
         for name in owned:
-            (task / name).unlink(missing_ok=True)
-        registry.unlink(missing_ok=True)
+            safe_path(root, task / name).unlink(missing_ok=True)
+        safe_path(root, registry).unlink(missing_ok=True)
         task.rmdir()
+
+
+    def registered(self, repo):
+        if not repo.exists():
+            return set()
+        output = self.manager.git(repo, 'worktree', 'list', '--porcelain', '-z').stdout
+        return {part.removeprefix('worktree ') for part in output.split('\0') if part.startswith('worktree ')}
+
+    def verify_metadata(self, repo, paths):
+        root = self.manager.config.workspace
+        safe_path(root, repo)
+        safe_path(root, repo / '.git')
+        registered = self.registered(repo)
+        for path in paths:
+            safe_path(root, path)
+            if not path.exists() and str(path) not in registered:
+                continue
+            if str(path) not in registered:
+                raise TaskError('cleanup_git_ownership_mismatch')
+            common = self.manager.git(repo, 'rev-parse', '--path-format=absolute', '--git-common-dir').stdout.strip()
+            # Repository clone must have its own local metadata, never another
+            # clone's gitdir or a symlink to a user repository.
+            if Path(common) != repo / '.git':
+                raise TaskError('cleanup_git_ownership_mismatch')
+            if path.exists():
+                dotgit = safe_path(root, path / '.git')
+                if not dotgit.is_file():
+                    raise TaskError('cleanup_git_ownership_mismatch')
+                content = dotgit.read_text().strip()
+                if not content.startswith('gitdir: '):
+                    raise TaskError('cleanup_git_ownership_mismatch')
+                metadata = safe_path(root, content.removeprefix('gitdir: '))
+                if metadata.parent != repo / '.git' / 'worktrees':
+                    raise TaskError('cleanup_git_ownership_mismatch')
+                pointer = safe_path(root, metadata / 'gitdir')
+                if pointer.read_text().strip() != str(dotgit):
+                    raise TaskError('cleanup_git_ownership_mismatch')
+                actual = self.manager.git(path, 'rev-parse', '--path-format=absolute', '--git-common-dir').stdout.strip()
+                if actual != common:
+                    raise TaskError('cleanup_git_ownership_mismatch')
+            else:
+                # Missing directory: require a reciprocal metadata registration.
+                metadata_root = safe_path(root, repo / '.git' / 'worktrees')
+                matches = []
+                for metadata in metadata_root.iterdir():
+                    pointer = safe_path(root, metadata / 'gitdir')
+                    if pointer.is_file() and pointer.read_text().strip() == str(path / '.git'):
+                        matches.append(metadata)
+                if len(matches) != 1:
+                    raise TaskError('cleanup_git_ownership_mismatch')
