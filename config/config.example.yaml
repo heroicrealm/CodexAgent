@@ -36,6 +36,7 @@ projects:
       reject: {name: 'dispatcher:reject', color: 'B60205', description: 'Отклонить выполнение'}
       pending: {name: 'dispatcher:pending', color: 'FBCA04', description: 'Подтверждено, ожидает запуска'}
       running: {name: 'dispatcher:running', color: '1D76DB', description: 'Задание выполняется'}
+      review_on_error: {name: 'dispatcher:review-on-error', color: 'D93F0B', description: 'Терминальная ошибка; требуется ручное решение'}
       review: {name: 'dispatcher:review', color: '5319E7', description: 'Ожидает приёмки'}
       done: {name: 'dispatcher:done', color: '0E8A16', description: 'Задание принято'}
       failed: {name: 'dispatcher:failed', color: 'D93F0B', description: 'Ошибка выполнения'}

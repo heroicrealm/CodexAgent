@@ -338,3 +338,22 @@ def upgrade607(db):
         BEGIN SELECT RAISE(ABORT,'Cleanup owns attempt history'); END""")
     validate(db)
     db.execute('INSERT OR IGNORE INTO schema_migrations VALUES(607)')
+
+
+def upgrade608(db):
+    """Terminal decision and immutable delivery survive publication failures."""
+    db.execute("""CREATE TABLE IF NOT EXISTS terminal_errors(
+        issue_id INTEGER PRIMARY KEY REFERENCES tasks(issue_id),
+        attempt_id TEXT NOT NULL UNIQUE REFERENCES attempts(attempt_id),
+        iteration_id INTEGER NOT NULL, version INTEGER NOT NULL,
+        reason TEXT NOT NULL, pr_number INTEGER NOT NULL, pr_id INTEGER NOT NULL,
+        created_at TEXT NOT NULL, publication TEXT NOT NULL DEFAULT 'pending',
+        diagnostic TEXT, body TEXT, comment_id TEXT, delivered INTEGER NOT NULL DEFAULT 0)""")
+    db.execute("""CREATE TABLE IF NOT EXISTS configuration_errors(
+        issue_id INTEGER NOT NULL REFERENCES tasks(issue_id), content_hash TEXT NOT NULL,
+        code TEXT NOT NULL, created_at TEXT NOT NULL, body TEXT NOT NULL,
+        delivered INTEGER NOT NULL, comment_id TEXT, PRIMARY KEY(issue_id,content_hash))""")
+    db.execute("""CREATE TRIGGER IF NOT EXISTS terminal_state_guard BEFORE UPDATE OF state ON tasks
+        WHEN OLD.state='review_on_error' AND NEW.state!=OLD.state
+        BEGIN SELECT RAISE(ABORT,'Terminal review_on_error'); END""")
+    db.execute('INSERT OR IGNORE INTO schema_migrations VALUES(608)')

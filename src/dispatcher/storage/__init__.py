@@ -23,7 +23,7 @@ def content_hash(issue):
 
 class Store:
     def __init__(self, path):
-        from .migrations import prepare, initialize, upgrade604, upgrade605, upgrade606, upgrade607, VERSION
+        from .migrations import prepare, initialize, upgrade604, upgrade605, upgrade606, upgrade607, upgrade608, VERSION
         prepare(path)
         self.db = sqlite3.connect(path, timeout=30)
         os.chmod(path, 0o600)
@@ -40,6 +40,7 @@ class Store:
                 upgrade605(self.db)
                 upgrade606(self.db)
                 upgrade607(self.db)
+                upgrade608(self.db)
         except Exception:
             self.db.close()
             raise
@@ -62,6 +63,7 @@ class Store:
             self.db.execute('BEGIN IMMEDIATE')
             before = self.get(repository, number)
             applied = (before is not None and before['version'] == expected_version
+                       and not self.configuration_blocked(before)
                        and before['available'] and before['state'] == 'discovered'
                        and self._set_state(before, 'pending', expected_version))
             if applied:
@@ -91,6 +93,7 @@ class Store:
                     'SELECT 1 FROM decisions WHERE repository=? AND event_id=?', (repository, str(event_id))).fetchone():
                 return 'duplicate'
             row = self.get(repository, number)
+            valid = valid and not (action == 'approve' and self.configuration_blocked(row))
             valid = valid and (expected_state is None or (row is not None and row['state'] == expected_state))
             valid = valid and (expected_synced_at is None or (row is not None and row['synced_at'] == expected_synced_at))
             blocked = self.blocked(repository, number, action) if source == 'github' else None
@@ -119,6 +122,10 @@ class Store:
             if result == 'applied' and action == 'approve':
                 self.db.execute('UPDATE task_iterations SET decision_id=? WHERE iteration_id=?', (receipt.lastrowid, iteration))
             return result
+
+    def configuration_blocked(self, row):
+        from dispatcher.preparation_error import blocked
+        return blocked(self, row)
 
     def reset_confirmation(self, repository, number, expected_version):
         """Compare-and-reset operation for stage 3; never changes active attempts."""
@@ -289,7 +296,7 @@ class Store:
 
     def _set_state(self, row, target, approved_version, *, current_iteration=None):
         """Shared CAS primitive; caller verifies authority/evidence and journals atomically."""
-        if row is None or row['state'] in ('done', 'cancelled'):
+        if row is None or row['state'] in ('done', 'cancelled', 'review_on_error'):
             return False
         expected_iteration = row['current_iteration_id'] if current_iteration is None else current_iteration
         cursor = self.db.execute("""UPDATE tasks SET state=?,approved_version=?
@@ -358,7 +365,7 @@ class Store:
                 return False
             if values == expected:
                 return True
-            if row['state'] in ('running', 'review', 'done', 'cancelled') or self.db.execute(
+            if row['state'] in ('running', 'review', 'done', 'cancelled', 'review_on_error') or self.db.execute(
                     "SELECT 1 FROM attempts WHERE repository=? AND number=? AND state='running'",
                     (repository, number)).fetchone():
                 return False

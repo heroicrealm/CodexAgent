@@ -2,6 +2,8 @@
 import json
 import sqlite3
 import time
+from dataclasses import replace
+from dispatcher import preparation_error
 from dispatcher.attachments import IssueAttachmentManager
 from dispatcher.codex import CodexExecutor
 from dispatcher.codex.quota import CodexQuotaProvider
@@ -12,6 +14,7 @@ from dispatcher.initialization import ready
 from dispatcher.logging import event
 from dispatcher.publisher import TaskResultPublisher
 from dispatcher.pr_publication import PullRequestPublisher
+from dispatcher.terminal_error import TerminalError, canonical_merged
 from dispatcher.runtime import identity
 from dispatcher.storage import Store
 from dispatcher.workspace import GitWorkspaceManager, TaskError
@@ -99,9 +102,18 @@ class Dispatcher:
                         continue
                     current = dict(current, **self.store.branches(project.repository, candidate['number']))
                     issue = json.loads(current['snapshot'])
-                    branch = self.git.branch(project, issue)
+                    try:
+                        params = preparation_error.parameters(issue['body'])
+                        preparation_project = replace(project, base_branch=current['base_branch'] or params.get('base_branch', project.base_branch))
+                        branch = params.get('branch_name') or self.git.branch(preparation_project, issue)
+                        self.git.validate_branch(branch)
+                        self.git.validate_branch(preparation_project.base_branch)
+                    except TaskError as exc:
+                        if exc.code in preparation_error.CODES:
+                            preparation_error.record(self.store, current, exc.code)
+                        raise
                     previous = self.store.db.execute(
-                        'SELECT * FROM attempts WHERE repository=? AND number=? ORDER BY rowid DESC LIMIT 1',
+                        'SELECT * FROM attempts WHERE repository=? AND number=? AND (codex_started=1 OR initial_sha IS NOT NULL) ORDER BY rowid DESC LIMIT 1',
                         (current['repository'], current['number'])).fetchone()
                     if previous:
                         source = self.store.db.execute("""SELECT DISTINCT p.* FROM task_pull_requests p
@@ -113,7 +125,7 @@ class Dispatcher:
                             (current['issue_id'], previous['iteration_id'])).fetchone()
                         if (not rejected or len(source) != 1 or source[0]['merged_at'] or
                                 source[0]['head'] != previous['branch'] or
-                                source[0]['base'] != project.base_branch or
+                                source[0]['base'] != preparation_project.base_branch or
                                 current['work_branch'] != previous['branch']):
                             raise TaskError('retry_identity_conflict', 'GIT')
                         remote_pr = self.adapter.request(
@@ -126,6 +138,12 @@ class Dispatcher:
                                 or remote_pr.get('base', {}).get('repo', {}).get('id') != current['repository_id']
                                 or remote_pr.get('state') not in ('open', 'closed')):
                             raise TaskError('pr_identity_conflict', 'GITHUB')
+                        if canonical_merged(remote_pr, source[0], current, previous, preparation_project):
+                            # No new attempt or workspace is needed to preserve
+                            # the previous result. Fence the pending decision.
+                            TerminalError(self.pr_publisher).record(previous, source[0], preparation=current)
+                            self.pr_publisher.publish(preparation_project, previous)
+                            continue
                         if remote_pr.get('merged') is not False or remote_pr.get('merged_at'):
                             raise TaskError('pr_merged', 'GITHUB')
                         issue['repeat_branch'] = True
@@ -137,7 +155,7 @@ class Dispatcher:
                         if not self.store.save_branches(project.repository, current['number'],
                                 expected_version=current['version'], expected_iteration_id=current['current_iteration_id'],
                                 expected=self.store.branches(project.repository, current['number']),
-                                base_branch=project.base_branch, work_branch=branch,
+                                base_branch=preparation_project.base_branch, work_branch=branch,
                                 branch_source='generated' if branch != issue['target_branch'] else 'explicit',
                                 branch_status='resolved'):
                             continue
@@ -150,7 +168,7 @@ class Dispatcher:
                     self.cursor = (self.projects.index(project) + 1) % len(self.projects)
                     started = time.monotonic()
                     try:
-                        worktree, sha = self.git.prepare(project, issue, branch)
+                        worktree, sha = self.git.prepare(preparation_project, issue, branch)
                         self.execution.update(attempt, worktree=str(worktree), initial_sha=sha)
                         if issue.get('previous_attempt'):
                             archived = worktree.parent / ('previous-' + issue['previous_attempt'])
@@ -167,10 +185,13 @@ class Dispatcher:
                         process = self.executor.start(issue, branch, paths, worktree, task, attempt)
                         self.execution.update(attempt, codex_started=1, pid=process['child'].pid,
                                               process_identity=identity(process['child'].pid))
-                        self.active[attempt] = dict(process, project=project, worktree=worktree, origin=origin,
+                        self.active[attempt] = dict(process, project=preparation_project, worktree=worktree, origin=origin,
                                                     initial_sha=sha, branch=branch, issue=issue, started=started, failure=None)
                     except TaskError as exc:
-                        self.execution.finish(attempt, 'failed', exc.code, exc.category, time.monotonic() - started)
+                        if exc.code in preparation_error.CODES:
+                            preparation_error.record(self.store, current, exc.code)
+                        else:
+                            self.execution.finish(attempt, 'failed', exc.code, exc.category, time.monotonic() - started)
                     except (OSError, RuntimeError):
                         self.execution.finish(attempt, 'failed', 'internal_error', 'DISPATCHER', time.monotonic() - started)
                     break
@@ -241,7 +262,8 @@ class Dispatcher:
                 self.quota.check()
                 self.admit()
             if time.monotonic() >= self.next_publish:
-                self.pr_publisher.flush(self.projects)
+                preparation_error.flush(self.store, self.adapter, self.config.projects)
+                self.pr_publisher.flush(self.config.projects)
                 self.publisher.flush()
                 self.next_publish = time.monotonic() + min(30, self.config.poll_interval_seconds)
             time.sleep(.05)

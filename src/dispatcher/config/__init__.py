@@ -13,6 +13,8 @@ COLORS = dict(zip(
     'ready discovered approve reject pending running review done failed rejected revoked cancelled interrupted'.split(),
     '0E8A16 D4C5F9 0E8A16 B60205 FBCA04 1D76DB 5319E7 0E8A16 D93F0B B60205 C2E0C6 E99695 F9D0C4'.split()))
 
+COLORS['review_on_error'] = 'D93F0B'
+
 
 @dataclass(frozen=True)
 class Label:
@@ -35,7 +37,8 @@ class Project:
     init_fingerprint: str = ''
 
     def label(self, key):
-        return self.labels.get(key, Label(self.task_label if key == 'ready' else f'dispatcher:{key}', COLORS[key]))
+        return self.labels.get(key, Label(self.task_label if key == 'ready' else f'dispatcher:{key.replace("_", "-")}', COLORS[key],
+            'Terminal error; manual resolution required' if key == 'review_on_error' else ''))
 
 
 @dataclass(frozen=True)
