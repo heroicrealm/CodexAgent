@@ -176,7 +176,12 @@ def transition(store, *, repository, number, expected_state, version, iteration_
             if target == 'review' and linked and db.execute(
                     'SELECT 1 FROM iteration_pr_history WHERE pr_id=? AND iteration_id!=?',
                     (evidence.pr_id, iteration_id)).fetchone():
-                return Outcome.CONFLICT
+                previous = db.execute("""SELECT 1 FROM task_transitions tr
+                    JOIN iteration_pr_history h ON h.iteration_id=tr.iteration_id
+                    WHERE tr.issue_id=? AND tr.to_state='rejected' AND h.pr_id=?
+                    AND tr.iteration_id!=?""", (row['issue_id'], evidence.pr_id, iteration_id)).fetchone()
+                if not previous or row['work_branch'] != evidence.head or linked[0]['merged_at']:
+                    return Outcome.CONFLICT
             if target == 'review' and db.execute(
                     'SELECT 1 FROM task_pull_requests WHERE issue_id=? AND head=? AND pr_id!=?',
                     (row['issue_id'], evidence.head, evidence.pr_id)).fetchone():

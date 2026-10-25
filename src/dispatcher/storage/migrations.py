@@ -177,10 +177,10 @@ SCHEMA += """
 
 SCHEMA += """
 CREATE TABLE IF NOT EXISTS pr_resolutions(
- pr_id INTEGER PRIMARY KEY REFERENCES task_pull_requests(pr_id),
+ pr_id INTEGER NOT NULL REFERENCES task_pull_requests(pr_id),
  iteration_id INTEGER NOT NULL REFERENCES task_iterations(iteration_id),
  target TEXT NOT NULL, metadata TEXT NOT NULL, issue_closed_at TEXT,
- comment_id INTEGER, error TEXT);
+ comment_id INTEGER, error TEXT, PRIMARY KEY(pr_id,iteration_id));
 """
 
 TRIGGERS = (
@@ -286,3 +286,16 @@ def upgrade605(db):
         BEGIN SELECT RAISE(ABORT,'Historical branch reserved by Issue'); END""")
     validate(db)
     db.execute('INSERT OR IGNORE INTO schema_migrations VALUES(?)', (BRANCH_VERSION,))
+
+
+def upgrade606(db):
+    """Retain one resolution per PR/iteration, atomically with the schema marker."""
+    keys = [r[1] for r in db.execute('PRAGMA table_info(pr_resolutions)') if r[5]]
+    if keys == ['pr_id']:
+        statement = next(s for s in SCHEMA.split(';') if 'CREATE TABLE IF NOT EXISTS pr_resolutions(' in s)
+        db.execute(statement.replace('pr_resolutions(', 'resolutions_upgrade606('))
+        db.execute('INSERT INTO resolutions_upgrade606 SELECT * FROM pr_resolutions')
+        db.execute('DROP TABLE pr_resolutions')
+        db.execute('ALTER TABLE resolutions_upgrade606 RENAME TO pr_resolutions')
+    validate(db)
+    db.execute('INSERT OR IGNORE INTO schema_migrations VALUES(606)')

@@ -52,7 +52,7 @@ class PullRequestPublisher:
 
     def _publish(self, project, attempt):
         key, iteration = 'pr:' + attempt['attempt_id'], attempt['iteration_id']
-        phase = 'verify'
+        phase, repeated, reuse_key = 'verify', False, None
         def progress(value, outcome='pending'):
             self.store.publication(key, iteration, value, outcome)
         try:
@@ -78,12 +78,30 @@ class PullRequestPublisher:
                 raise GitHubError(kind='invalid_response')
             if self.adapter.repository_identity(project) != task['repository_id']:
                 raise TaskError('publication_conflict', 'GITHUB')
+            prior = self.store.db.execute("""SELECT p.* FROM task_pull_requests p
+                JOIN iteration_pr_history h USING(pr_id) JOIN task_iterations i USING(iteration_id)
+                WHERE p.issue_id=? AND p.repository_id=? AND i.iteration_id!=?
+                ORDER BY i.iteration_number DESC LIMIT 1""",
+                (task['issue_id'], task['repository_id'], iteration)).fetchone()
+            repeated = self.store.db.execute('SELECT iteration_number FROM task_iterations WHERE iteration_id=?',
+                                             (iteration,)).fetchone()[0] > 1
+            if repeated and prior is None:
+                raise TaskError('pr_identity_conflict', 'GITHUB')
             worktree = Path(attempt['worktree'])
             sha = self.git.publication_commit(worktree, attempt['branch'], attempt['initial_sha'], project.base_branch)
             self.execution.update(attempt['attempt_id'], result_sha=sha)
             phase = 'push'
             progress(phase)
-            self.git.push(project, worktree, attempt['branch'], attempt['origin_url'])
+            if repeated:
+                remote_before = self.git.git(worktree, 'ls-remote', 'origin',
+                                            'refs/heads/' + attempt['branch']).stdout.split()
+                # A lost push response may already have installed our persisted result.
+                if not remote_before:
+                    raise TaskError('remote_branch_missing', 'GIT')
+                if remote_before[0] not in (attempt['initial_sha'], sha):
+                    raise TaskError('remote_head_changed', 'GIT')
+            if not attempt['pushed']:
+                self.git.push(project, worktree, attempt['branch'], attempt['origin_url'])
             remote = self.git.git(worktree, 'ls-remote', 'origin', 'refs/heads/' + attempt['branch']).stdout.split()
             if not remote or remote[0] != sha:
                 raise GitHubError(kind='invalid_response')
@@ -100,7 +118,37 @@ class PullRequestPublisher:
                 if len(candidates) > 1:
                     raise TaskError('publication_conflict', 'GITHUB')
                 return candidates[0] if candidates else None
-            found = find()
+            if repeated:
+                reuse_key = f'reopen:{iteration}:{prior["pr_id"]}'
+                self.store.publication(reuse_key, iteration, 'verify')
+                endpoint = f'repos/{repo}/pulls/{prior["pr_number"]}'
+                found = self.adapter.request(endpoint)
+                def validate_prior(pr):
+                    if (not isinstance(pr, dict) or pr.get('id') != prior['pr_id']
+                            or pr.get('number') != prior['pr_number']
+                            or prior['head'] != attempt['branch'] or prior['base'] != project.base_branch
+                            or pr.get('head', {}).get('ref') != prior['head']
+                            or pr.get('base', {}).get('ref') != prior['base']
+                            or pr.get('head', {}).get('repo', {}).get('id') != task['repository_id']
+                            or pr.get('base', {}).get('repo', {}).get('id') != task['repository_id']):
+                        raise TaskError('pr_identity_conflict', 'GITHUB')
+                    if pr.get('merged') is not False or pr.get('merged_at'):
+                        raise TaskError('pr_merged', 'GITHUB')
+                validate_prior(found)
+                if found.get('state') == 'closed':
+                    phase = 'reopen:' + str(prior['pr_id'])
+                    progress(phase)
+                    self.store.publication(reuse_key, iteration, 'reopen')
+                    try:
+                        self.adapter.write(endpoint, 'PATCH', dict(state='open'))
+                    except GitHubError:
+                        pass  # Reconcile an unknown result before deciding to retry.
+                    found = self.adapter.request(endpoint)
+                    validate_prior(found)
+                if found.get('state') != 'open':
+                    raise TaskError('reopen_failed', 'GITHUB')
+            else:
+                found = find()
             if found is None:
                 # Repeat authoritative search immediately before the non-idempotent POST.
                 found = find()
@@ -120,6 +168,8 @@ class PullRequestPublisher:
             if not isinstance(found, dict) or not rest_id(found.get('number')):
                 raise GitHubError(kind='invalid_response')
             pr = self.adapter.request(f'repos/{repo}/pulls/{found["number"]}')
+            if repeated:
+                validate_prior(pr)
             if not isinstance(pr, dict):
                 raise GitHubError(kind='invalid_response')
             stamp = self.adapter.response_date
@@ -134,6 +184,8 @@ class PullRequestPublisher:
                     or pr.get('base', {}).get('repo', {}).get('id') != task['repository_id']
                     or type(pr.get('changed_files')) is not int or pr['changed_files'] <= 0):
                 raise TaskError('publication_conflict', 'GITHUB')
+            if reuse_key:
+                self.store.publication(reuse_key, iteration, 'confirmed', 'completed')
             guard = self.store.guard(project.repository, task['number'])
             fence = guard['server_at'] or json.loads(task['snapshot']).get('server_observed_at')
             proof = Evidence(task['repository_id'], task['issue_id'], task['number'], stamp, stamp,
@@ -153,12 +205,16 @@ class PullRequestPublisher:
             self.adapter.reconcile(project, self.store.get(project.repository, task['number']))
             progress('label', 'completed')
         except TaskError as exc:
+            if reuse_key:
+                self.store.publication(reuse_key, iteration, exc.code, 'failed', retry=True)
             self.execution.update(attempt['attempt_id'], recovery_diagnostic=exc.code)
-            if exc.code in ('no_diff', 'publication_conflict'):
+            if exc.code == 'no_diff' or (exc.code == 'publication_conflict' and not repeated):
                 self.execution.finish(attempt['attempt_id'], 'failed', exc.code, exc.category)
                 progress('terminal', 'failed')
             else:
                 self.store.publication(key, iteration, phase, 'failed', retry=True)
         except (GitHubError, OSError, ValueError, TypeError, KeyError, AttributeError, sqlite3.Error):
+            if reuse_key:
+                self.store.publication(reuse_key, iteration, 'publication_unavailable', 'failed', retry=True)
             self.execution.update(attempt['attempt_id'], recovery_diagnostic='publication_unavailable')
             self.store.publication(key, iteration, phase, 'failed', retry=True)

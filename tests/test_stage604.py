@@ -155,7 +155,7 @@ def test_closed_issue_still_observes_merge(monitored):
     assert store.get(PROJECT.repository, 1)['state'] == 'done'
 
 
-def test_explicit_retry_without_edit_new_iteration_new_pr(monitored):
+def test_legacy_distinct_pr_history_remains_readable(monitored):
     store, api, pull, _, comments, writes, attempt = monitored
     assert poll(monitored) == []
     prior_iteration = store.get(PROJECT.repository, 1)['current_iteration_id']
@@ -232,7 +232,7 @@ def test_retry_missing_sha_blocks(env):
             manager.retry_source(project, 1, sha)
 
 
-def test_scheduler_retry_creates_new_branch_and_pr_from_rejected_sha(env):
+def test_scheduler_retry_reuses_branch_and_pr_from_current_origin(env):
     from test_stage04 import adapter, register, finish
     from dispatcher.scheduler import Dispatcher
     from dispatcher.runtime import Lifecycle
@@ -252,12 +252,27 @@ def test_scheduler_retry_creates_new_branch_and_pr_from_rejected_sha(env):
         assert dispatcher.store.get(project.repository, 1)['state'] == 'rejected'
         assert decide_cli(dispatcher.store, api, project, 1, 'approve') == ('applied', True)
         original_write = api.write.side_effect
-        def new_pr(endpoint, method, payload):
-            result = original_write(endpoint, method, payload)
-            if endpoint.endswith('/pulls'):
-                result.update(id=302, number=3)
-            return result
-        api.write.side_effect = new_pr
+        original_request = api.request.side_effect
+        def reopen(endpoint, method, payload):
+            if '/pulls/' in endpoint and method == 'PATCH':
+                api._pr.update(payload)
+                return deepcopy(api._pr)
+            return original_write(endpoint, method, payload)
+        def read(endpoint):
+            value = original_request(endpoint)
+            if '/pulls/' in endpoint:
+                value['head']['sha'] = git(env[4], 'rev-parse', 'refs/heads/' + first['branch'])
+            return value
+        api.write.side_effect, api.request.side_effect = reopen, read
+        # A human advances origin after rejection; the dispatcher clone is behind.
+        seed = env[3]
+        git(seed, 'fetch', str(env[4]), first['branch'])
+        git(seed, 'checkout', '-b', 'human', 'FETCH_HEAD')
+        (seed / 'manual.txt').write_text('keep this manual correction')
+        git(seed, 'add', '.')
+        git(seed, 'commit', '-m', 'Manual correction')
+        updated = git(seed, 'rev-parse', 'HEAD')
+        git(seed, 'push', str(env[4]), 'HEAD:refs/heads/' + first['branch'])
         env[2].write_text(json.dumps(dict(exec='dirty')))
         dispatcher.admit()
         finish(dispatcher)
@@ -265,11 +280,13 @@ def test_scheduler_retry_creates_new_branch_and_pr_from_rejected_sha(env):
         assert len(attempts) == 2
         second = attempts[1]
         assert second['state'] == 'review'
-        assert second['initial_sha'] == first['result_sha']
-        assert second['branch'] != first['branch']
-        assert {r['pr_id'] for r in dispatcher.store.db.execute('SELECT * FROM task_pull_requests')} == {301, 302}
+        assert second['initial_sha'] == updated
+        assert (__import__('pathlib').Path(second['worktree']) / 'manual.txt').read_text() == 'keep this manual correction'
+        assert second['branch'] == first['branch']
+        assert {r['pr_id'] for r in dispatcher.store.db.execute('SELECT * FROM task_pull_requests')} == {301}
         assert old_pr['head']['ref'] == first['branch']
-        assert not any(c.args[1] == 'PATCH' and '/pulls/' in c.args[0] for c in api.write.call_args_list)
+        assert sum(c.args[1] == 'PATCH' and '/pulls/' in c.args[0] for c in api.write.call_args_list) == 1
+        assert dispatcher.store.db.execute('SELECT count(DISTINCT iteration_id) FROM iteration_pr_history').fetchone()[0] == 2
     finally:
         dispatcher.close()
 
