@@ -217,8 +217,11 @@ class Adapter:
         except (KeyError, TypeError, AttributeError):
             raise GitHubError('Cannot verify command version') from None
 
-    def reconcile(self, project, row):
-        """Only touch configured indicator/command labels, preserving ready and others."""
+    def reconcile(self, project, row, *, store=None):
+        """Deliver state labels; consume commands only with durable queue receipts.
+
+        Without a store, leave command labels for a later verified poll.
+        """
         from urllib.parse import quote
         from dispatcher.config import COLORS
         endpoint = f'repos/{project.repository}/issues/{row["number"]}/labels'
@@ -226,7 +229,33 @@ class Adapter:
         desired = project.label(row['state']).name
         managed = {project.label(k).name.casefold() for k in COLORS if k != 'ready'}
         present = {v['name'].casefold(): v['name'] for v in current}
+        # State delivery must never consume a command that the queue has not
+        # examined. In particular, PR comment delivery may span several polls.
+        commands = {project.label(k).name.casefold(): k for k in ('approve', 'reject')}
+        if row['state'] == 'rejected':
+            commands[project.label('cancelled').name.casefold()] = 'cancel'
+        removable = set()
+        if store is not None and commands.keys() & present.keys():
+            for label, action in commands.items():
+                block = store.blocked(project.repository, row['number'], action)
+                if block is not None and block['event_id'] is None:
+                    removable.add(label)
+            events = []
+            if (commands.keys() & present.keys()) - removable:
+                events, _ = self.command_events(project, row['number'])
+            latest = {}
+            for event in sorted(events, key=lambda e: e['id']):
+                if event.get('event') in ('labeled', 'unlabeled'):
+                    latest[event['label']['name'].casefold()] = event
+            for label in commands:
+                event = latest.get(label)
+                if (event and event['event'] == 'labeled' and store.db.execute(
+                            'SELECT 1 FROM decisions WHERE repository=? AND number=? AND event_id=?',
+                            (project.repository.casefold(), row['number'], str(event['id']))).fetchone()):
+                    removable.add(label)
         for folded, name in present.items():
+            if folded in commands and folded not in removable:
+                continue
             if folded in managed and folded != desired.casefold():
                 self.write(endpoint + '/' + quote(name, safe=''), 'DELETE', {})
         if desired.casefold() not in present:

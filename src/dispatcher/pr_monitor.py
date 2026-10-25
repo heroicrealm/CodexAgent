@@ -161,7 +161,7 @@ class PullRequestMonitor:
             with db:
                 db.execute('UPDATE pr_resolutions SET comment_id=?,error=NULL WHERE pr_id=? AND iteration_id=?',
                            (existing['id'], linked['pr_id'], linked['iteration_id']))
-        api.reconcile(project, self.store.get(project.repository, linked['number']))
+        api.reconcile(project, self.store.get(project.repository, linked['number']), store=self.store)
         with db:
             db.execute('UPDATE pr_resolutions SET error=NULL WHERE pr_id=? AND iteration_id=?', (linked['pr_id'], linked['iteration_id']))
         self.store.publication(key, linked['iteration_id'], 'delivered', 'completed')

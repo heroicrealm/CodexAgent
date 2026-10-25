@@ -224,7 +224,7 @@ class Dispatcher:
             del self.active[attempt]
             try:
                 self.adapter.reconcile(task['project'], self.store.get(task['project'].repository,
-                                                                      self.execution.get(attempt)['number']))
+                                                                      self.execution.get(attempt)['number']), store=self.store)
             except GitHubError:
                 pass
 

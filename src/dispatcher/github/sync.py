@@ -54,7 +54,7 @@ class SyncService:
                 # Always reconcile, even when a command was rejected. DB is authoritative.
                 for row in self.store.queue(project.repository):
                     try:
-                        self.adapter.reconcile(project, row)
+                        self.adapter.reconcile(project, row, store=self.store)
                     except GitHubError:
                         result['errors'].append(dict(project=project.id, error='GitHub label sync failed; will retry'))
                         self.log('label_sync_failed', project)

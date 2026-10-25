@@ -166,7 +166,7 @@ def decide_cli(store, adapter, project, number, action):
     if result not in ('applied', 'already_applied'):
         raise RuntimeError('Decision conflicts with current version, readiness or previous decision; inspect show')
     try:
-        adapter.reconcile(project, store.get(project.repository, number))
+        adapter.reconcile(project, store.get(project.repository, number), store=store)
     except GitHubError:
         return result, False
     return result, True

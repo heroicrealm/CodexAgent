@@ -40,7 +40,7 @@ def store(tmp_path):
 
 @pytest.fixture(autouse=True)
 def stage2_label_boundary(monkeypatch):
-    monkeypatch.setattr(Adapter, 'reconcile', lambda *args: None)
+    monkeypatch.setattr(Adapter, 'reconcile', lambda *args, **kwargs: None)
     monkeypatch.setattr(Adapter, 'repository_identity', lambda *args: 100)
 
 

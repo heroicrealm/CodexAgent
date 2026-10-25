@@ -202,7 +202,7 @@ class PullRequestPublisher:
             self.execution.finish(attempt['attempt_id'], 'review')
             phase = 'label'
             progress(phase)
-            self.adapter.reconcile(project, self.store.get(project.repository, task['number']))
+            self.adapter.reconcile(project, self.store.get(project.repository, task['number']), store=self.store)
             progress('label', 'completed')
         except TaskError as exc:
             if reuse_key:
