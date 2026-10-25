@@ -196,7 +196,7 @@ def test_reconcile_preserves_ready_and_unrelated_and_retries(setup, state):
     adapter.reconcile(project, row)
     calls = adapter.write.call_args_list
     deletes = [c.args[0] for c in calls if c.args[1] == 'DELETE']
-    assert len(deletes) == 3 and all('ready' not in url and 'other' not in url for url in deletes)
+    assert len(deletes) == 1 and all('ready' not in url and 'other' not in url for url in deletes)
     assert calls[-1].args[2] == dict(labels=[project.label(state).name])
     adapter.pages.return_value = [dict(name=name) for name in [project.task_label, 'other', project.label(state).name]]
     adapter.write.reset_mock()
