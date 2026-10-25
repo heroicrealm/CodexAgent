@@ -23,7 +23,7 @@ def content_hash(issue):
 
 class Store:
     def __init__(self, path):
-        from .migrations import prepare, initialize, upgrade604, upgrade605, upgrade606, VERSION
+        from .migrations import prepare, initialize, upgrade604, upgrade605, upgrade606, upgrade607, VERSION
         prepare(path)
         self.db = sqlite3.connect(path, timeout=30)
         os.chmod(path, 0o600)
@@ -39,6 +39,7 @@ class Store:
                 self.db.executemany('INSERT OR IGNORE INTO schema_migrations VALUES(?)', [(1,), (2,), (3,), (VERSION,), (604,)])
                 upgrade605(self.db)
                 upgrade606(self.db)
+                upgrade607(self.db)
         except Exception:
             self.db.close()
             raise

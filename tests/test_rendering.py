@@ -117,6 +117,7 @@ def test_show_json_populated_sections(unicode_task, capsys):
     expected['decisions'] = [dict(r) for r in store.db.execute('SELECT * FROM decisions')]
     expected['command_diagnostics'] = [dict(r) for r in store.db.execute('SELECT action,event_id,reason FROM command_quarantine')]
     expected['attempts'] = [dict(r) for r in store.db.execute('SELECT * FROM attempts')]
+    expected['cleanup_jobs'] = []
     expected['pull_requests'] = []
     expected['pr_sync_operations'] = []
     expected['attempts'][0]['previous_attempt_id'] = None

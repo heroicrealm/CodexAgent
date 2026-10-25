@@ -299,3 +299,42 @@ def upgrade606(db):
         db.execute('ALTER TABLE resolutions_upgrade606 RENAME TO pr_resolutions')
     validate(db)
     db.execute('INSERT OR IGNORE INTO schema_migrations VALUES(606)')
+
+
+def upgrade607(db):
+    """Durable cleanup generations; triggers include all SQL state writers."""
+    db.execute('''CREATE TABLE IF NOT EXISTS cleanup_jobs(
+        cleanup_id INTEGER PRIMARY KEY,
+        issue_id INTEGER NOT NULL REFERENCES tasks(issue_id), project_id TEXT NOT NULL,
+        repository TEXT NOT NULL, number INTEGER NOT NULL,
+        generation INTEGER NOT NULL, version INTEGER NOT NULL, attempt_id TEXT,
+        state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN ('pending','running','completed','failed')),
+        attempts INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+        started_at TEXT, completed_at TEXT, next_retry_at TEXT, last_error TEXT,
+        UNIQUE(issue_id,generation,version))''')
+    db.execute('CREATE INDEX IF NOT EXISTS cleanup_job_state ON cleanup_jobs(state,next_retry_at)')
+    db.execute('CREATE INDEX IF NOT EXISTS cleanup_attempt_task ON attempts(repository,number)')
+    for operation in ('INSERT', 'UPDATE'):
+        db.execute(f'''CREATE TRIGGER IF NOT EXISTS cleanup_enqueue_{operation.lower()}
+            AFTER {operation} ON tasks WHEN NEW.state IN ('done','cancelled')
+            BEGIN
+                INSERT OR IGNORE INTO cleanup_jobs(issue_id,project_id,repository,number,generation,version,
+                    attempt_id,created_at,updated_at)
+                VALUES(NEW.issue_id,NEW.project_id,NEW.repository,NEW.number,COALESCE(NEW.current_iteration_id,0),NEW.version,
+                    (SELECT attempt_id FROM attempts WHERE repository=NEW.repository AND number=NEW.number ORDER BY rowid DESC LIMIT 1),
+                    strftime('%Y-%m-%dT%H:%M:%f+00:00','now'),strftime('%Y-%m-%dT%H:%M:%f+00:00','now'));
+            END''')
+    db.execute('''CREATE TRIGGER IF NOT EXISTS cleanup_generation_guard BEFORE UPDATE ON tasks
+        WHEN EXISTS(SELECT 1 FROM cleanup_jobs j WHERE j.issue_id=OLD.issue_id AND j.state='running')
+        AND (NEW.state!=OLD.state OR NEW.issue_id!=OLD.issue_id OR NEW.project_id!=OLD.project_id
+             OR NEW.repository!=OLD.repository OR NEW.number!=OLD.number OR NEW.version!=OLD.version
+             OR NEW.current_iteration_id IS NOT OLD.current_iteration_id)
+        BEGIN SELECT RAISE(ABORT,'Cleanup owns task generation'); END''')
+    db.execute('''CREATE TRIGGER IF NOT EXISTS cleanup_attempt_guard BEFORE INSERT ON attempts
+        WHEN EXISTS(SELECT 1 FROM cleanup_jobs j WHERE j.repository=NEW.repository AND j.number=NEW.number AND j.state='running')
+        BEGIN SELECT RAISE(ABORT,'Cleanup owns task generation'); END''')
+    db.execute("""CREATE TRIGGER IF NOT EXISTS cleanup_attempt_update_guard BEFORE UPDATE ON attempts
+        WHEN EXISTS(SELECT 1 FROM cleanup_jobs j WHERE j.repository=OLD.repository AND j.number=OLD.number AND j.state='running')
+        BEGIN SELECT RAISE(ABORT,'Cleanup owns attempt history'); END""")
+    validate(db)
+    db.execute('INSERT OR IGNORE INTO schema_migrations VALUES(607)')

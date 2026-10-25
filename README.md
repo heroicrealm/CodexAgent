@@ -385,8 +385,8 @@ PR относительно `base_branch`, включая уже созданн�
 идентичности; неоднозначность блокирует запуск. Незавершённая публикация после
 успешного Codex продолжается без повторного exec. Остальные running становятся interrupted,
 outbox доставляется повторно. Не удаляйте SQLite и worktree для повторного запуска.
-`TaskWorkspaceCleanup` разрешает очистку только после done; подключение к ручной
-приемке оставлено следующему этапу.
+`TaskWorkspaceCleanup` удаляет проверенные артефакты после done/cancelled через
+независимую durable очередь (миграция 607), автоматически в daemon.
 
 ### Основа этапа 6.2
 
@@ -445,8 +445,10 @@ merge → `done` с закрытием Issue как `completed`; закрыти�
 автор, версия, идентичность Issue и серверные границы времени так же, как для approve;
 одновременные cancelled и approve/reject отклоняются. Историческая метка не даёт разрешения.
 После достоверной отмены SQLite фиксирует терминальный `cancelled`, Issue закрывается
-с `state_reason=not_planned`. Сбои закрытия и очистки повторяются при poll/start после
-перезапуска; успешные операции повторно не выполняются. История попыток и PR сохраняется.
+с `state_reason=not_planned`. Сбои закрытия повторяются при poll/start после
+перезапуска. Удаление выполняется отдельным cleanup worker с четырьмя попытками
+(сразу, затем через 1/5/15 минут после предыдущей ошибки); ошибки удаления не меняют
+состояние Issue. История попыток и PR сохраняется.
 Очистка удаляет только доказанно принадлежащие задаче чистые worktree и зарегистрированные
 артефакты; чужие файлы, изменённые SHA/ветки и симлинки блокируют очистку. Старые ветки
 сохраняются: прежняя схема не доказывает исключительное владение удалёнными refs.
@@ -457,3 +459,34 @@ merge → `done` с закрытием Issue как `completed`; закрыти�
 
 Параметры текущей Git-ветки Issue и безопасная additive-миграция SQLite **605**:
 [схема, API, владение веткой и проверки](docs/stages/sqlite-branches-605.md).
+
+
+### Автоматическая очистка — этап 6.4.1.4
+
+Миграция SQLite **607** добавляет `cleanup_jobs` и triggers: переход в `done` или
+`cancelled` и постановка задания фиксируются одной транзакцией. При старте и далее
+каждую секунду worker сверяет старые terminal задачи, включая завершённые до миграции.
+Основной scheduler и GitHub poll работают независимо от файловых операций.
+Состояния cleanup: `pending/running/completed/failed`; они не являются статусами Issue.
+После аварии работа продолжается с сохранёнными attempts и next_retry_at.
+
+Удаляются чистые текущий worktree, все подтверждённые историей `previous-*`,
+`attachments-*`, вложения по manifest и dispatcher files по registry/истории attempts.
+Сохраняются repository clone, local/origin branches, SQLite history и PR.
+Unknown/dirty объекты, symlink/traversal, повреждённый registry/manifest и несовпадение
+Git metadata останавливают удаление с диагностикой. Неразрешимое legacy ownership
+требует разбора оператором; автоматического удаления по одному имени каталога нет.
+
+```bash
+codex-dispatcher --config config/config.yaml show example-project 123
+codex-dispatcher --config config/config.yaml show example-project 123 --format json
+codex-dispatcher --config config/config.yaml cleanup-retry example-project 123
+```
+
+`show` содержит `cleanup_jobs` с attempts, timestamps, next_retry_at и last_error.
+`cleanup-retry` явно сбрасывает exhausted/failed задание текущего поколения и ставит
+его в pending; работа выполняется запущенным daemon. Ручной `poll` сверяет очередь,
+но для автоматической очистки не нужен. Структурированные события `cleanup` в
+`logs/dispatcher.jsonl` содержат project, issue/task, cleanup_id, attempt, result/reason.
+Полный регламент, ограничения и ручная приёмка:
+[stage-06-04-01-04 implementation](docs/stages/stage-06-04-01-04-implementation.md).
