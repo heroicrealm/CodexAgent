@@ -1,4 +1,6 @@
 dispatcher:
+  # Detach/emergency-stop (6.4.1.7) is not implemented; see the stage blocker report.
+  # No emergency label or polling setting is active in this version.
   poll_interval_seconds: 30
   max_parallel_tasks: 1
   shutdown_policy: wait
