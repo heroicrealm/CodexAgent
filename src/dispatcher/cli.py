@@ -88,6 +88,10 @@ def main(argv=None):
                     if row is None:
                         raise RuntimeError('Unknown issue')
                     value = _display_task(row)
+                    value['configuration_errors'] = [dict(r) for r in store.db.execute(
+                        'SELECT * FROM configuration_errors WHERE issue_id=?', (row['issue_id'],))]
+                    value['terminal_errors'] = [dict(r) for r in store.db.execute(
+                        'SELECT * FROM terminal_errors WHERE issue_id=?', (row['issue_id'],))]
                     value['cleanup_jobs'] = [dict(r) for r in store.db.execute(
                         'SELECT * FROM cleanup_jobs WHERE issue_id=? ORDER BY cleanup_id', (row['issue_id'],))]
                     value['decisions'] = [dict(r) for r in store.db.execute(

@@ -3,6 +3,7 @@ import fcntl
 import hashlib
 import json
 import sqlite3
+from dataclasses import replace
 from pathlib import Path
 from urllib.parse import urlencode
 
@@ -10,6 +11,7 @@ from dispatcher.codex_summary import final_summary
 from dispatcher.github import GitHubError
 from dispatcher.storage.transitions import Authority, Evidence, rest_id
 from dispatcher.workspace import TaskError
+from dispatcher.terminal_error import TerminalError, canonical_merged
 
 
 class PullRequestPublisher:
@@ -28,7 +30,9 @@ class PullRequestPublisher:
     def flush(self, projects):
         rows = self.store.db.execute("""SELECT a.* FROM attempts a JOIN publication_operations p
             ON p.operation_key='pr:'||a.attempt_id WHERE p.phase!='terminal'
-            AND (p.outcome!='completed' OR a.state='running')""").fetchall()
+            AND (p.outcome!='completed' OR a.state='running')
+            UNION SELECT a.* FROM attempts a JOIN terminal_errors e USING(attempt_id)
+            WHERE e.delivered=0 OR e.publication!='confirmed'""").fetchall()
         for row in rows:
             project = next((p for p in projects if p.repository.casefold() == row['repository']), None)
             if project is not None:
@@ -38,7 +42,7 @@ class PullRequestPublisher:
         # A separate advisory lock serializes publishers across connections and
         # processes without holding SQLite's writer lock during network calls.
         database = self.store.db.execute('PRAGMA database_list').fetchone()[2]
-        name = hashlib.sha256(attempt['attempt_id'].encode()).hexdigest()
+        name = hashlib.sha256(f'{attempt["repository"]}:{attempt["number"]}'.encode()).hexdigest()
         with (Path(database).parent / ('publication-' + name + '.lock')).open('a') as lock:
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -46,16 +50,24 @@ class PullRequestPublisher:
                 return
             operation = self.store.db.execute('SELECT * FROM publication_operations WHERE operation_key=?',
                                              ('pr:' + attempt['attempt_id'],)).fetchone()
-            if operation and (operation['outcome'] == 'completed' or operation['phase'] == 'terminal'):
+            terminal = TerminalError(self).saved(attempt)
+            if operation and not terminal and (operation['outcome'] == 'completed' or operation['phase'] == 'terminal'):
                 return
             self._publish(project, self.execution.get(attempt['attempt_id']))
 
     def _publish(self, project, attempt):
+        task = self.store.get(attempt['repository'], attempt['number'])
+        if task['base_branch']:
+            project = replace(project, base_branch=task['base_branch'])
         key, iteration = 'pr:' + attempt['attempt_id'], attempt['iteration_id']
         phase, repeated, reuse_key = 'verify', False, None
         def progress(value, outcome='pending'):
             self.store.publication(key, iteration, value, outcome)
         try:
+            terminal = TerminalError(self)
+            if terminal.saved(attempt):
+                terminal.drain(project, attempt)
+                return
             # Persist once, including fallback, before any Git/HTTP publication.
             # The operation flock serializes selection across publisher processes.
             saved = self.store.db.execute(
@@ -87,6 +99,14 @@ class PullRequestPublisher:
                                              (iteration,)).fetchone()[0] > 1
             if repeated and prior is None:
                 raise TaskError('pr_identity_conflict', 'GITHUB')
+            if task['state'] not in ('running', 'review'):
+                raise TaskError('publication_conflict', 'GITHUB')
+            if repeated:
+                observed = self.adapter.request(f'repos/{project.repository}/pulls/{prior["pr_number"]}')
+                if canonical_merged(observed, prior, task, attempt, project):
+                    terminal.record(attempt, prior)
+                    terminal.drain(project, attempt)
+                    return
             worktree = Path(attempt['worktree'])
             sha = self.git.publication_commit(worktree, attempt['branch'], attempt['initial_sha'], project.base_branch)
             self.execution.update(attempt['attempt_id'], result_sha=sha)
@@ -122,7 +142,7 @@ class PullRequestPublisher:
                 reuse_key = f'reopen:{iteration}:{prior["pr_id"]}'
                 self.store.publication(reuse_key, iteration, 'verify')
                 endpoint = f'repos/{repo}/pulls/{prior["pr_number"]}'
-                found = self.adapter.request(endpoint)
+                found = observed
                 def validate_prior(pr):
                     if (not isinstance(pr, dict) or pr.get('id') != prior['pr_id']
                             or pr.get('number') != prior['pr_number']
@@ -132,6 +152,9 @@ class PullRequestPublisher:
                             or pr.get('head', {}).get('repo', {}).get('id') != task['repository_id']
                             or pr.get('base', {}).get('repo', {}).get('id') != task['repository_id']):
                         raise TaskError('pr_identity_conflict', 'GITHUB')
+                    if canonical_merged(pr, prior, task, attempt, project):
+                        terminal.record(attempt, prior)
+                        raise TaskError('pr_merged', 'GITHUB')
                     if pr.get('merged') is not False or pr.get('merged_at'):
                         raise TaskError('pr_merged', 'GITHUB')
                 validate_prior(found)
@@ -205,6 +228,9 @@ class PullRequestPublisher:
             self.adapter.reconcile(project, self.store.get(project.repository, task['number']), store=self.store)
             progress('label', 'completed')
         except TaskError as exc:
+            if terminal.saved(attempt):
+                with self.store.db:
+                    self.store.db.execute('UPDATE terminal_errors SET diagnostic=? WHERE attempt_id=?', (exc.code, attempt['attempt_id']))
             if reuse_key:
                 self.store.publication(reuse_key, iteration, exc.code, 'failed', retry=True)
             self.execution.update(attempt['attempt_id'], recovery_diagnostic=exc.code)
@@ -214,6 +240,9 @@ class PullRequestPublisher:
             else:
                 self.store.publication(key, iteration, phase, 'failed', retry=True)
         except (GitHubError, OSError, ValueError, TypeError, KeyError, AttributeError, sqlite3.Error):
+            if terminal.saved(attempt):
+                with self.store.db:
+                    self.store.db.execute("UPDATE terminal_errors SET diagnostic='publication_unavailable' WHERE attempt_id=?", (attempt['attempt_id'],))
             if reuse_key:
                 self.store.publication(reuse_key, iteration, 'publication_unavailable', 'failed', retry=True)
             self.execution.update(attempt['attempt_id'], recovery_diagnostic='publication_unavailable')

@@ -61,6 +61,8 @@ class SyncService:
             except (GitHubError, sqlite3.Error):
                 result['errors'].append(dict(project=project.id, error='GitHub polling or storage failure'))
                 self.log('poll_failed', project)
+        from dispatcher import preparation_error
+        preparation_error.flush(self.store, self.adapter, self.config.projects)
         from dispatcher.cleanup import CleanupService
         CleanupService(self.config, self.store).reconcile()
         return result

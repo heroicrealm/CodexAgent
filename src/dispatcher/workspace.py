@@ -176,7 +176,11 @@ class GitWorkspaceManager:
             self.git(repo, 'worktree', 'add', '-b', branch, str(worktree), sha)
             worktree.chmod(0o700)
             return worktree, sha
-        base = issue.get('retry_sha') or (remote if exists else f'refs/remotes/origin/{project.base_branch}')
+        if exists and not issue.get('retry_sha'):
+            raise TaskError('branch_ownership_conflict', 'GIT')
+        if self.git(repo, 'show-ref', '--verify', f'refs/remotes/origin/{project.base_branch}', check=False).returncode:
+            raise TaskError('base_branch_missing', 'GIT')
+        base = issue.get('retry_sha') or f'refs/remotes/origin/{project.base_branch}'
         if issue.get('retry_sha') and (exists or self.git(repo, 'show-ref', '--verify', 'refs/heads/' + branch, check=False).returncode == 0):
             raise TaskError('retry_workspace_conflict', 'GIT')
         # Never reset/reuse a pre-existing local branch or another task's history.
@@ -209,7 +213,7 @@ class GitWorkspaceManager:
             raise TaskError('rewritten_history', 'GIT')
         return sha
 
-    def publication_commit(self, worktree, branch, initial_sha, base):
+    def publication_commit(self, worktree, branch, initial_sha, base, *, salvage=False):
         safe_path(self.config.workspace, worktree)
         if self.git(worktree, 'symbolic-ref', '--short', 'HEAD').stdout.strip() != branch:
             raise TaskError('unexpected_branch', 'GIT')
@@ -217,6 +221,8 @@ class GitWorkspaceManager:
             self.git(worktree, 'add', '--all')
             self.git(worktree, 'commit', '-m', 'Implement task')
         sha = self.verify(worktree, branch, initial_sha, noop=True)
+        if salvage:
+            return sha
         self.validate_branch(base)
         self.git(worktree, 'fetch', 'origin', f'+refs/heads/{base}:refs/remotes/origin/{base}')
         diff = self.git(worktree, 'diff', '--quiet', f'refs/remotes/origin/{base}...{sha}', check=False)
@@ -255,7 +261,7 @@ class TaskWorkspaceCleanup:
             raise
 
     def _cleanup(self, project, row):
-        if row['state'] not in ('done', 'cancelled'):
+        if row['state'] not in ('done', 'cancelled') and not (row['state'] == 'review_on_error' and dict(row).get('publication_confirmed') is True):
             raise TaskError('cleanup_requires_done')
         repo, task, worktree = self.manager.paths(project, row['number'])
         root = self.manager.config.workspace

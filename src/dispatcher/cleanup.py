@@ -31,7 +31,9 @@ class CleanupService:
                 generation,version,attempt_id,created_at,updated_at)
                 SELECT issue_id,project_id,repository,number,COALESCE(current_iteration_id,0),version,
                     (SELECT attempt_id FROM attempts a WHERE a.repository=t.repository AND a.number=t.number ORDER BY rowid DESC LIMIT 1),?,?
-                FROM tasks t WHERE state IN ('done','cancelled')''', (now(), now()))
+                FROM tasks t WHERE state IN ('done','cancelled','review_on_error')
+                AND (state!='review_on_error' OR EXISTS(SELECT 1 FROM terminal_errors e
+                    WHERE e.issue_id=t.issue_id AND e.publication='confirmed'))''', (now(), now()))
 
     def retry(self, project, number):
         with self.store.db as db:
@@ -40,7 +42,7 @@ class CleanupService:
                 next_retry_at=NULL,last_error=NULL,completed_at=NULL,updated_at=?
                 WHERE project_id=? AND repository=? AND number=? AND state='failed'
                 AND EXISTS(SELECT 1 FROM tasks t WHERE t.issue_id=cleanup_jobs.issue_id
-                    AND t.state IN ('done','cancelled') AND t.project_id=cleanup_jobs.project_id
+                    AND t.state IN ('done','cancelled','review_on_error') AND t.project_id=cleanup_jobs.project_id
                     AND COALESCE(t.current_iteration_id,0)=cleanup_jobs.generation AND t.version=cleanup_jobs.version)''',
                 (self.clock().isoformat(), project.id, project.repository.casefold(), number)).rowcount)
 
@@ -48,6 +50,10 @@ class CleanupService:
         repo, task, worktree = self.manager.paths(project, row['number'])
         if row['project_id'] != project.id or row['repository'] != project.repository.casefold():
             raise TaskError('cleanup_identity_mismatch')
+        if row['state'] == 'review_on_error' and not self.store.db.execute(
+                "SELECT 1 FROM terminal_errors WHERE issue_id=? AND publication='confirmed'",
+                (row['issue_id'],)).fetchone():
+            raise TaskError('cleanup_publication_unconfirmed')
         attempts = self.store.db.execute('''SELECT * FROM attempts WHERE repository=? AND number=? ORDER BY rowid''',
                                          (row['repository'], row['number'])).fetchall()
         for a in attempts:
@@ -57,7 +63,7 @@ class CleanupService:
                 raise TaskError('cleanup_active_execution')
         if not attempts and (task.exists() or str(worktree) in TaskWorkspaceCleanup(self.manager).registered(repo)):
             raise TaskError('cleanup_ownership_unproven')
-        result = dict(row, owned_worktrees=['previous-' + a['attempt_id'] for a in attempts],
+        result = dict(row, publication_confirmed=row['state'] == 'review_on_error', owned_worktrees=['previous-' + a['attempt_id'] for a in attempts],
                       owned_attachments=['attachments-' + a['attempt_id'] for a in attempts],
                       owned_attempts=[a['attempt_id'] for a in attempts])
         candidates = [(worktree, attempts[-1] if attempts else None)]
@@ -122,7 +128,7 @@ class CleanupService:
                     latest = db.execute('SELECT attempt_id FROM attempts WHERE repository=? AND number=? ORDER BY rowid DESC LIMIT 1',
                                         (job['repository'], job['number'])).fetchone()
                     if (not row or row['issue_id'] != job['issue_id'] or row['project_id'] != job['project_id']
-                            or row['state'] not in ('done','cancelled') or row['version'] != job['version']
+                            or row['state'] not in ('done','cancelled','review_on_error') or row['version'] != job['version']
                             or (row['current_iteration_id'] or 0) != job['generation']
                             or (latest[0] if latest else None) != job['attempt_id']):
                         db.execute("UPDATE cleanup_jobs SET state='failed',last_error='cleanup_generation_changed',updated_at=? WHERE cleanup_id=?",

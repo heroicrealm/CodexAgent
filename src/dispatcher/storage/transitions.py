@@ -137,7 +137,7 @@ def transition(store, *, repository, number, expected_state, version, iteration_
                 return Outcome.MISSING_EVIDENCE
             if fence < datetime.fromisoformat(last.replace('Z', '+00:00')):
                 return Outcome.MISSING_EVIDENCE
-        if target in ('pending', 'running') and not row['available']:
+        if target in ('pending', 'running') and (not row['available'] or store.configuration_blocked(row)):
             return Outcome.MISSING_EVIDENCE
         if target == 'running':
             from dispatcher.execution_store import ExecutionStore

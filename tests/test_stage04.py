@@ -161,6 +161,10 @@ def test_worktree_existing_missing_default_and_push(env, branch):
     item = issue(project, target_branch=branch)
     actual = manager.branch(project, item)
     assert actual == ('codex/issue-1' if branch == 'main' else branch)
+    if branch == 'existing':
+        with pytest.raises(TaskError, match='branch_ownership_conflict'):
+            manager.prepare(project, item, actual)
+        return
     worktree, initial = manager.prepare(project, item, actual)
     (worktree / 'new').write_text('new')
     git(worktree, 'add', '.')
@@ -472,7 +476,7 @@ def test_outbox_uncertain_write_recovery_and_migration(env):
     try:
         execution = ExecutionStore(store)
         ExecutionStore(store)
-        assert [r[0] for r in store.db.execute('SELECT version FROM schema_migrations ORDER BY version')] == [1,2,3,602,604,605,606,607]
+        assert [r[0] for r in store.db.execute('SELECT version FROM schema_migrations ORDER BY version')] == [1,2,3,602,604,605,606,607,608]
         assert store.get(project.repository,1)['approved_version'] == 1
         api.pages.return_value = [dict(id=456,body=body)]
         TaskResultPublisher(execution,api).flush()
@@ -843,7 +847,9 @@ def test_scheduler_project_round_robin(env):
     config=replace(config,projects=(project,second))
     prepare(config)
     repo=config.workspace/second.id/'repository'
-    git(config.source.parent,'clone','--no-checkout',str(remote),str(repo))
+    second_remote = config.source.parent / 'second-remote.git'
+    git(config.source.parent,'clone','--bare',str(remote),str(second_remote))
+    git(config.source.parent,'clone','--no-checkout',str(second_remote),str(repo))
     git(repo,'config','user.name','Test')
     git(repo,'config','user.email','test@example.invalid')
     first_items=[issue(project),issue(project,id=2,number=2)]
@@ -859,8 +865,8 @@ def test_scheduler_project_round_robin(env):
         assert dispatcher.store.get(project.repository,1)['state']=='review'
         dispatcher.admit()
         finish(dispatcher)
-        # Same remote branch has first task's commit; stub's second commit may
-        # be no-op, but admission must nevertheless have selected project two.
+        # Each project owns a separate remote. The shared API fixture may
+        # reject the second PR identity, but admission must select project two.
         assert dispatcher.store.get(second.repository,1)['state'] in ('review','failed')
         assert dispatcher.store.get(project.repository,2)['state']=='pending'
     finally:

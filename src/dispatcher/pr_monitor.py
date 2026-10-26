@@ -31,7 +31,7 @@ class PullRequestMonitor:
             LEFT JOIN publication_operations o ON o.operation_key='resolution:'||p.pr_id||
                 CASE WHEN i.iteration_number=1 OR legacy.iteration_id=h.iteration_id
                 THEN '' ELSE ':'||h.iteration_id END
-            WHERE t.repository=? AND
+            WHERE t.repository=? AND t.state!='review_on_error' AND
             ((t.state='review' AND t.current_iteration_id=h.iteration_id)
              OR (r.pr_id IS NOT NULL AND (o.outcome IS NULL OR o.outcome!='completed')))''',
             (project.repository.casefold(),)).fetchall()
@@ -64,6 +64,8 @@ class PullRequestMonitor:
         db, api = self.store.db, self.adapter
         saved = db.execute('SELECT * FROM pr_resolutions WHERE pr_id=? AND iteration_id=?', (linked['pr_id'], linked['iteration_id'])).fetchone()
         task = self.store.get(project.repository, linked['number'])
+        if task['state'] == 'review_on_error':
+            return
         if task['state'] == 'review' and task['current_iteration_id'] == linked['iteration_id']:
             pr = api.request(f'repos/{project.repository}/pulls/{linked["pr_number"]}')
             observed = utc(api.response_date)
