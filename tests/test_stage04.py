@@ -36,7 +36,9 @@ def git(path, *args):
 
 
 @pytest.fixture
-def env(tmp_path):
+def env(tmp_path, legacy_boundary_contract):
+    # Legacy business/ownership regression uses a mocked boundary contract.
+    # This is not variant B kernel acceptance; production has no such switch.
     executable = tmp_path / 'codex-stub'
     control = tmp_path / 'control.json'
     control.write_text('{}')
@@ -692,7 +694,7 @@ def test_daemon_comment_diagnostic_handles_status_timeout(tmp_path, monkeypatch)
     assert len(diagnostic) < 4500
 
 
-def test_real_daemon_start_poll_execute_comment_stop(env):
+def test_real_daemon_blocks_uncontrolled_attempt_and_stops(env):
     """Exercise actual CLI daemon and stub gh over its real subprocess boundary."""
     config, project, _, _, remote = env
     api_state = config.source.parent / 'github-state.json'
@@ -716,13 +718,16 @@ def test_real_daemon_start_poll_execute_comment_stop(env):
     assert result.returncode == 0, result.stderr
     try:
         deadline = time.monotonic()+10
+        log = config.logs / 'dispatcher.jsonl'
         while time.monotonic()<deadline:
-            state=json.loads(api_state.read_text())
-            if state['comments']: break
+            if log.exists() and 'descendant_boundary_unverified' in log.read_text():
+                break
             time.sleep(.05)
-        assert len(state['comments'])==1, daemon_comment_diagnostic(argv, config, state)
-        assert 'Task completed successfully.' in state['comments'][0]['body']
-        assert git(remote,'rev-parse','codex/issue-1')
+        assert 'descendant_boundary_unverified' in log.read_text()
+        state = json.loads(api_state.read_text())
+        assert state['comments'] == []
+        with sqlite3.connect(config.workspace / '.runtime' / 'tasks.sqlite3') as db:
+            assert db.execute('SELECT count(*) FROM attempts').fetchone()[0] == 0
     finally:
         result=subprocess.run([*argv,'stop'],capture_output=True,text=True,timeout=10)
         assert result.returncode == 0, result.stderr

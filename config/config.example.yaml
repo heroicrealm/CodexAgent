@@ -1,4 +1,6 @@
 dispatcher:
+  # Variant B is blocked: strong descendant containment backend is not implemented.
+  # There is no PGID fallback or option to bypass boundary verification; see README.
   poll_interval_seconds: 30
   emergency_poll_interval_seconds: 5 # Independent checks of active attempts.
   max_parallel_tasks: 1

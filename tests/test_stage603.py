@@ -12,7 +12,8 @@ from dispatcher.workspace import TaskError
 
 
 @pytest.fixture
-def publication(store):
+def publication(store, legacy_boundary_contract):
+    # Publication regression injects the boundary contract; no kernel claim.
     execution, attempt = running(store)
     execution.update(attempt, worktree='/tmp/worktree', initial_sha='b'*40, origin_url='origin')
     api, git = Mock(), Mock()

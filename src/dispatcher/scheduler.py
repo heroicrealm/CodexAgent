@@ -86,6 +86,15 @@ class Dispatcher:
         self.execution.update(row['attempt_id'], recovery_diagnostic=diagnostic)
 
     def admit(self):
+        from dispatcher import containment
+        try:
+            containment.require_control()
+        except TaskError:
+            if not getattr(self, '_containment_reported', False):
+                event(self.config.logs / 'dispatcher.jsonl', 'admission_unavailable', level='WARN',
+                      reason='descendant_boundary_unverified')
+                self._containment_reported = True
+            return
         order = self.projects[self.cursor:] + self.projects[:self.cursor]
         for project in order:
             if self.lifecycle.stopping or len(self.active) >= self.config.max_parallel_tasks:

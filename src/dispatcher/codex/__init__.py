@@ -23,6 +23,8 @@ class CodexExecutor:
         self.checked = True
 
     def start(self, issue, branch, paths, worktree, task, attempt, before_exec=None):
+        from dispatcher import containment
+        containment.require_control()
         self.check()
         prompt = ('Implement this approved GitHub Issue. Work on branch ' + branch + '.\n'
                   'Run available tests and create a Git commit. Do not push, change GitHub Issues, create PRs or merge.\n'

@@ -63,6 +63,10 @@ def ssh_diagnose(config, which, run, environ):
 
 def diagnose(config, which=shutil.which, run=subprocess.run, environ=None):
     checks = [('PASS' if sys.version_info >= (3, 12) else 'FAIL', 'Python 3.12+')]
+    from dispatcher.containment import capabilities
+    boundary = capabilities()
+    checks.append(('FAIL', 'Descendant containment: backend unimplemented; launches and cleanup blocked; ' +
+        ('cgroup v2 delegation not writable' if not boundary['delegated_writable'] else 'delegation alone is not a verified boundary')))
     for binary in ('git', config.github_executable, config.executable):
         found = which(binary)
         if not found:

@@ -1,4 +1,8 @@
-"""Reproduce the existing process-containment gap; not Detach acceptance."""
+"""Variant B: real escaped descendants, legacy history and safe cleanup refusal.
+
+These tests prove the refusal path, not a working cgroup containment backend.
+A subprocess subreaper owns and reaps every escaped child created here.
+"""
 import ctypes
 import os
 from pathlib import Path
@@ -7,51 +11,125 @@ import subprocess
 import sys
 import time
 
-from dispatcher.runtime import Lifecycle
+import pytest
+
+from dispatcher.cleanup import CleanupService
+from dispatcher.config import Config, Project
+from dispatcher.detachment import StopController, request_in_transaction
+from dispatcher.execution_store import ExecutionStore
+from dispatcher.runtime import Lifecycle, identity, prepare
+from dispatcher.storage import Store
+from dispatcher.workspace import GitWorkspaceManager, TaskWorkspaceCleanup, TaskError
 
 
-def reproduce(worktree):
-    # A separate harness becomes a subreaper so the escaped grandchild is both
-    # terminated and reaped by this test, independently of the host's PID 1.
+def reproduce(root, escape='setsid', reason='emergency_stop', leader_exit=False):
     assert ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0) == 0
-    worktree.mkdir()
-    marker = worktree.parent / 'escaped-pid'
-    escaped = ('import os,pathlib,time; '
-               f'pathlib.Path({str(marker)!r}).write_text(str(os.getpid())); '
-               'time.sleep(60)')
+    project = Project('one', True, 'owner/repo', 'main', 'ready', ('alice',))
+    config = Config(root/'unused.yaml', root, root/'logs', 1, 1, 'codex', (project,))
+    prepare(config)
+    manager = GitWorkspaceManager(config)
+    repo, task, worktree = manager.paths(project, 1)
+    repo.mkdir()
+    def git(cwd, *args):
+        return subprocess.run(['git', '-C', str(cwd), *args], check=True,
+                              capture_output=True, text=True).stdout.strip()
+    git(repo, 'init', '-b', 'main')
+    git(repo, 'config', 'user.name', 'Test')
+    git(repo, 'config', 'user.email', 'test@example.invalid')
+    (repo/'initial').write_text('base')
+    git(repo, 'add', '.')
+    git(repo, 'commit', '-m', 'base')
+    git(repo, 'worktree', 'add', '-b', 'task', str(worktree))
+    # A real registered worktree with valid branch/SHA/metadata ownership.
+    (worktree/'user-file').write_text('preserve me')
+    store = Store(root/'.runtime'/'tasks.sqlite3')
+    store.apply(project, [dict(id=101, repository_id=11, number=1, title='Task', body='',
+        author='alice', target_branch='task', eligible=True, labels=['ready'],
+        state='open', server_observed_at='2026-10-26T10:00:00Z')])
+    assert store.confirm(project.repository, 1, 1)
+    execution = ExecutionStore(store)
+    attempt = execution.reserve(store.queue()[0], 'task', 1,
+                                store.guard(project.repository, 1)['observation_token'])
+    execution.update(attempt, worktree=str(worktree), initial_sha=git(worktree,'rev-parse','HEAD'))
+    marker = root/'escaped-pid'
+    change_group = 'os.setpgid(0,0); ' if escape == 'setpgid' else ''
+    escaped = ('import os,pathlib,time; ' + change_group +
+               f'pathlib.Path({str(marker)!r}).write_text(str(os.getpid())); time.sleep(60)')
     leader_code = ('import subprocess,sys,time; '
-                   f'subprocess.Popen([sys.executable,"-c",{escaped!r}], start_new_session=True); '
-                   'time.sleep(60)')
+                   f'subprocess.Popen([sys.executable,"-c",{escaped!r}], start_new_session={escape == "setsid"}); '
+                   + ('time.sleep(.1)' if leader_exit else 'time.sleep(60)'))
     lifecycle = Lifecycle(force_grace_timeout_seconds=1)
     pid = None
     try:
+        # Model an already-running pre-variant-B attempt. The production
+        # scheduler now refuses such a launch; this low-level test does it openly.
+        neighbor = lifecycle.submit([sys.executable,'-c','import time;time.sleep(60)'], service=True, cwd=root)
         leader = lifecycle.submit([sys.executable, '-c', leader_code], cwd=worktree)
+        execution.update(attempt, codex_started=1, pid=leader.pid, process_identity=identity(leader.pid))
         deadline = time.monotonic() + 5
         while not marker.exists() and time.monotonic() < deadline:
             time.sleep(.01)
         pid = int(marker.read_text())
-        lifecycle.cancel_child(leader)
+        if leader_exit:
+            while leader in lifecycle._active() and time.monotonic() < deadline:
+                time.sleep(.01)
+        else:
+            lifecycle.cancel_child(leader)
         assert leader.returncode is not None
-        assert lifecycle._active() == []
+        assert leader not in lifecycle._active()
+        assert neighbor in lifecycle._active()
         assert os.getpgid(pid) != leader.pid
         assert Path(f'/proc/{pid}/cwd').resolve() == worktree
-        print('original group stopped; escaped descendant still uses worktree', flush=True)
+        assert int(Path(f'/proc/{pid}/stat').read_text().rsplit(')',1)[1].split()[1]) == os.getpid()
+        with store.db:
+            request_in_transaction(store,store.queue()[0],reason,{'test':'legacy escaped child'})
+        controller = StopController(config,store,None)
+        assert not controller.finalize(store.queue()[0],recovered=True)
+        saved = store.db.execute('SELECT * FROM stop_requests').fetchone()
+        assert saved['process_status'] == 'unconfirmed' and saved['finalized_at'] is None
+        assert saved['error'] == 'descendant_boundary_unverified'
+        # Also cover a historical false-finalized task/job from the previous
+        # release. Valid ownership and an empty original group must not delete it.
+        with store.db:
+            store.db.execute("UPDATE attempts SET state='interrupted'")
+            store.db.execute("UPDATE tasks SET state='detached'")
+        with pytest.raises(TaskError, match='descendant_boundary_unverified'):
+            TaskWorkspaceCleanup(manager).cleanup(project,dict(store.queue()[0],owned_attempts=[attempt]))
+        CleanupService(config,store).tick()
+        job = store.db.execute('SELECT * FROM cleanup_jobs').fetchone()
+        assert job['state'] == 'pending' and job['last_error'] == 'descendant_boundary_unverified'
+        assert (worktree/'user-file').read_text() == 'preserve me'
+        assert neighbor in lifecycle._active()
+        store.close()
+        store = Store(root/'.runtime'/'tasks.sqlite3')
+        with store.db:
+            store.db.execute('UPDATE cleanup_jobs SET next_retry_at=NULL')
+        CleanupService(config,store).tick()
+        assert (worktree/'user-file').read_text() == 'preserve me'
+        assert store.db.execute('SELECT last_error FROM cleanup_jobs').fetchone()[0] == 'descendant_boundary_unverified'
+        assert Path(f'/proc/{pid}/cwd').resolve() == worktree
+        print('original group stopped; escaped descendant still uses worktree; cleanup refused', flush=True)
     finally:
         lifecycle.cancel()
         if pid is None and marker.exists():
             pid = int(marker.read_text())
         if pid is not None:
-            # Now our unreaped adopted child: no PID reuse between proof/kill.
             os.kill(pid, signal.SIGKILL)
             os.waitpid(pid, 0)
+        store.close()
 
 
-def test_original_group_completion_does_not_prove_worktree_unused(tmp_path):
-    result = subprocess.run([sys.executable, __file__, str(tmp_path / 'worktree')],
-                            capture_output=True, text=True, timeout=15)
+@pytest.mark.parametrize('escape', ['setsid','setpgid'])
+@pytest.mark.parametrize('reason', ['ready_removed','emergency_stop'])
+@pytest.mark.parametrize('leader_exit', [False,True])
+def test_escaped_descendant_preserved_across_cleanup_and_restart(tmp_path, escape, reason, leader_exit):
+    result = subprocess.run([sys.executable, __file__, str(tmp_path/'probe'), escape, reason, str(int(leader_exit))],
+                            capture_output=True, text=True, timeout=20)
     assert result.returncode == 0, result.stderr
-    assert 'escaped descendant still uses worktree' in result.stdout
+    assert 'escaped descendant still uses worktree; cleanup refused' in result.stdout
 
 
 if __name__ == '__main__':
-    reproduce(Path(sys.argv[1]))
+    reproduce(Path(sys.argv[1]), sys.argv[2] if len(sys.argv)>2 else 'setsid',
+              sys.argv[3] if len(sys.argv)>3 else 'emergency_stop',
+              bool(int(sys.argv[4])) if len(sys.argv)>4 else False)

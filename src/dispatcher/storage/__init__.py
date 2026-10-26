@@ -229,6 +229,14 @@ class Store:
                 if row and row['state'] == 'detached' and issue['eligible'] and not emergency:
                     stop = self.db.execute('SELECT * FROM stop_requests WHERE issue_id=? AND active=1', (row['issue_id'],)).fetchone()
                     from dispatcher.detachment import newer_observation
+                    if stop and stop['attempt_id']:
+                        from dispatcher import containment
+                        from dispatcher.workspace import TaskError
+                        try:
+                            containment.require_control()
+                        except TaskError:
+                            self.db.execute("UPDATE stop_requests SET finalized_at=NULL,process_status='unconfirmed',error='descendant_boundary_unverified' WHERE request_id=?", (stop['request_id'],))
+                            stop = self.db.execute('SELECT * FROM stop_requests WHERE request_id=?', (stop['request_id'],)).fetchone()
                     if stop and stop['finalized_at'] and newer_observation(stop, issue) and not self.db.execute(
                             "SELECT 1 FROM cleanup_jobs WHERE issue_id=? AND state!='completed'", (row['issue_id'],)).fetchone():
                         self._record_transition(row, 'discovered', 'reattach:' + str(stop['request_id']), 'ready_observer', {'observed_at':issue.get('server_observed_at')})

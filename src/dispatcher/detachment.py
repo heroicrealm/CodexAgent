@@ -13,6 +13,7 @@ from threading import Event, Thread
 from dispatcher.github import Adapter, GitHubError
 from dispatcher.storage import Store, now
 from dispatcher.workspace import TaskError
+from dispatcher import containment
 
 
 def live_processes(store, attempt):
@@ -51,6 +52,12 @@ def request_in_transaction(store, row, reason, evidence):
     db.execute('UPDATE tasks SET available=0,approved_version=NULL WHERE issue_id=? AND version=? AND current_iteration_id IS ?',
                (row['issue_id'], row['version'], row['current_iteration_id']))
     store._history(row['repository'], row['number'], row['version'], reason, json.dumps(evidence), now())
+    if attempt:
+        try:
+            containment.require_control()
+        except TaskError:
+            db.execute("UPDATE stop_requests SET process_status='unconfirmed',error='descendant_boundary_unverified' WHERE request_id=?", (cursor.lastrowid,))
+            return cursor.lastrowid
     from dispatcher.runtime import group_members
     cleaning = db.execute("SELECT 1 FROM cleanup_jobs WHERE issue_id=? AND state='running'", (row['issue_id'],)).fetchone()
     if not cleaning and (not attempt or attempt['state'] != 'running') and not live_processes(store, attempt):
@@ -131,6 +138,12 @@ class StopController:
         return names
 
     def signal(self, lifecycle, stop, attempt):
+        try:
+            containment.require_control()
+        except TaskError:
+            with self.store.db as db:
+                db.execute("UPDATE stop_requests SET process_status='unconfirmed',error='descendant_boundary_unverified' WHERE request_id=? AND (process_status!='unconfirmed' OR error IS NOT 'descendant_boundary_unverified')", (stop['request_id'],))
+            return
         # Share Lifecycle ownership, and recheck durable backoff under its lock:
         # simultaneous watcher/recovery must not repeatedly TERM a stuck group.
         with lifecycle.mutex:
@@ -153,6 +166,13 @@ class StopController:
         stop = db.execute('SELECT * FROM stop_requests WHERE issue_id=? AND active=1', (row['issue_id'],)).fetchone()
         if not stop:
             return False
+        if stop['attempt_id']:
+            try:
+                containment.require_control()
+            except TaskError:
+                with db:
+                    db.execute("UPDATE stop_requests SET process_status='unconfirmed',error='descendant_boundary_unverified',finalized_at=NULL WHERE request_id=? AND (process_status!='unconfirmed' OR error IS NOT 'descendant_boundary_unverified' OR finalized_at IS NOT NULL)", (stop['request_id'],))
+                return False
         if stop['finalized_at']:
             return True
         attempt = db.execute('SELECT * FROM attempts WHERE attempt_id=?', (stop['attempt_id'],)).fetchone()
@@ -244,6 +264,7 @@ class StopController:
 
 def fence(store, adapter, project, attempt):
     """Fresh labels plus durable generation check before each irreversible step."""
+    containment.require_control()
     task = store.get(attempt['repository'], attempt['number'])
     if store.stop_requested(task):
         raise TaskError('task_detached', 'DISPATCHER')

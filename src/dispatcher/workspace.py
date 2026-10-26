@@ -67,6 +67,9 @@ class GitWorkspaceManager:
 
     def run(self, argv, **kwargs):
         """Register task helpers before exec; Lifecycle alone reaps their groups."""
+        if self.lifecycle and self.operation_attempt:
+            from dispatcher import containment
+            containment.require_control()
         allow_stopped = kwargs.pop('_allow_stopped', False)
         if self.cleanup_lock_fd is not None:
             kwargs['pass_fds'] = (self.cleanup_lock_fd,)
@@ -357,6 +360,9 @@ class TaskWorkspaceCleanup:
             if candidate.is_relative_to(task) and candidate not in worktrees:
                 raise TaskError('cleanup_ownership_unproven')
         self.verify_metadata(repo, worktrees)
+        if task.exists() or any(str(path) in registered for path in worktrees):
+            from dispatcher import containment
+            containment.require_control()
         if not task.exists():
             # A crash may leave Git metadata after the worktree disappeared.
             for path in worktrees:

@@ -95,6 +95,9 @@ class CleanupService:
                 raise TaskError('cleanup_ownership_unproven')
             if path == worktree and attempt['worktree'] != str(worktree):
                 raise TaskError('cleanup_ownership_unproven')
+        if attempts:
+            from dispatcher import containment
+            containment.require_control()
         return result
 
     def cleanup(self, project, row):
@@ -160,7 +163,7 @@ class CleanupService:
                         self.manager.cleanup_lock_fd = None
                 except (TaskError, OSError, ValueError, TypeError) as exc:
                     error = exc.code if isinstance(exc, TaskError) else 'cleanup_preserved_artifacts'
-                    delay = (60, 300, 900)[count - 1] if count < 4 else (900 if row['state'] == 'detached' else None)
+                    delay = (60, 300, 900)[count - 1] if count < 4 else (900 if row['state'] == 'detached' or error == 'descendant_boundary_unverified' else None)
                     with db:
                         db.execute('''UPDATE cleanup_jobs SET state=?,updated_at=?,next_retry_at=?,last_error=? WHERE cleanup_id=?''',
                                    ('pending' if delay else 'failed', self.clock().isoformat(),

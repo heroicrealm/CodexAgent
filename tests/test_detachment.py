@@ -1,4 +1,4 @@
-"""Stage 6.4.1.7 acceptance: durable fences, real groups and local Git cleanup."""
+"""Legacy 6.4.1.7 regression with a mocked boundary; not variant B kernel acceptance."""
 import json
 from dataclasses import replace
 from pathlib import Path
