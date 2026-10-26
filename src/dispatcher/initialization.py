@@ -6,6 +6,7 @@ import json
 import os
 import tempfile
 from pathlib import Path
+from dataclasses import asdict
 
 import yaml
 
@@ -16,7 +17,8 @@ from dispatcher.logging import event
 
 def fingerprint(project):
     value = dict(repository=project.repository.casefold(),
-                 labels={key: project.label(key).name for key in COLORS})
+                 labels={key: project.label(key).name for key in COLORS},
+                 emergency_stop=asdict(project.label('emergency_stop')))
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
 
 

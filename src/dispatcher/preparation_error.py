@@ -87,6 +87,8 @@ def flush(store, adapter, projects):
                 JOIN tasks t USING(issue_id) WHERE delivered=0''').fetchall():
             if not any(p.repository.casefold() == row['repository'] for p in projects):
                 continue
+            if store.stop_requested(store.get(row['repository'], row['number'])):
+                continue
             try:
                 endpoint = f'repos/{row["repository"]}/issues/{row["number"]}/comments'
                 marker = row['body'].splitlines()[-1]
@@ -95,6 +97,8 @@ def flush(store, adapter, projects):
                     raise GitHubError(kind='invalid_response')
                 found = next((c for c in comments if marker in c.get('body', '')), None)
                 if found is None:
+                    if store.stop_requested(store.get(row['repository'], row['number'])):
+                        continue
                     found = adapter.write(endpoint, 'POST', dict(body=row['body']))
                 if not isinstance(found, dict) or type(found.get('id')) is not int:
                     raise GitHubError(kind='invalid_response')

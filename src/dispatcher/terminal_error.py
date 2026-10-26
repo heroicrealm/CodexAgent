@@ -69,7 +69,10 @@ class TerminalError:
                   task=task['number'], reason='canonical_pr_merged', attempt=attempt['attempt_id'])
 
     def drain(self, project, attempt):
+        from dispatcher.detachment import fence
         saved = self.saved(attempt)
+        guarded_attempt = dict(attempt, iteration_id=saved['iteration_id'], version=saved['version'])
+        fence(self.store, self.worker.adapter, project, guarded_attempt)
         task = self.store.get(attempt['repository'], attempt['number'])
         if (task['state'] != 'review_on_error' or task['version'] != saved['version']
                 or task['current_iteration_id'] != saved['iteration_id']
@@ -79,13 +82,17 @@ class TerminalError:
             git, path = self.worker.git, Path(attempt['worktree'])
             # This path deliberately ignores PR diff: even a no-diff result must
             # be preserved. Git verifies branch, ancestry and configured origin.
+            fence(self.store, self.worker.adapter, project, guarded_attempt)
             sha = git.publication_commit(path, attempt['branch'], attempt['initial_sha'],
-                                         project.base_branch, salvage=True)
+                                         project.base_branch, salvage=True,
+                                         before_commit=lambda: fence(self.store, self.worker.adapter, project, guarded_attempt))
             self.execution.update(attempt['attempt_id'], result_sha=sha)
             remote = git.git(path, 'ls-remote', 'origin', 'refs/heads/' + attempt['branch']).stdout.split()
             if not remote or remote[0] not in (attempt['initial_sha'], sha):
                 raise TaskError('remote_head_changed', 'GIT')
-            git.push(project, path, attempt['branch'], attempt['origin_url'])
+            fence(self.store, self.worker.adapter, project, guarded_attempt)
+            git.push(project, path, attempt['branch'], attempt['origin_url'],
+                     before_push=lambda: fence(self.store, self.worker.adapter, project, guarded_attempt))
             remote = git.git(path, 'ls-remote', 'origin', 'refs/heads/' + attempt['branch']).stdout.split()
             if not remote or remote[0] != sha:
                 raise TaskError('publication_unavailable', 'GIT')
@@ -109,7 +116,10 @@ class TerminalError:
         self.store.publication('pr:' + attempt['attempt_id'], attempt['iteration_id'], 'terminal', 'completed')
 
     def deliver(self, project, attempt):
+        from dispatcher.detachment import fence
         saved = self.saved(attempt)
+        guarded_attempt = dict(attempt, iteration_id=saved['iteration_id'], version=saved['version'])
+        fence(self.store, self.worker.adapter, project, guarded_attempt)
         if saved['delivered']:
             return
         endpoint = f'repos/{project.repository}/issues/{attempt["number"]}/comments'
@@ -119,6 +129,7 @@ class TerminalError:
             raise GitHubError(kind='invalid_response')
         found = next((c for c in comments if marker in c.get('body', '')), None)
         if found is None:
+            fence(self.store, self.worker.adapter, project, guarded_attempt)
             found = self.worker.adapter.write(endpoint, 'POST', dict(body=saved['body']))
         if not isinstance(found, dict) or type(found.get('id')) is not int:
             raise GitHubError(kind='invalid_response')

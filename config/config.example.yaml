@@ -1,7 +1,6 @@
 dispatcher:
-  # Detach/emergency-stop (6.4.1.7) is not implemented; see the stage blocker report.
-  # No emergency label or polling setting is active in this version.
   poll_interval_seconds: 30
+  emergency_poll_interval_seconds: 5 # Independent checks of active attempts.
   max_parallel_tasks: 1
   shutdown_policy: wait
   force_grace_timeout_seconds: 5
@@ -33,6 +32,7 @@ projects:
     labels:
       # Legacy string form "ready: codex-ready" is also supported.
       ready: {name: codex-ready, color: '0E8A16', description: 'Задание готово к обработке'}
+      emergency_stop: {name: 'dispatcher:emergency-stop', color: 'B60205', description: 'Адресная аварийная остановка; удалить вручную для повторного подключения'}
       discovered: {name: 'dispatcher:discovered', color: 'D4C5F9', description: 'Ожидает подтверждения'}
       approve: {name: 'dispatcher:approve', color: '0E8A16', description: 'Подтвердить выполнение'}
       reject: {name: 'dispatcher:reject', color: 'B60205', description: 'Отклонить выполнение'}

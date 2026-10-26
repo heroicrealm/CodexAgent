@@ -11,7 +11,7 @@ from datetime import datetime, timedelta, timezone
 from threading import Event, Thread
 
 from dispatcher.logging import event
-from dispatcher.runtime import identity
+from dispatcher.runtime import identity, group_members
 from dispatcher.storage import Store, now
 from dispatcher.workspace import GitWorkspaceManager, TaskWorkspaceCleanup, TaskError, safe_path
 
@@ -31,7 +31,7 @@ class CleanupService:
                 generation,version,attempt_id,created_at,updated_at)
                 SELECT issue_id,project_id,repository,number,COALESCE(current_iteration_id,0),version,
                     (SELECT attempt_id FROM attempts a WHERE a.repository=t.repository AND a.number=t.number ORDER BY rowid DESC LIMIT 1),?,?
-                FROM tasks t WHERE state IN ('done','cancelled','review_on_error')
+                FROM tasks t WHERE state IN ('done','cancelled','review_on_error','detached')
                 AND (state!='review_on_error' OR EXISTS(SELECT 1 FROM terminal_errors e
                     WHERE e.issue_id=t.issue_id AND e.publication='confirmed'))''', (now(), now()))
 
@@ -42,7 +42,7 @@ class CleanupService:
                 next_retry_at=NULL,last_error=NULL,completed_at=NULL,updated_at=?
                 WHERE project_id=? AND repository=? AND number=? AND state='failed'
                 AND EXISTS(SELECT 1 FROM tasks t WHERE t.issue_id=cleanup_jobs.issue_id
-                    AND t.state IN ('done','cancelled','review_on_error') AND t.project_id=cleanup_jobs.project_id
+                    AND t.state IN ('done','cancelled','review_on_error','detached') AND t.project_id=cleanup_jobs.project_id
                     AND COALESCE(t.current_iteration_id,0)=cleanup_jobs.generation AND t.version=cleanup_jobs.version)''',
                 (self.clock().isoformat(), project.id, project.repository.casefold(), number)).rowcount)
 
@@ -57,9 +57,12 @@ class CleanupService:
         attempts = self.store.db.execute('''SELECT * FROM attempts WHERE repository=? AND number=? ORDER BY rowid''',
                                          (row['repository'], row['number'])).fetchall()
         for a in attempts:
+            for helper in self.store.db.execute('SELECT * FROM attempt_processes WHERE attempt_id=? AND finished_at IS NULL', (a['attempt_id'],)):
+                if group_members(helper['pid']) or identity(helper['pid']) == helper['process_identity']:
+                    raise TaskError('cleanup_active_execution')
             if not re.fullmatch('[0-9a-f]{32}', a['attempt_id']):
                 raise TaskError('cleanup_invalid_attempt')
-            if a['state'] == 'running' or (a['pid'] and a['process_identity'] and identity(a['pid']) == a['process_identity']):
+            if a['state'] == 'running' or (a['pid'] and (group_members(a['pid']) or (a['process_identity'] and identity(a['pid']) == a['process_identity']))):
                 raise TaskError('cleanup_active_execution')
         if not attempts and (task.exists() or str(worktree) in TaskWorkspaceCleanup(self.manager).registered(repo)):
             raise TaskError('cleanup_ownership_unproven')
@@ -86,7 +89,9 @@ class CleanupService:
             branch = self.manager.git(cwd, *git_args, 'symbolic-ref', '--short', 'HEAD', check=False).stdout.strip()
             expected_sha = attempt['result_sha'] or attempt['initial_sha']
             # Detached previous worktrees are intentional; current must retain its branch.
-            if sha != expected_sha or (branch != attempt['branch'] and (path == worktree or branch)):
+            detached_owned = (row['state'] == 'detached' and attempt['initial_sha'] and
+                self.manager.git(cwd, *git_args, 'merge-base', '--is-ancestor', attempt['initial_sha'], sha, check=False).returncode == 0)
+            if (sha != expected_sha and not detached_owned) or (branch != attempt['branch'] and (path == worktree or branch)):
                 raise TaskError('cleanup_ownership_unproven')
             if path == worktree and attempt['worktree'] != str(worktree):
                 raise TaskError('cleanup_ownership_unproven')
@@ -128,7 +133,7 @@ class CleanupService:
                     latest = db.execute('SELECT attempt_id FROM attempts WHERE repository=? AND number=? ORDER BY rowid DESC LIMIT 1',
                                         (job['repository'], job['number'])).fetchone()
                     if (not row or row['issue_id'] != job['issue_id'] or row['project_id'] != job['project_id']
-                            or row['state'] not in ('done','cancelled','review_on_error') or row['version'] != job['version']
+                            or row['state'] not in ('done','cancelled','review_on_error','detached') or row['version'] != job['version']
                             or (row['current_iteration_id'] or 0) != job['generation']
                             or (latest[0] if latest else None) != job['attempt_id']):
                         db.execute("UPDATE cleanup_jobs SET state='failed',last_error='cleanup_generation_changed',updated_at=? WHERE cleanup_id=?",
@@ -137,7 +142,7 @@ class CleanupService:
                     executions = db.execute('SELECT state,pid,process_identity FROM attempts WHERE repository=? AND number=?',
                                             (job['repository'], job['number'])).fetchall()
                     active_execution = any(a['state'] == 'running' or
-                        (a['pid'] and a['process_identity'] and identity(a['pid']) == a['process_identity'])
+                        (a['pid'] and (group_members(a['pid']) or (a['process_identity'] and identity(a['pid']) == a['process_identity'])))
                         for a in executions)
                     # Recovery resumes the same counted attempt. The OS lock proves
                     # the previous worker cannot still be deleting this task.
@@ -148,10 +153,14 @@ class CleanupService:
                 try:
                     if active_execution:
                         raise TaskError('cleanup_active_execution')
-                    self.cleanup(project, row)
+                    self.manager.cleanup_lock_fd = fd
+                    try:
+                        self.cleanup(project, row)
+                    finally:
+                        self.manager.cleanup_lock_fd = None
                 except (TaskError, OSError, ValueError, TypeError) as exc:
                     error = exc.code if isinstance(exc, TaskError) else 'cleanup_preserved_artifacts'
-                    delay = (60, 300, 900)[count - 1] if count < 4 else None
+                    delay = (60, 300, 900)[count - 1] if count < 4 else (900 if row['state'] == 'detached' else None)
                     with db:
                         db.execute('''UPDATE cleanup_jobs SET state=?,updated_at=?,next_retry_at=?,last_error=? WHERE cleanup_id=?''',
                                    ('pending' if delay else 'failed', self.clock().isoformat(),

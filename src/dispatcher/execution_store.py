@@ -16,6 +16,8 @@ class ExecutionStore:
     def _reserve(self, row, branch, maximum, observation, *, event_key=None, actor='scheduler', evidence=None):
         """Admission implementation; caller owns the SQLite transaction."""
         guard = self.store.guard(row['repository'], row['number'])
+        if self.store.stop_requested(row):
+            return None
         if not guard or guard['observation_token'] != observation:
             return None
         if self.db.execute("SELECT count(*) FROM attempts WHERE state='running'").fetchone()[0] >= maximum:
@@ -28,11 +30,11 @@ class ExecutionStore:
             return None
         if self.db.execute("""SELECT 1 FROM attempts a JOIN tasks t ON t.repository=a.repository AND t.number=a.number
                            WHERE a.repository=? AND a.branch=? AND a.number!=?
-                           AND (a.state='running' OR t.state NOT IN ('done','cancelled','revoked'))""",
+                           AND (a.state='running' OR t.state NOT IN ('done','cancelled','revoked','detached'))""",
                            (row['repository'], branch, row['number'])).fetchone():
             return None
         if self.db.execute("""SELECT 1 FROM tasks WHERE repository=? AND number!=?
-                AND work_branch=? AND state NOT IN ('done','cancelled','revoked')""",
+                AND work_branch=? AND state NOT IN ('done','cancelled','revoked','detached')""",
                 (row['repository'], row['number'], branch)).fetchone():
             return None
         current = self.store.get(row['repository'], row['number'])
@@ -75,6 +77,8 @@ class ExecutionStore:
         with self.db:
             self.db.execute('BEGIN IMMEDIATE')
             row = self.get(attempt)
+            if self.store.stop_requested(self.store.get(row['repository'], row['number'])):
+                return
             if row['state'] != 'running':
                 return
             if state == 'review':

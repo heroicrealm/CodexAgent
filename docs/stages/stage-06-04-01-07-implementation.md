@@ -1,157 +1,205 @@
-# 6.4.1.7 — анализ интеграции и блокер подтверждения остановки
+# Реализация 6.4.1.7 — Detach и адресный emergency-stop
 
-Статус: **реализация Detach/emergency-stop заблокирована до уточнения контракта
-процессов**. Ветка: `STAGE_06_04_01_07`. Обязательное
-[ТЗ](stage-06-04-01-07-spec.md) не изменялось. Этот документ не является отчётом
-об успешной реализации или приёмке этапа.
+Ветка: `STAGE_06_04_01_07`. Основание:
+[обязательное ТЗ](stage-06-04-01-07-spec.md).
 
-## B1: исчезновение process group не доказывает отсутствие пользователей worktree
+## Уточнение и границы процессов
 
-Пункты 6–7 ТЗ требуют подтверждения завершения процессов до удаления артефактов
-и запрета успешной очистки при невозможности подтверждения. Однако README
-(раздел Lifecycle) явно исключает `setsid/setpgid` и демонизацию из гарантий.
-Codex запускается с отключёнными sandbox/approvals и технически может создавать
-таких потомков. Это не предположение о вредоносности: обычный subprocess с
-`start_new_session=True` уже покидает исходную группу.
+Первоначально зафиксирован B1: исчезновение исходной process group не доказывает
+завершение потомков, выполнивших setsid/setpgid. Пользователь 2026-10-26 выбрал
+сохранение существующих границ Lifecycle. Уточнение внесено в ТЗ: остановка и
+cleanup подтверждаются для исходной группы, без требования cgroup. B1 снят.
+`tests/test_stage60417_blocker.py` сохранён как воспроизводимая проверка этой границы:
+в отдельном subreaper-harness потомок уходит в другую сессию; тест явно завершает
+и reap-ит его после проверки. Он не является обещанием поддержки демонизации.
 
-`Lifecycle._active()` ищет живые процессы только по PGID лидера, затем освобождает
-лидера через `wait()`. `cancel_child()` после исчезновения этой группы возвращает
-управление. Потомок с новой сессией может продолжать работать с тем же cwd и
-файлами. `CleanupService.owned_row()` проверяет состояние attempt и identity
-сохранённого лидера; полное множество таких потомков не сохраняется.
-Проверки symlink, Git metadata и ownership артефактов не заменяют доказательство
-отсутствия процессов.
+## Интеграция и изменённые файлы
 
-Добавлен изолированный воспроизводитель
-`tests/test_stage60417_blocker.py`: реальный потомок лидера вызывает новую сессию,
-исходная группа адресно останавливается, Lifecycle возвращает пустой active,
-а потомок всё ещё держит cwd моделируемого worktree. Отдельный harness становится
-Linux subreaper, после проверки убивает и reap-ит потомка; production cleanup
-не вызывается. Тест проходит, когда воспроизводит **текущий пробел**, и не является
-тестом приёмки новой функциональности.
+- `detachment.py`: durable intent с reason, previous state, stage, attempt,
+  timestamps, process status/method/error/evidence и durable backoff неподтверждённых сигналов; CAS поколения после сетевой
+  проверки; независимый StopWatcher с собственными Store/Adapter. Подтверждение
+  emergency через актуальные labels и последнее labeled event разрешённого
+  человеческого actor. Без доказательства сигналы запрещены. Stop intent имеет
+  приоритет над обычными queue commands; отсутствие ready является наблюдением
+  потери eligibility, как в прежней модели revocation, без требования approve.
+- `storage/__init__.py`, `storage/transitions.py`, `execution_store.py`: intent
+  ограждает confirm/decide/reserve/transitions/finish. Снятие ready для известной
+  Issue фиксирует intent в транзакции apply; отсутствие Issue в выдаче open Issues
+  само по себе не считается снятием метки. Identity проверяется до intent.
+  Pending/idle переходят в detached сразу; running ждёт scheduler. Task outcome
+  отделён от attempt outcome; естественный exit=0 остаётся completed, настоящий
+  exit_code сохраняется, обычный result_outbox не создаётся. Done/cancelled
+  сохраняют историческое состояние при обычном Detach и emergency.
+- `scheduler.py`, `attachments.py`, `codex/__init__.py`, `runtime/__init__.py`: проверка после reserve,
+  перед/между подготовительными Git шагами и перед запуском. Launch gate фиксирует
+  pid/start identity в SQLite до exec; durable stop проверяется под writer lock.
+  Только Lifecycle управляет reaping/signals; его операции сериализованы RLock.
+  Адресный stop_attempt проверяет identity, посылает TERM, ждёт grace, затем KILL
+  и ещё grace; отсутствие подтверждения возвращается как незавершённая остановка.
+  Git/gh helpers подготовки/публикации также запускаются через Lifecycle в отдельных
+  зарегистрированных группах (`attempt_processes`) с launch gate; restart/cleanup
+  учитывают их, а не только Codex PID. Обычный Detach не сигналит такие операции,
+  emergency адресно завершает их. Глобальный stop не вызывается. Прежние stop/stop --force продолжают работать.
+- `runtime.serve`/recovery: старые группы со stop intent исключаются из прежнего
+  общего crash cancellation. Ordinary detach продолжает ждать естественно,
+  emergency продолжает адресную остановку. До исчезновения группы cleanup запрещён.
+  Orphan registry сохраняется, завершённые записи удаляются. Codex не перезапускается.
+  В обычном Detach прежний deadline Codex не становится причиной сигнала; отдельные
+  явные stop --force и штатное поведение службы сохраняются.
+- `github/__init__.py`, `github/sync.py`, `queue.py`: команды остановки раньше
+  queue commands/PR monitor; targeted reads покрывают также tracked closed Issues.
+  Reconcile перечитывает SQLite и удаляет только точные configured managed names
+  отдельными DELETE, без label-set replacement и без удаления по префиксу.
+  Emergency никогда не удаляется синхронизацией. При подтверждённой emergency
+  снимаются ready и все остальные managed labels; пользовательские остаются.
+  Неподтверждённая emergency не разрешает потреблять команды или посылать сигналы,
+  но запрещает admission/publication до успешной проверки/ручного удаления.
+- `pr_publication.py`, `workspace.py`, `terminal_error.py`: fence перед commit,
+  непосредственно внутри Git manager перед commit/push после предварительных
+  проверок, перед create/reopen PR и terminal salvage. Каждый критический fence
+  перечитывает remote labels и проверяет durable intent/version/iteration.
+  Publication flock и publication_operations сохранены. Уже начатые эффекты не
+  откатываются: SHA, pushed/remote SHA и найденный PR записываются как факты.
+  `attempt_publications` хранит факт PR даже если stop запретил переход в review.
+- `publisher.py`: result delivery использует flock и проверяет stop/generation,
+  включая fresh labels перед POST. Сетевые операции вынесены из SQLite writer
+  transaction, чтобы они не задерживали фиксацию stop intent. Marker reconciliation
+  и publication_operations сохранены. `preparation_error.py`, `pr_monitor.py`,
+  `cancellation.py` проверяют durable stop перед очередным внешним эффектом.
+- `detachment.py`/`stop_outbox`: один diagnostic comment на request с marker,
+  flock, durable body/status/error и поиском перед POST. Lost response не создаёт
+  повторный комментарий; последующий прогресс меняет тот же комментарий PATCH.
+  Содержит причину, предыдущее состояние, preparation/codex/publication/idle,
+  attempt, TERM/KILL/not_required, process/cleanup status/errors, branch/SHA/PR.
+  Branch metadata экранируется и редактируется по политике обычного publisher.
+- `cleanup.py`, `workspace.py`: detached включён в прежние durable cleanup jobs
+  и generation guards; исходная группа и leader identity проверяются до удаления.
+  Разрешён force-remove dirty worktree только после ownership/preflight: workspace
+  boundaries, symlink, Git metadata/common-dir, зарегистрированные worktrees,
+  attempt branch и ancestry initial SHA, artifact/attachment registry. Дочерний
+  Git helper очистки наследует cleanup flock FD, поэтому recovery не начинает
+  повторное удаление, пока старый helper ещё выполняет операцию. Чужие файлы,
+  неизвестные архивы и неподтверждённые процессы сохраняются. Detached retries не
+  заканчиваются после обычного лимита четырёх попыток. Remote refs/PR не удаляются.
+- `config/__init__.py`, `initialization.py`, `config/config.example.yaml`: optional
+  emergency_stop name/color/description; interval default 5, positive integer.
+  Init/--update создают и обновляют метку. Fingerprint включает имена всех меток и полные свойства
+  emergency-метки; смена цвета/описания обычных меток сохраняет прежний контракт. Старые YAML и строковая форма поддержаны; прежние default names
+  остальных меток загрузчика сохранены. После upgrade нужен init --update.
+- `cli.py`, `rendering.py`: show table/JSON выводит stop_requests и stop_outbox
+  вместе с существующими attempts/publication/cleanup diagnostics.
+- `README.md`, ТЗ и этот отчёт: семантика, конфигурация, согласованная граница
+  процессов, миграция, проверки и ручные сценарии.
 
-Один обход `/proc` по cwd/fd или PPID не решает проблему: процессы могут менять
-cwd, закрывать fd, переподчиняться после смерти родителя и создавать потомков
-между проверкой и удалением. Нельзя сигналить неизвестные сохранённые PID без
-защиты от reuse. Нельзя объявить `cleanup=completed` на основании одной пустой
-исходной группы, если требование распространяется на всех потомков.
+## Миграция SQLite 609
 
-Для продолжения нужен явный выбор границы:
+Аддитивная, в существующем BEGIN IMMEDIATE/validation/marker механизме Store.
+Создаёт stop_requests, partial unique stop_active, stop_outbox и
+attempt_publications, attempt_processes и control_observations. Последняя таблица
+запрещает применение более старых серверных control snapshots к новому циклу. История attempts/iterations/PR/decisions не сбрасывается.
+Повторное открытие/повторная миграция идемпотентны; DDL и marker откатываются вместе.
 
-1. Строгая изоляция попытки, например делегированная cgroup v2. Расширить Lifecycle,
-   gate и durable registry: включать процессы в контейнер владения **до exec**,
-   подтверждать отсутствие всех членов перед cleanup, восстанавливать владение
-   после рестарта. В среде без доступного backend запуск должен быть запрещён,
-   а не молча переходить к более слабой гарантии. Это меняет требования к
-   развёртыванию и поддержку существующих сценариев. В проверенной среде
-   `/sys/fs/cgroup` не доступен текущему пользователю на запись; наличие cgroup2
-   mount само по себе не доказывает делегацию.
-2. Явно ограничить ТЗ существующим контрактом: исполнители не покидают исходную
-   process group. Тогда проверка всей группы достаточна внутри этой границы,
-   но гарантия не распространяется на произвольные демонизированные процессы.
-   Это изменение требований, которое нельзя принять за пользователя.
+Partial branch index и claim triggers исключают detached из активных броней;
+использующие их SQL reserve обновлены согласованно. Attempt освобождается только
+после подтверждённого завершения группы. Terminal review_on_error guard разрешает
+переход в detached только при durable stop intent; без intent остаётся прежний
+terminal guard. Cleanup enqueue triggers включают detached и сохраняют прежние
+межпроцессные flock/generation guards.
 
-До выбора не добавлены ни удаление грязных worktree, ни ложное подтверждение
-остановки. Вопрос передан пользователю. Технически расширить Lifecycle возможно;
-блокер — несовпадающие гарантии и необходимость выбрать поддерживаемую среду,
-а не утверждение, что Detach принципиально нереализуем.
-
-## Карта интеграции после снятия B1
-
-| Узел | Текущая граница | Необходимая интеграция |
-| --- | --- | --- |
-| `scheduler.py` | `admit` делает fresh fetch/apply, reserve, синхронную preparation; `collect` после exit=0 сразу создаёт publication intent | Команды должны фиксироваться до admission и collect. Fence после reserve, перед подготовкой и запуском, после подготовки и перед каждым эффектом. Ordinary detach ждёт естественного конца, emergency адресно вызывает Lifecycle. Task и attempt outcomes разделить, настоящий exit_code сохранить. |
-| `storage/__init__.py` | `apply/_revoke` переводят mutable tasks в revoked; running сохраняется, available=0. `decide`, `_set_state`, `save_branches` используют transaction/CAS | Durable intent с expected version/iteration/attempt и журналом в той же транзакции. Не превращать отсутствие Issue в fetch автоматически в доказанное ручное снятие ready. Проверить identity до изменения intent. Intent должен ограждать все пути решений. |
-| `storage/transitions.py` | Guarded transitions проверяют authority, evidence, iteration, version и journal | Добавить запрет обычных переходов при stop intent. Не обходить guard прямым UPDATE из scheduler. done/cancelled сохраняют исторический результат. Отдельно согласовать взаимодействие с immutable review_on_error. |
-| `execution_store.py` | Reserve проверяет observation token, лимиты, claims; finish создаёт result_outbox | Admission обязан проверять stop intent транзакционно. Завершение остановленной попытки не должно создавать обычный comment/PR intent или возвращать task в failed/review. |
-| `github/sync.py` | fetch → apply → queue commands → PR monitor → cancellation → reconcile | Обработать emergency раньше обычных команд/monitor. Независимая проверка активных попыток с собственным rate limit и Store/Adapter; не использовать общий SQLite connection из другого thread. Ошибка API не снимает durable блокировку. |
-| `github/Adapter` | Fetch всех open Issues; label reconciliation по точным конфигурируемым именам, отдельных DELETE/POST; command_events даёт GraphQL proof и REST actors | Повторно читать критические метки. Никогда не удалять emergency, в том числе по stale row. При emergency удалить ready и только точный набор managed labels, сторонние сохранить. Не расширять удаление до префикса dispatcher:. Учесть tracked closed Issues. |
-| `queue.py` | Human allowlist, labeled event, server time/revision fence, quarantine до наблюдения отсутствия; CLI также делает fetch/apply | Отдельная проверка emergency event/actor без зависимости от наличия ready и обычного approve boundary. Простого наличия метки недостаточно для выполнения команды. Неподтверждённая emergency не должна случайно превратиться в approve. |
-| `runtime/Lifecycle` | Launch gate, process registry, group identity, удержание zombie-лидера; методы вызываются последовательно scheduler | Решить B1; bounded ожидание при адресной остановке с durable незавершённым статусом. Нельзя вызвать глобальный cancel/request_stop(force=True). Параллельный poll не должен конкурентно reap-ить детей. |
-| `runtime.serve` / restart | `Lifecycle.recover()` до создания Dispatcher завершает старые зарегистрированные группы; Dispatcher затем восстанавливает publication либо finish interrupted | Ordinary detach не должен превратиться в сигнал после рестарта; учитывать durable intent до общего recovery. Emergency recovery должен адресно продолжать остановку; непроверяемые процессы сохраняют артефакты и диагностику. Не запускать Codex повторно. |
-| `pr_publication.py` | Per-Issue flock, publication_operations, восстановление intent, commit → push → create/reopen PR → verified transition | Fencing перед каждым необратимым шагом и fresh labels; проверка лишь в начале publish недостаточна. Уже начатый эффект сверить и сохранить как факт. Не возобновлять старый PR intent после detach/restart. |
-| `terminal_error.py` | Отдельный salvage commit/push/comment путь для review_on_error | Такой же fence, включая pending terminal outbox. Сохранить terminal evidence; не продолжать salvage вопреки обнаруженной команде. |
-| `publisher.py`, `preparation_error.py`, `pr_monitor.py`, `cancellation.py` | Несколько независимых durable delivery paths, включая старые PR resolutions | Запрет обычных внешних эффектов должен охватывать все очереди, а не только PR Publisher. Emergency diagnostic — отдельный durable outbox с маркером, reconciliation после lost response и сериализацией доставки. |
-| `cleanup.py`, `workspace.py` | Durable jobs, flock, generation guards, ограниченные retry; dirty worktree сохраняется; ownership по attempt SHA/branch, Git metadata и registry | Detached допускает dirty cleanup только при доказанном владении и подтверждённом отсутствии процессов. Проверка начального SHA недостаточна после коммитов Codex. Повторять незавершённую безопасную очистку; не терять blocked job после исчерпания обычного retry. Не удалять remote branch/PR. |
-| `config`, `initialization`, пример | COLORS определяет labels и init; fingerprint сейчас включает имена | Новый emergency key с name/color/description и interval=5 по умолчанию; совместимость строковой формы и прежних YAML. Учитывать upgrade init/fingerprint и recovery у stale init. Не добавлять в пример неработающие настройки. |
-| `storage/migrations.py` | Аддитивные 605–608, transactional validation, triggers/indexes для claims и cleanup | Следующая идемпотентная миграция intent/progress/outbox. Detached исключить из активных claims во всех indexes/triggers/SQL, сохранив branch ownership remote. Новая итерация после reattach, без удаления attempts/history и без восстановления старого запуска. |
-
-Отдельный архитектурный объём: текущий scheduler синхронно выполняет Git/gh
-подготовку и публикацию (часть subprocess timeout до 120 секунд), поэтому добавить
-`if elapsed >= 5` в основной цикл недостаточно для независимого emergency polling.
-Потребуется отдельный наблюдатель с собственными соединениями, durable fencing и
-согласованной передачей адресной остановки единственному владельцу Lifecycle.
-Это разрешимый объём работ, сам по себе не основание ослаблять ТЗ.
-
-## Изменения и миграции
-
-Изменены только README, комментарий в примере конфигурации, этот документ и
-воспроизводитель. Production-код и schema не менялись; последняя миграция — 608.
-Миграция Detach, emergency label/interval, outbox и новые состояния **не реализованы**.
-Не заявляется выполнение критериев приёмки 6.4.1.7. main и STAGE_06_04_01 не меняются,
-PR не создаётся.
+Повторное ready после исчезновения emergency, finalized stop и completed cleanup
+может начать discovered только по более новому серверному наблюдению. Старые
+attempts не восстанавливаются. После approve создаётся новый iteration_id согласно
+существующей модели approved iterations. Исторический stop остаётся с active=0.
+При занятой remote branch действует прежний branch_ownership_conflict/configuration
+error путь; разрешение повторно использовать ветку rejected PR на Detach не переносится.
 
 ## Проверки
 
-Прямой воспроизводитель:
+Новые acceptance tests: `tests/test_detachment.py`. Существующие fixtures в
+`test_stage04.py`/`test_stage603.py` дополнены явными targeted control reads; gh stub
+теперь различает list Issues и GET конкретной Issue. Проверки JSON/show в
+`test_cli_unicode.py`/`test_rendering.py` учитывают новые diagnostics. Stage 2
+revocation test в `test_github.py` различает прежнее исчезновение eligibility и
+новый явный Detach при снятии ready, а reattach выполняет после cleanup и более
+нового server observation. `test_stage604.py` использует новые серверные даты для
+новых правок/закрытия после публикации; fixture claim в `test_issue32.py` сохраняет
+конкурирующую Issue в актуальном fetch, чтобы проверять живую бронь, а не отозванную.
 
-```bash
-PYTHONPATH=src python3 tests/test_stage60417_blocker.py /tmp/unique-process-probe
-```
+Проверены idle states, done/cancelled, running natural exit и dirty cleanup,
+preparation stop, две активные попытки и изоляция emergency, ready/no-ready,
+сохранение сторонних меток, untrusted actor, fence commit/push/PR, lost response,
+SIGKILL для живого потомка после выхода лидера, restart natural drain, миграция
+с 608/повтор/rollback, custom config/fingerprint, ownership failure/retry,
+неподтверждённая identity, reattach и конфликт уже опубликованной ветки.
+Независимый watcher проверяется через настоящие subprocess с подменёнными gh/Codex,
+без вызова основного poll/collect во время обнаружения/остановки.
 
-Использовать новый путь при каждом запуске. Ожидаемый вывод:
-`original group stopped; escaped descendant still uses worktree`.
-
-Первый `bash scripts/test.sh` не стартовал: в системном Python нет pytest.
-Для повторного запуска создано отдельное временное окружение, зависимости
-установлены через `pip install -e '.[test]'`; зависимости проекта не менялись.
-Полный прогон:
+Тестовая среда: `/tmp/codexagent-60417-venv`, установлен editable `.[test]`.
+В системном Python pytest отсутствовал; зависимости/pyproject не менялись.
+Первый baseline до реализации: 608 passed, 30 subtests passed (40.40s).
+Итоговый прогон после всех изменений:
 
 ```text
 PATH=/tmp/codexagent-60417-venv/bin:$PATH bash scripts/test.sh
-608 passed, 30 subtests passed in 40.40s
+642 passed, 30 subtests passed in 91.03s (0:01:31)
 ```
 
-Exit code 0; скрипт также выполнил `compileall` для src/tests. `git diff --check`
-прошёл. Существующая регрессия review_on_error, rejected→pending, PR publication,
-cleanup и stop --force прошла. Это проверка исходного поведения и воспроизводителя
-B1, а не автоматическая приёмка не реализованного Detach/emergency-stop.
+Exit code 0; compileall src/tests также прошёл. `git diff --check` — успешно.
+Включены 34 новых acceptance-сценария `test_detachment.py` и существующая регрессия
+review_on_error, rejected→pending, PR publication, cleanup, stop/stop --force.
+Промежуточные прогоны выявили и исправили terminal preparation fencing, targeted
+GET в gh fixtures, совместимость fingerprint обычных меток и устаревшие серверные
+даты в тестовых снимках. Проверки не используют реальные учётные данные GitHub.
 
-## Ручная проверка блокера
+## Ограничения
 
-1. Работать в рабочей ветке и временном каталоге, не в настоящем workspace службы.
-2. Выполнить команду воспроизводителя выше или pytest для данного файла.
-3. Проверить успешный exit и сообщение: адресно остановлена исходная группа,
-   escaped descendant на момент проверки ещё жив и cwd равен тестовому worktree.
-4. Harness сам посылает SIGKILL только своему усыновлённому unreaped потомку и
-   выполняет waitpid; рабочие задания диспетчера не затрагиваются.
-5. Не проверять emergency в настоящей Issue как реализованную команду: пока это
-   обычная неизвестная метка, она не является средством остановки.
+- Гарантии относятся к исходной process group, как согласовано в ТЗ; setsid,
+  setpgid и демонизация вне контракта. Linux /proc необходим для подтверждения.
+- Remote label → обнаружение → SQLite и внешний GitHub/Git эффект не являются
+  единой транзакцией. Не обещается отмена уже начатого эффекта. Интервал 5 секунд
+  ограничивает частоту проверок, не гарантирует такой latency при медленном API.
+- После crash невозможно получить exit_code уже осиротевшего процесса из чужого
+  waitpid; неизвестный код остаётся NULL, а не подменяется успешным результатом.
+  Записанный exit_code сохраняется. Recovery не запускает Codex повторно.
+- При недоказанном ownership (например, crash внутри worktree creation до сохранения
+  initial SHA), неизвестных артефактах или непроверяемой surviving группе автоматическая
+  очистка сохраняет данные и диагностику. Исправить причину и повторить cleanup-retry;
+  detached cleanup продолжает безопасные retry. Автоматически присваивать владение
+  произвольным найденным файлам нельзя.
+- Live GitHub приёмка не проводилась; реальные Issue/PR для тестов не создавались.
 
-## План ручной приёмки после реализации
+## Ручная приёмка
 
-Эти сценарии пока **не выполнены**, начинать только после снятия B1 и реализации.
+В отдельном тестовом проекте с выделенными workspace и учётной записью:
 
-1. В тестовом проекте проверить ready removal для discovered/pending/revoked/
-   review/rejected: detached, без запуска и публикации; done/cancelled сохраняются.
-2. Запустить два длительных задания. Снять ready с первого: дождаться естественного
-   exit, проверить сохранённый exit_code, отсутствие commit/push/PR от диспетчера,
-   безопасную очистку. Второе продолжает работу.
-3. Повторить с emergency при наличии и отсутствии ready; проверить TERM, затем
-   KILL для игнорирующего TERM stub. Второе задание и служба продолжают работу.
-   Проверить живого потомка после завершения лидера в выбранном контракте изоляции.
-4. Добавить пользовательские `bug` и `dispatcher:my-label`; после emergency
-   сохранить их и emergency, удалить только configured managed labels и ready.
-   Повторное ready при emergency не запускает задачу.
-5. После ordinary detach добавить ready: новая discovered/iteration после approve,
-   прежние history/attempts сохранены. Занятая remote branch не перезаписывается.
-6. Внедрить сбой до/после intent, сигнала, publication effect и cleanup, перезапустить:
-   нет повторного Codex/PR/comment. При неподтверждённых процессах worktree остаётся,
-   cleanup незавершён, диагностика доставляется и восстановление повторяется.
-7. Отключить GitHub при доставке diagnostic, восстановить сеть, повторить poll:
-   блокировка сохраняется, комментарий один, содержит фактические SHA/branch/PR,
-   stop method, process/cleanup status и безопасные ошибки.
-8. Внедрить гонки перед commit/push/create/reopen PR и после PR: после обнаружения
-   команды нет новых эффектов; уже начатые эффекты записаны без обещания отката.
-9. Проверить custom emergency label/init --update, старый YAML, повторную миграцию,
-   rejected→pending, review_on_error, done/cancelled cleanup и stop --force.
+1. Обновить конфиг, выполнить init --update. Проверить configured emergency name,
+   color, description; старый YAML без новых ключей должен загружаться с default 5.
+2. Для discovered/pending/revoked/review/rejected снять ready, выполнить poll.
+   В show проверить ready_removed, detached и cleanup. У done/cancelled историческое
+   состояние должно сохраниться. До запуска Codex не должно появиться новой попытки.
+3. Запустить два долгих stub задания. Снять ready с первого: процесс заканчивает
+   естественно, exit_code сохранён, новых dispatcher commit/push/PR/comments нет.
+   Второе работает. После подтверждения завершения первой группы dirty worktree
+   удаляется при доказанном ownership.
+4. Повторить с emergency (как с ready, так и без неё) от allowlisted человека.
+   Дождаться отдельной проверки watcher; только первая группа получает TERM/KILL,
+   служба и второе задание работают. Для stub, игнорирующего TERM, проверить KILL.
+   Повторить с вышедшим лидером и живым потомком той же группы.
+5. Добавить `bug` и `dispatcher:custom`. После emergency они и emergency остаются,
+   ready и только configured managed labels удаляются. Добавление ready при
+   emergency не запускает Codex. Команда от bot/неразрешённого actor не даёт сигналов.
+6. Отключить GitHub во время diagnostic POST и восстановить сеть. Повторить poll,
+   перезапустить службу: один комментарий по marker, обновляется тот же comment_id,
+   блокировка не исчезает. Проверить stage/method/process/cleanup/SHA/PR/errors.
+7. Убить daemon на границах intent/signal/cleanup, запустить снова: ordinary ждёт
+   без сигналов, emergency продолжает адресную остановку; нового Codex нет.
+   При неподтверждённой identity/группе worktree сохраняется и stop не finalized.
+8. После completed cleanup добавить ready (для emergency сначала удалить её).
+   После нового poll — discovered, после approve — новый iteration_id, история цела.
+   При существующей remote branch отказ branch_ownership_conflict, без force push.
+9. Внести чужой файл рядом с worktree, symlink или неизвестный архив: cleanup
+   pending/error, данные сохранены. Устранить причину и проверить retry/cleanup-retry.
+10. Инъецировать команду между git add/commit, проверками/push, поиском/create/reopen
+    PR и после PR. После обнаружения — нет следующих эффектов; уже начатые эффекты
+    записаны как факты. Проверить rejected→pending, review_on_error, done/cancelled
+    cleanup и stop --force по прежним сценариям.

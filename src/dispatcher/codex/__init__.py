@@ -22,7 +22,7 @@ class CodexExecutor:
             raise TaskError('unsupported_codex_cli', 'CODEX') from None
         self.checked = True
 
-    def start(self, issue, branch, paths, worktree, task, attempt):
+    def start(self, issue, branch, paths, worktree, task, attempt, before_exec=None):
         self.check()
         prompt = ('Implement this approved GitHub Issue. Work on branch ' + branch + '.\n'
                   'Run available tests and create a Git commit. Do not push, change GitHub Issues, create PRs or merge.\n'
@@ -39,7 +39,7 @@ class CodexExecutor:
         with open(prompt_path) as stdin, private_file(output) as stdout:
             child = self.lifecycle.submit([self.config.executable, 'exec',
                 '--dangerously-bypass-approvals-and-sandbox', '--json', '-'],
-                cwd=worktree, stdin=stdin, stdout=stdout, stderr=subprocess.STDOUT)
+                cwd=worktree, stdin=stdin, stdout=stdout, stderr=subprocess.STDOUT, before_exec=before_exec)
         return dict(child=child, deadline=time.monotonic() + self.config.timeout_seconds, output=output)
 
     @staticmethod

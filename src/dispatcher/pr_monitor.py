@@ -64,7 +64,7 @@ class PullRequestMonitor:
         db, api = self.store.db, self.adapter
         saved = db.execute('SELECT * FROM pr_resolutions WHERE pr_id=? AND iteration_id=?', (linked['pr_id'], linked['iteration_id'])).fetchone()
         task = self.store.get(project.repository, linked['number'])
-        if task['state'] == 'review_on_error':
+        if self.store.stop_requested(task) or task['state'] == 'review_on_error':
             return
         if task['state'] == 'review' and task['current_iteration_id'] == linked['iteration_id']:
             pr = api.request(f'repos/{project.repository}/pulls/{linked["pr_number"]}')
@@ -139,6 +139,8 @@ class PullRequestMonitor:
             if issue['id'] != linked['issue_id']:
                 raise GitHubError(kind='invalid_response')
             if issue['state'] != 'closed' or issue.get('state_reason') != 'completed':
+                if self.store.stop_requested(self.store.get(project.repository, linked['number'])):
+                    return
                 api.write(endpoint, 'PATCH', dict(state='closed', state_reason='completed'))
                 issue = api.request(endpoint)
             if issue['id'] != linked['issue_id'] or issue['state'] != 'closed' or issue.get('state_reason') != 'completed':
@@ -157,6 +159,8 @@ class PullRequestMonitor:
                 if saved['target'] == 'done':
                     body += f'merged_at: {metadata["merged_at"]}\nIssue closed_at: {issue_closed_at}\n'
                 body += marker
+                if self.store.stop_requested(self.store.get(project.repository, linked['number'])):
+                    return
                 existing = api.write(endpoint + '/comments', 'POST', dict(body=body))
             if not rest_id(existing.get('id')):
                 raise GitHubError(kind='invalid_response')

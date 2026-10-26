@@ -115,6 +115,7 @@ def issue(project, **changes):
 def adapter(items):
     result = Mock(spec=Adapter)
     result.fetch.return_value = items
+    result.control_issue.side_effect = lambda project, number: dict(id=next(i['id'] for i in result.fetch(project) if i['number']==number), number=number, labels=[dict(name=n) for n in next(i['labels'] for i in result.fetch(project) if i['number']==number)])
     result.pages.return_value = []
     result.repository_identity.return_value = 11
     result.response_date = '2026-10-24T00:10:00Z'
@@ -476,7 +477,7 @@ def test_outbox_uncertain_write_recovery_and_migration(env):
     try:
         execution = ExecutionStore(store)
         ExecutionStore(store)
-        assert [r[0] for r in store.db.execute('SELECT version FROM schema_migrations ORDER BY version')] == [1,2,3,602,604,605,606,607,608]
+        assert [r[0] for r in store.db.execute('SELECT version FROM schema_migrations ORDER BY version')] == [1,2,3,602,604,605,606,607,608,609]
         assert store.get(project.repository,1)['approved_version'] == 1
         api.pages.return_value = [dict(id=456,body=body)]
         TaskResultPublisher(execution,api).flush()
@@ -571,6 +572,7 @@ if method=='GET':
     elif '/pulls/' in endpoint: result=state['pr']
     elif '/comments' in endpoint: result=state['comments']
     elif '/labels' in endpoint: result=state['issue']['labels']
+    elif endpoint=='repos/owner/repo/issues/1': result=state['issue']
     else: result=[state['issue']]
 else:
     payload=json.load(sys.stdin)

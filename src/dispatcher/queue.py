@@ -79,7 +79,7 @@ def commands(store, adapter, project, items, before, observation=None):
         actions = {project.label(k).name.casefold(): k for k in ('approve', 'reject')}
         row = (observation.get(issue['number']) if observation is not None
                else store.get(project.repository, issue['number']))
-        if row is None:
+        if row is None or store.stop_requested(row) or project.label('emergency_stop').name.casefold() in names:
             continue
         if row['state'] == 'rejected':
             actions[project.label('cancelled').name.casefold()] = 'cancel'

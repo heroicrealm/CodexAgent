@@ -58,17 +58,80 @@ def register_artifacts(root, task, *names):
 
 
 class GitWorkspaceManager:
-    def __init__(self, config):
+    def __init__(self, config, lifecycle=None, execution=None):
         self.config = config
+        self.operation_guard = None
+        self.lifecycle, self.execution = lifecycle, execution
+        self.operation_attempt = None
+        self.cleanup_lock_fd = None
+
+    def run(self, argv, **kwargs):
+        """Register task helpers before exec; Lifecycle alone reaps their groups."""
+        allow_stopped = kwargs.pop('_allow_stopped', False)
+        if self.cleanup_lock_fd is not None:
+            kwargs['pass_fds'] = (self.cleanup_lock_fd,)
+        if not self.lifecycle or not self.operation_attempt:
+            return subprocess.run(argv, **kwargs)
+        import tempfile
+        import time
+        from dispatcher.runtime import identity
+        from dispatcher.storage import now
+        timeout = kwargs.pop('timeout', 120)
+        text = kwargs.pop('text', False)
+        kwargs.pop('capture_output', None)
+        process_id = None
+        def registered(child):
+            nonlocal process_id
+            with self.execution.db as db:
+                db.execute('BEGIN IMMEDIATE')
+                task_attempt = self.execution.get(self.operation_attempt)
+                task = self.execution.store.get(task_attempt['repository'], task_attempt['number'])
+                if self.execution.store.stop_requested(task) and not allow_stopped:
+                    raise RuntimeError('Task detached before helper launch')
+                process_id = db.execute('''INSERT INTO attempt_processes(attempt_id,pid,process_identity,started_at)
+                    VALUES(?,?,?,?)''', (self.operation_attempt, child.pid, identity(child.pid), now())).lastrowid
+        # Files avoid pipe deadlocks without communicate(), which reaps the leader.
+        with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
+            try:
+                child = self.lifecycle.submit(argv, service=True, before_exec=registered, during_drain=True,
+                    stdout=stdout, stderr=stderr, **kwargs)
+            except RuntimeError:
+                task_attempt = self.execution.get(self.operation_attempt)
+                if self.execution.store.stop_requested(self.execution.store.get(task_attempt['repository'], task_attempt['number'])):
+                    raise TaskError('task_detached', 'DISPATCHER') from None
+                raise
+            deadline = time.monotonic() + timeout
+            expired = False
+            while child in self.lifecycle._active():
+                if time.monotonic() >= deadline:
+                    expired = True
+                    _, confirmed = self.lifecycle.stop_attempt(child.pid, self.execution.db.execute(
+                        'SELECT process_identity FROM attempt_processes WHERE process_id=?', (process_id,)).fetchone()[0])
+                    if not confirmed:
+                        raise subprocess.TimeoutExpired(argv, timeout)
+                time.sleep(.01)
+            with self.execution.db as db:
+                db.execute('UPDATE attempt_processes SET finished_at=?,exit_code=? WHERE process_id=?',
+                           (now(), child.returncode, process_id))
+            if expired:
+                raise subprocess.TimeoutExpired(argv, timeout)
+            stdout.seek(0)
+            stderr.seek(0)
+            out, err = stdout.read(), stderr.read()
+            return subprocess.CompletedProcess(argv, child.returncode,
+                out.decode(errors='replace') if text else out, err.decode(errors='replace') if text else err)
 
     def git(self, cwd, *args, check=True):
+        if self.operation_guard:
+            self.operation_guard()
         try:
             environment = dict(os.environ, GIT_TERMINAL_PROMPT='0')
             environment.setdefault('GIT_SSH_COMMAND', 'ssh -oBatchMode=yes')
             helper = '!' + shlex.quote(self.config.github_executable) + ' auth git-credential'
-            result = subprocess.run(['git', '-c', 'credential.helper=', '-c',
+            result = self.run(['git', '-c', 'credential.helper=', '-c',
                                      'credential.helper=' + helper, '-C', str(cwd), *args], capture_output=True,
-                                    text=True, timeout=120, env=environment, stdin=subprocess.DEVNULL)
+                                    text=True, timeout=120, env=environment, stdin=subprocess.DEVNULL,
+                                    _allow_stopped=bool(args and (args[0] in ('rev-parse','symbolic-ref','status','merge-base','diff','ls-remote','show-ref') or args[:2] == ('remote','get-url'))))
         except (OSError, subprocess.TimeoutExpired):
             raise TaskError('git_unavailable', 'GIT') from None
         if check and result.returncode:
@@ -84,6 +147,8 @@ class GitWorkspaceManager:
         return safe_path(root, base / 'repository'), task, safe_path(root, task / 'worktree')
 
     def default_branch(self, project):
+        if self.operation_guard:
+            self.operation_guard()
         repo, _, _ = self.paths(project, 1)
         if repo.exists():
             output = self.git(repo, 'ls-remote', '--symref', 'origin', 'HEAD').stdout
@@ -93,7 +158,7 @@ class GitWorkspaceManager:
             raise TaskError('default_branch_unavailable', 'GIT')
         try:
             import json
-            response = subprocess.run([self.config.github_executable, 'repo', 'view', project.repository,
+            response = self.run([self.config.github_executable, 'repo', 'view', project.repository,
                                        '--json', 'defaultBranchRef'], capture_output=True, text=True, timeout=30)
             value = json.loads(response.stdout)['defaultBranchRef']['name']
             if response.returncode:
@@ -109,10 +174,12 @@ class GitWorkspaceManager:
         return f'codex/issue-{issue["number"]}' if branch in (project.base_branch, self.default_branch(project)) else branch
 
     def validate_branch(self, branch):
+        if self.operation_guard:
+            self.operation_guard()
         from dispatcher.github import valid_branch
         if not valid_branch(branch):
             raise TaskError('invalid_branch', 'GIT')
-        result = subprocess.run(['git', 'check-ref-format', '--branch', branch], capture_output=True, timeout=10)
+        result = self.run(['git', 'check-ref-format', '--branch', branch], capture_output=True, timeout=10)
         if result.returncode:
             raise TaskError('invalid_branch', 'GIT')
 
@@ -138,9 +205,11 @@ class GitWorkspaceManager:
         if worktree.exists():
             raise TaskError('worktree_already_exists', 'GIT')
         if not repo.exists():
+            if self.operation_guard:
+                self.operation_guard()
             # gh honors its configured SSH/HTTPS protocol and existing auth.
             try:
-                response = subprocess.run([self.config.github_executable, 'repo', 'clone', project.repository,
+                response = self.run([self.config.github_executable, 'repo', 'clone', project.repository,
                                            str(repo), '--', '--no-checkout'], capture_output=True,
                                           timeout=120, stdin=subprocess.DEVNULL,
                                           env=dict(os.environ, GH_PROMPT_DISABLED='1', GIT_TERMINAL_PROMPT='0'))
@@ -213,14 +282,18 @@ class GitWorkspaceManager:
             raise TaskError('rewritten_history', 'GIT')
         return sha
 
-    def publication_commit(self, worktree, branch, initial_sha, base, *, salvage=False):
+    def publication_commit(self, worktree, branch, initial_sha, base, *, salvage=False, before_commit=None):
         safe_path(self.config.workspace, worktree)
         if self.git(worktree, 'symbolic-ref', '--short', 'HEAD').stdout.strip() != branch:
             raise TaskError('unexpected_branch', 'GIT')
         if self.git(worktree, 'status', '--porcelain').stdout.strip():
             self.git(worktree, 'add', '--all')
+            if before_commit:
+                before_commit()
             self.git(worktree, 'commit', '-m', 'Implement task')
         sha = self.verify(worktree, branch, initial_sha, noop=True)
+        if self.execution and self.operation_attempt:
+            self.execution.update(self.operation_attempt, result_sha=sha)
         if salvage:
             return sha
         self.validate_branch(base)
@@ -232,17 +305,21 @@ class GitWorkspaceManager:
             raise TaskError('git_operation_failed', 'GIT')
         return sha
 
-    def push(self, project, worktree, branch, expected_origin=None):
+    def push(self, project, worktree, branch, expected_origin=None, *, before_push=None):
         safe_path(self.config.workspace, worktree)
         if expected_origin is not None and self.git(worktree, 'remote', 'get-url', 'origin').stdout.strip() != expected_origin:
             raise TaskError('origin_changed', 'GIT')
         self.validate_branch(branch)
         if branch in (project.base_branch, self.default_branch(project)):
             raise TaskError('default_branch_protected', 'GIT')
+        if before_push:
+            before_push()
         result = self.git(worktree, 'push', 'origin', f'HEAD:refs/heads/{branch}', check=False)
         if result.returncode:
             rejected = any(token in result.stderr.lower() for token in ('non-fast-forward', 'fetch first'))
             raise TaskError('non_fast_forward' if rejected else 'git_operation_failed', 'GIT')
+        if self.execution and self.operation_attempt:
+            self.execution.update(self.operation_attempt, pushed=1)
 
 
 class TaskWorkspaceCleanup:
@@ -261,7 +338,7 @@ class TaskWorkspaceCleanup:
             raise
 
     def _cleanup(self, project, row):
-        if row['state'] not in ('done', 'cancelled') and not (row['state'] == 'review_on_error' and dict(row).get('publication_confirmed') is True):
+        if row['state'] not in ('done', 'cancelled', 'detached') and not (row['state'] == 'review_on_error' and dict(row).get('publication_confirmed') is True):
             raise TaskError('cleanup_requires_done')
         repo, task, worktree = self.manager.paths(project, row['number'])
         root = self.manager.config.workspace
@@ -284,7 +361,7 @@ class TaskWorkspaceCleanup:
             # A crash may leave Git metadata after the worktree disappeared.
             for path in worktrees:
                 if str(path) in self.registered(repo):
-                    self.manager.git(repo, 'worktree', 'remove', str(path))
+                    self.manager.git(repo, 'worktree', 'remove', *(['--force'] if row['state'] == 'detached' else []), str(path))
             return
         # Preflight everything before removing the worktree or any artifacts.
         for path in task.rglob('*'):
@@ -356,12 +433,12 @@ class TaskWorkspaceCleanup:
                     if path not in attachment_files | {manifest} or not path.is_file():
                         raise TaskError('cleanup_unexpected_file')
         for path in worktrees:
-            if path.exists() and self.manager.git(path, 'status', '--porcelain', '--untracked-files=all', '--ignored').stdout.strip():
+            if row['state'] != 'detached' and path.exists() and self.manager.git(path, 'status', '--porcelain', '--untracked-files=all', '--ignored').stdout.strip():
                 raise TaskError('dirty_worktree', 'GIT')
         for path in worktrees:
             if path.exists() or str(path) in self.registered(repo):
                 self.verify_metadata(repo, [path])
-                self.manager.git(repo, 'worktree', 'remove', str(path))
+                self.manager.git(repo, 'worktree', 'remove', *(['--force'] if row['state'] == 'detached' else []), str(path))
         for path in attachment_files:
             safe_path(root, path)
             path.unlink(missing_ok=True)

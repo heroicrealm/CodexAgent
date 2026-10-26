@@ -36,6 +36,21 @@ class SyncService:
                 counts = self.store.apply(project, items, observation=observation)
                 for key, count in counts.items():
                     result[key] += count
+                from dispatcher.detachment import StopController
+                stops = StopController(self.config, self.store, self.adapter)
+                for stopped_row in self.store.queue(project.repository):
+                    # Targeted reads also cover closed managed Issues.
+                    observed_item = next((i for i in items if i['number'] == stopped_row['number']), None)
+                    if observed_item is None or project.label('emergency_stop').name.casefold() in {n.casefold() for n in observed_item['labels']}:
+                        try:
+                            raw_control = None if observed_item is None else dict(id=observed_item['id'], number=observed_item['number'], labels=[dict(name=n) for n in observed_item['labels']])
+                            stops.observe(project, stopped_row, raw_control)
+                        except (GitHubError, KeyError, TypeError, ValueError):
+                            self.log('stop_verification_failed', project, task=stopped_row['number'])
+                    latest_attempt = self.store.db.execute("SELECT 1 FROM attempts WHERE repository=? AND number=? AND state='running'",
+                        (stopped_row['repository'], stopped_row['number'])).fetchone()
+                    if not latest_attempt:
+                        stops.finalize(stopped_row)
                 receipts = commands(self.store, self.adapter, project, items, before, observation)
                 for receipt in receipts:
                     notify = receipt.pop('notify')
@@ -63,6 +78,8 @@ class SyncService:
                 self.log('poll_failed', project)
         from dispatcher import preparation_error
         preparation_error.flush(self.store, self.adapter, self.config.projects)
+        from dispatcher.detachment import StopController
+        StopController(self.config, self.store, self.adapter).diagnostics()
         from dispatcher.cleanup import CleanupService
         CleanupService(self.config, self.store).reconcile()
         return result

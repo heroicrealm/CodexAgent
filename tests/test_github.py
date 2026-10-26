@@ -51,7 +51,7 @@ def config(project):
 
 
 def poll(store, project, items):
-    adapter = Adapter(run=Mock(return_value=response(items)))
+    adapter = Adapter(run=Mock(return_value=response(items, headers='Date: Sat, 24 Oct 2026 00:10:00 GMT\n')))
     return SyncService(config(project), store, adapter).poll()
 
 
@@ -82,10 +82,22 @@ def test_revocation_restore(store, project, replacement, confirmed):
     poll(store, project, [raw()])
     if confirmed:
         assert store.confirm('owner/repo', 1, 1)
-    assert poll(store, project, replacement)['revoked'] == 1
+    detached = bool(replacement and not replacement[0]['labels'])
+    assert poll(store, project, replacement)['revoked'] == (0 if detached else 1)
     assert store.get('owner/repo', 1)['approved_version'] is None
     assert not store.get('owner/repo', 1)['available']
-    assert store.get('owner/repo', 1)['state'] == 'revoked'
+    assert store.get('owner/repo', 1)['state'] == ('detached' if detached else 'revoked')
+    if detached:
+        from dispatcher.cleanup import CleanupService
+        from dataclasses import replace
+        test_config = replace(config(project), workspace=Path(store.db.execute('PRAGMA database_list').fetchone()[2]).parent, logs=Path(store.db.execute('PRAGMA database_list').fetchone()[2]).parent / 'logs')
+        from dispatcher.runtime import prepare
+        prepare(test_config)
+        CleanupService(test_config, store).tick()
+    if detached:
+        # Reattach requires a newer server observation than the detach read.
+        with store.db:
+            store.db.execute("UPDATE stop_requests SET evidence=?", (json.dumps({'observed_at':'2026-10-23T00:00:00Z'}),))
     poll(store, project, [raw()])
     assert store.get('owner/repo', 1)['state'] == 'discovered'
     assert store.db.execute('SELECT count(*) FROM tasks').fetchone()[0] == 1
