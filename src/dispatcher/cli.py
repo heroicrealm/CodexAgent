@@ -88,6 +88,10 @@ def main(argv=None):
                     if row is None:
                         raise RuntimeError('Unknown issue')
                     value = _display_task(row)
+                    value['stop_requests'] = [dict(r) for r in store.db.execute(
+                        'SELECT request_id,iteration_id,version,attempt_id,reason,previous_state,stage,requested_at,finalized_at,active,process_status,method,error FROM stop_requests WHERE issue_id=? ORDER BY request_id', (row['issue_id'],))]
+                    value['stop_outbox'] = [dict(r) for r in store.db.execute(
+                        'SELECT o.request_id,o.delivered,o.comment_id,o.error FROM stop_outbox o JOIN stop_requests s USING(request_id) WHERE s.issue_id=?', (row['issue_id'],))]
                     value['configuration_errors'] = [dict(r) for r in store.db.execute(
                         'SELECT * FROM configuration_errors WHERE issue_id=?', (row['issue_id'],))]
                     value['terminal_errors'] = [dict(r) for r in store.db.execute(

@@ -1,5 +1,7 @@
 dispatcher:
+  # Natural drain works without delegated cgroups. Only stop --force sends signals.
   poll_interval_seconds: 30
+  emergency_poll_interval_seconds: 5 # Independent checks of active attempts.
   max_parallel_tasks: 1
   shutdown_policy: wait
   force_grace_timeout_seconds: 5
@@ -10,7 +12,7 @@ github:
   auth_method: gh
 codex:
   executable: codex
-  timeout_seconds: 7200
+  timeout_seconds: 7200 # Diagnostic comment once per attempt; execution continues.
   # Dispatcher mode: codex exec bypasses approvals and the sandbox. Use a dedicated OS account.
   execution_mode: full-auto
   quota:
@@ -31,6 +33,7 @@ projects:
     labels:
       # Legacy string form "ready: codex-ready" is also supported.
       ready: {name: codex-ready, color: '0E8A16', description: 'Задание готово к обработке'}
+      emergency_stop: {name: 'dispatcher:emergency-stop', color: 'B60205', description: 'Адресная аварийная остановка; удалить вручную для повторного подключения'}
       discovered: {name: 'dispatcher:discovered', color: 'D4C5F9', description: 'Ожидает подтверждения'}
       approve: {name: 'dispatcher:approve', color: '0E8A16', description: 'Подтвердить выполнение'}
       reject: {name: 'dispatcher:reject', color: 'B60205', description: 'Отклонить выполнение'}

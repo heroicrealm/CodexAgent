@@ -357,3 +357,73 @@ def upgrade608(db):
         WHEN OLD.state='review_on_error' AND NEW.state!=OLD.state
         BEGIN SELECT RAISE(ABORT,'Terminal review_on_error'); END""")
     db.execute('INSERT OR IGNORE INTO schema_migrations VALUES(608)')
+
+
+def upgrade609(db):
+    """Stop intent and diagnostic outbox; repair old claim/cleanup predicates."""
+    db.execute('''CREATE TABLE IF NOT EXISTS stop_requests(
+        request_id INTEGER PRIMARY KEY, issue_id INTEGER NOT NULL REFERENCES tasks(issue_id),
+        iteration_id INTEGER, version INTEGER NOT NULL, attempt_id TEXT REFERENCES attempts(attempt_id),
+        reason TEXT NOT NULL, previous_state TEXT NOT NULL, stage TEXT NOT NULL,
+        requested_at TEXT NOT NULL, finalized_at TEXT, active INTEGER NOT NULL DEFAULT 1,
+        process_status TEXT NOT NULL DEFAULT 'pending', method TEXT NOT NULL DEFAULT 'not_required',
+        error TEXT, evidence TEXT NOT NULL, next_signal_at TEXT)''')
+    if 'next_signal_at' not in {r[1] for r in db.execute('PRAGMA table_info(stop_requests)')}:
+        db.execute('ALTER TABLE stop_requests ADD COLUMN next_signal_at TEXT')
+    db.execute('''CREATE TABLE IF NOT EXISTS control_observations(
+        issue_id INTEGER PRIMARY KEY REFERENCES tasks(issue_id), server_at TEXT NOT NULL)''')
+    db.execute('CREATE UNIQUE INDEX IF NOT EXISTS stop_active ON stop_requests(issue_id) WHERE active=1')
+    db.execute('''CREATE TABLE IF NOT EXISTS stop_outbox(
+        request_id INTEGER PRIMARY KEY REFERENCES stop_requests(request_id), body TEXT NOT NULL,
+        delivered INTEGER NOT NULL DEFAULT 0, comment_id TEXT, error TEXT)''')
+    db.execute('''CREATE TABLE IF NOT EXISTS attempt_publications(
+        attempt_id TEXT PRIMARY KEY REFERENCES attempts(attempt_id), pr_id INTEGER,
+        pr_number INTEGER NOT NULL, observed_at TEXT NOT NULL)''')
+    db.execute('''CREATE TABLE IF NOT EXISTS attempt_processes(
+        process_id INTEGER PRIMARY KEY, attempt_id TEXT NOT NULL REFERENCES attempts(attempt_id),
+        pid INTEGER NOT NULL, process_identity TEXT NOT NULL, started_at TEXT NOT NULL,
+        finished_at TEXT, exit_code INTEGER)''')
+    # Rebuild definitions whose partial predicates change. Caller owns writer lock.
+    db.execute('DROP INDEX IF EXISTS task_work_branch')
+    db.execute("""CREATE UNIQUE INDEX task_work_branch ON tasks(repository,work_branch)
+        WHERE work_branch IS NOT NULL AND state NOT IN ('done','cancelled','revoked','detached')""")
+    for name in ('task_branch_claim_insert','task_branch_claim_update',
+                 'attempt_branch_claim_insert','attempt_branch_claim_update','task_branch_reactivate'):
+        sql = db.execute("SELECT sql FROM sqlite_master WHERE name=?", (name,)).fetchone()
+        if sql:
+            db.execute('DROP TRIGGER ' + name)
+            db.execute(sql[0].replace("'done','cancelled','revoked'", "'done','cancelled','revoked','detached'"))
+    for operation in ('insert', 'update'):
+        name = 'cleanup_enqueue_' + operation
+        sql = db.execute('SELECT sql FROM sqlite_master WHERE name=?', (name,)).fetchone()[0]
+        db.execute('DROP TRIGGER ' + name)
+        db.execute(sql.replace("'done','cancelled'", "'done','cancelled','detached'"))
+    # review_on_error remains terminal except for a journaled stop request.
+    db.execute('DROP TRIGGER IF EXISTS terminal_state_guard')
+    db.execute("""CREATE TRIGGER terminal_state_guard BEFORE UPDATE OF state ON tasks
+        WHEN OLD.state='review_on_error' AND NEW.state!=OLD.state AND NOT
+        (NEW.state='detached' AND EXISTS(SELECT 1 FROM stop_requests s
+          WHERE s.issue_id=OLD.issue_id AND s.active=1))
+        BEGIN SELECT RAISE(ABORT,'Terminal review_on_error'); END""")
+    validate(db)
+    db.execute('INSERT OR IGNORE INTO schema_migrations VALUES(609)')
+
+
+def upgrade610(db):
+    """Durable per-attempt diagnostic timeout delivery; no execution transition."""
+    db.execute('''CREATE TABLE IF NOT EXISTS timeout_outbox(
+        attempt_id TEXT PRIMARY KEY REFERENCES attempts(attempt_id),
+        elapsed_seconds REAL NOT NULL, limit_seconds REAL NOT NULL,
+        body TEXT NOT NULL, delivered INTEGER NOT NULL DEFAULT 0,
+        comment_id TEXT, error TEXT)''')
+    if 'codex_started_at' not in {r[1] for r in db.execute('PRAGMA table_info(attempts)')}:
+        db.execute('ALTER TABLE attempts ADD COLUMN codex_started_at TEXT')
+    db.execute('INSERT OR IGNORE INTO schema_migrations VALUES(610)')
+
+
+def upgrade611(db):
+    """Write-ahead ref ownership and archive intent survive cleanup and restart."""
+    db.execute('''CREATE TABLE IF NOT EXISTS detach_refs(
+        attempt_id TEXT PRIMARY KEY REFERENCES attempts(attempt_id),
+        branch TEXT NOT NULL, sha TEXT, archive TEXT UNIQUE NOT NULL)''')
+    db.execute('INSERT OR IGNORE INTO schema_migrations VALUES(611)')

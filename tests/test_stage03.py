@@ -314,7 +314,8 @@ def test_doctor_read_only(setup):
     with patch('dispatcher.doctor.Adapter', return_value=adapter):
         checks = diagnose(config, which=lambda _: '/stub',
                           run=Mock(return_value=subprocess.CompletedProcess([], 0, stdout='')), environ={})
-    assert not any(level == 'FAIL' for level, _ in checks)
+    assert not any(level == 'FAIL' and 'Descendant containment:' not in message for level, message in checks)
+    assert any(level == 'WARN' and 'Descendant containment:' in message for level, message in checks)
     adapter.write.assert_not_called()
     assert config.source.read_bytes() == before
     assert not config.workspace.exists() and not config.logs.exists()

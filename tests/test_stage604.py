@@ -149,7 +149,7 @@ def test_invalid_evidence_preserves_review(monitored, mutation):
 def test_closed_issue_still_observes_merge(monitored):
     merged(monitored)
     store = monitored[0]
-    store.apply(PROJECT, [item(eligible=False, state='closed')])
+    store.apply(PROJECT, [item(eligible=False, state='closed', server_observed_at='2026-10-24T00:25:00Z')])
     assert store.get(PROJECT.repository, 1)['available'] == 0
     assert poll(monitored) == []
     assert store.get(PROJECT.repository, 1)['state'] == 'done'
@@ -178,7 +178,7 @@ def test_legacy_distinct_pr_history_remains_readable(monitored):
 def test_edit_rejected_requires_fresh_explicit_confirmation(monitored):
     assert poll(monitored) == []
     store = monitored[0]
-    store.apply(PROJECT, [item(body='New requirements')])
+    store.apply(PROJECT, [item(body='New requirements', server_observed_at='2026-10-24T00:25:00Z')])
     assert store.get(PROJECT.repository, 1)['state'] == 'rejected'
     assert store.decide(PROJECT.repository, 1, 1, 'approve', expected_state='rejected') == 'conflict'
     assert store.decide(PROJECT.repository, 1, 2, 'approve', expected_state='rejected') == 'applied'

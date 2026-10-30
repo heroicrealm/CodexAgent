@@ -7,6 +7,8 @@ import signal
 import subprocess
 import sys
 import time
+from threading import RLock
+from functools import wraps
 
 from dispatcher.logging import event
 
@@ -20,6 +22,26 @@ def identity(pid):
         return fields[19]
     except (OSError, IndexError):
         return None
+
+
+def group_members(pgid):
+    result = []
+    for stat in Path('/proc').glob('[0-9]*/stat'):
+        try:
+            fields = stat.read_text().rsplit(')', 1)[1].split()
+            if int(fields[2]) == pgid and fields[0] != 'Z':
+                result.append(int(stat.parent.name))
+        except FileNotFoundError:
+            pass
+    return result
+
+
+def serialized(method):
+    @wraps(method)
+    def invoke(self, *args, **kwargs):
+        with self.mutex:
+            return method(self, *args, **kwargs)
+    return invoke
 
 
 def prepare(config):
@@ -63,6 +85,8 @@ def running(root):
 class Lifecycle:
     """Future scheduler contract: stop admission, drain, or cancel process groups."""
     def __init__(self, max_parallel_tasks=1, force_grace_timeout_seconds=5, registry=None):
+        self.mutex = RLock()
+        self.orphans = []
         self.max_parallel_tasks = max_parallel_tasks
         self.force_grace_timeout_seconds = force_grace_timeout_seconds
         self.stopping = False
@@ -71,8 +95,9 @@ class Lifecycle:
         self.services = []
         self.registry = registry
 
+    @serialized
     def save_registry(self):
-        values = []
+        values = list(self.orphans)
         for child in self.children:
             if child.returncode is None:
                 try:
@@ -94,8 +119,8 @@ class Lifecycle:
         finally:
             os.close(descriptor)
 
-    def recover(self):
-        """Only signal old groups with a verified leader start identity.
+    def recover(self, preserve=None):
+        """Preserve old groups for natural drain with verified leader identity.
 
         Unknown surviving groups block daemon startup instead of risking PID reuse.
         This is recovery of non-child processes, not Popen polling/reaping.
@@ -119,29 +144,26 @@ class Lifecycle:
                 return result
             if not members():
                 continue
+            if preserve and preserve(pid):
+                self.orphans.append(value)
+                continue
             try:
                 start = Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()[19]
             except FileNotFoundError:
                 raise RuntimeError('Unverifiable surviving task group; inspect process registry') from None
             if start != value['identity']:
                 raise RuntimeError('Recovery process identity mismatch; inspect process registry')
-            os.killpg(pid, signal.SIGTERM)
-            deadline = time.monotonic() + self.force_grace_timeout_seconds
-            while members() and time.monotonic() < deadline:
-                time.sleep(.02)
-            if members():
-                os.killpg(pid, signal.SIGKILL)
-            deadline = time.monotonic() + 5
-            while members():
-                if time.monotonic() >= deadline:
-                    raise RuntimeError('Recovered process group did not stop')
-                time.sleep(.02)
-        self.registry.unlink()
+            self.orphans.append(value)
+        if self.orphans:
+            self.save_registry()
+        else:
+            self.registry.unlink()
 
     def request_stop(self, force=False):
         self.stopping = True
         self.forced |= force
 
+    @serialized
     def _active(self):
         active = []
         for child in self.children:
@@ -171,35 +193,47 @@ class Lifecycle:
         self.services = [child for child in self.services if child in active]
         return active
 
-    def submit(self, argv, *, service=False, **kwargs):
-        if self.stopping:
+    @serialized
+    def submit(self, argv, *, service=False, before_exec=None, during_drain=False, **kwargs):
+        if self.stopping and not (during_drain and not self.forced):
             raise RuntimeError('Dispatcher is stopping')
         if len([c for c in self._active() if c not in self.services]) >= self.max_parallel_tasks and not service:
             raise RuntimeError('Parallel task limit reached')
         gate_read = gate_write = None
-        if self.registry:
+        if self.registry or before_exec:
             gate_read, gate_write = os.pipe()
             kwargs['pass_fds'] = (*kwargs.get('pass_fds', ()), gate_read)
             argv = [sys.executable, str(Path(__file__).with_name('_child.py')),
                     str(gate_read), str(os.getpid()), *argv]
         try:
             child = subprocess.Popen(argv, start_new_session=True, **kwargs)
+            child.dispatcher_identity = identity(child.pid)
             self.children.append(child)
             if self.registry:
                 self.save_registry()
+            if before_exec:
+                before_exec(child)
+            if gate_write is not None:
                 os.write(gate_write, b'1')
             if service:
                 self.services.append(child)
             return child
-        except OSError:
-            if 'child' in locals():
-                self.cancel_child(child)
+        except (OSError, RuntimeError):
+            # A failed registration never opens the gate. EOF lets the inert
+            # wrapper exit naturally; no task command or signal is needed.
+            if gate_write is not None:
+                os.close(gate_write)
+                gate_write = None
+                while 'child' in locals() and child in self._active():
+                    time.sleep(.01)
             raise
         finally:
             if gate_read is not None:
                 os.close(gate_read)
-                os.close(gate_write)
+                if gate_write is not None:
+                    os.close(gate_write)
 
+    @serialized
     def cancel_child(self, child):
         if child not in self._active():
             return
@@ -212,14 +246,60 @@ class Lifecycle:
         while child in self._active():
             time.sleep(0.02)
 
+    @serialized
+    def prune_orphans(self):
+        surviving = [o for o in self.orphans if group_members(o['pid'])]
+        if len(surviving) != len(self.orphans):
+            self.orphans = surviving
+            if self.registry:
+                self.save_registry()
+
+    @serialized
+    def stop_attempt(self, pid, expected_identity):
+        if not group_members(pid):
+            return 'not_required', True
+        child = next((c for c in self.children if c.pid == pid), None)
+        # An unreaped owned leader pins PGID. Recovery requires start identity,
+        # including a zombie leader; identity() intentionally excludes zombies.
+        try:
+            actual = Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()[19]
+        except FileNotFoundError:
+            return 'not_required', False
+        if not expected_identity or actual != expected_identity:
+            return 'not_required', False
+        method = 'SIGTERM'
+        try:
+            os.killpg(pid, signal.SIGTERM)
+            deadline = time.monotonic() + self.force_grace_timeout_seconds
+            while group_members(pid) and time.monotonic() < deadline:
+                time.sleep(.02)
+            if group_members(pid):
+                method = 'SIGKILL'
+                os.killpg(pid, signal.SIGKILL)
+            deadline = time.monotonic() + self.force_grace_timeout_seconds
+            while group_members(pid) and time.monotonic() < deadline:
+                time.sleep(.02)
+            confirmed = not group_members(pid)
+            if confirmed and child is not None:
+                self._active()
+            return method, confirmed
+        except (ProcessLookupError, PermissionError):
+            return method, not group_members(pid)
+
     def drain(self):
-        while self._active():
+        while self._active() or any(group_members(o['pid']) for o in self.orphans):
             if self.forced:
                 self.cancel()
                 return
             time.sleep(0.05)
 
+    @serialized
     def cancel(self):
+        for orphan in list(self.orphans):
+            _, confirmed = self.stop_attempt(orphan['pid'], orphan['identity'])
+            if not confirmed:
+                raise RuntimeError('Unverifiable surviving task group; artifacts preserved')
+        self.orphans = []
         for child in self._active():
             os.killpg(child.pid, signal.SIGTERM)
         deadline = time.monotonic() + self.force_grace_timeout_seconds
@@ -250,7 +330,24 @@ def serve(config):
     state = root / 'state.json'
     temporary = root / 'state.tmp'
     try:
-        lifecycle.recover()
+        # Detach recovery must not turn a natural drain into a forced stop.
+        from dispatcher.storage import Store
+        recovery_store = Store(root / 'tasks.sqlite3')
+        try:
+            def preserve(pid):
+                return recovery_store.db.execute("""SELECT 1 FROM attempts a JOIN tasks t
+                    ON t.repository=a.repository AND t.number=a.number
+                    JOIN stop_requests s ON s.issue_id=t.issue_id
+                    WHERE a.pid=? AND s.active=1
+                    UNION SELECT 1 FROM attempt_processes p JOIN attempts a USING(attempt_id)
+                    JOIN tasks t ON t.repository=a.repository AND t.number=a.number
+                    JOIN stop_requests s ON s.issue_id=t.issue_id
+                    WHERE p.pid=? AND p.finished_at IS NULL AND s.active=1""", (pid, pid)).fetchone() is not None
+            lifecycle.recover(preserve)
+        finally:
+            recovery_store.close()
+        from dispatcher.process_wait import bind
+        bind(lifecycle)
         state_fd = os.open(temporary, os.O_CREAT | os.O_TRUNC | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
         with os.fdopen(state_fd, 'w') as stream:
             os.fchmod(stream.fileno(), 0o600)
@@ -266,7 +363,10 @@ def serve(config):
         lifecycle.drain()
         event(config.logs / 'dispatcher.jsonl', 'stopped_force' if lifecycle.forced else 'stopped')
     finally:
-        lifecycle.cancel()
+        from dispatcher.process_wait import bind
+        bind(None)
+        if lifecycle.forced:
+            lifecycle.cancel()
         state.unlink(missing_ok=True)
         temporary.unlink(missing_ok=True)
         os.close(fd)

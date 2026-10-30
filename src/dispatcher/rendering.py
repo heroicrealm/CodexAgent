@@ -8,7 +8,7 @@ import unicodedata
 
 STATUS_COLORS = {
     'discovered': '36', 'pending': '33', 'running': '34', 'review': '35',
-    'done': '32', 'failed': '31', 'rejected': '31', 'revoked': '90',
+    'done': '32', 'failed': '31', 'rejected': '31', 'revoked': '90', 'detached': '90',
     'review_on_error': '31', 'cancelled': '90', 'interrupted': '31',
 }
 
@@ -131,6 +131,8 @@ def render_queue(rows, projects, format='table', stream=None):
 
 # Explicit fields avoid dumping internal snapshots, remote credentials or process data.
 DETAIL_FIELDS = {
+    'stop_requests': ('request_id','reason','previous_state','stage','attempt_id','requested_at','finalized_at','active','process_status','method','error'),
+    'stop_outbox': ('request_id','delivered','comment_id','error'),
     'configuration_errors': ('content_hash', 'code', 'created_at', 'delivered', 'comment_id'),
     'terminal_errors': ('reason', 'pr_number', 'pr_id', 'created_at', 'publication', 'diagnostic', 'comment_id', 'delivered'),
     'cleanup_jobs': ('cleanup_id', 'generation', 'state', 'attempts', 'created_at', 'updated_at', 'started_at', 'completed_at', 'next_retry_at', 'last_error'),

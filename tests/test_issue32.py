@@ -268,6 +268,7 @@ def test_scheduler_blocks_agent_on_unsafe_repeat(env, failure):
         if failure == 'claim':
             other = issue(project, id=2, number=2)
             dispatcher.store.apply(project, [issue(project), other])
+            api.fetch.return_value.append(other)  # Authoritative read still includes the claimant.
             # Another Issue's historical attempt already owns the same branch.
             with dispatcher.store.db:
                 dispatcher.store.db.execute("INSERT INTO attempts(attempt_id,repository,number,version,branch,state,started_at) VALUES('foreign','owner/repo',2,1,?,'failed','now')", (first['branch'],))

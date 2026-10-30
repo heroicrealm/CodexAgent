@@ -98,6 +98,8 @@ def transition(store, *, repository, number, expected_state, version, iteration_
             return Outcome.CONFLICT
         if row['version'] != version or row['current_iteration_id'] != iteration_id:
             return Outcome.STALE_VERSION
+        if store.stop_requested(row):
+            return Outcome.CONFLICT
         edges = {('discovered', 'pending'), ('discovered', 'rejected'), ('pending', 'running'),
                  ('running', 'review'), ('review', 'done'), ('review', 'rejected'),
                  ('rejected', 'pending'), ('rejected', 'cancelled')}

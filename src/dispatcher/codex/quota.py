@@ -79,6 +79,7 @@ class CodexQuotaProvider:
                 except queue.Full:
                     break
         finally:
+            stream.close()
             try:
                 messages.put(None, timeout=1)
             except queue.Full:
@@ -158,9 +159,12 @@ class CodexQuotaProvider:
 
     def close(self):
         if self.child:
-            self.lifecycle.cancel_child(self.child)
             self.child.stdin.close()
             if self.reader:
                 self.reader.join(timeout=2)
-            self.child.stdout.close()
+            # A stubborn server may ignore stdin EOF. Let Lifecycle drain it
+            # naturally (or an explicit force stop cancel it); closing a buffered
+            # stream while reader holds its lock could block the force loop.
+            if not self.reader or not self.reader.is_alive():
+                self.child.stdout.close()
             self.child = None

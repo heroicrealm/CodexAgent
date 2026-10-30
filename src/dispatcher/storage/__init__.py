@@ -23,7 +23,7 @@ def content_hash(issue):
 
 class Store:
     def __init__(self, path):
-        from .migrations import prepare, initialize, upgrade604, upgrade605, upgrade606, upgrade607, upgrade608, VERSION
+        from .migrations import prepare, initialize, upgrade604, upgrade605, upgrade606, upgrade607, upgrade608, upgrade609, upgrade610, upgrade611, VERSION
         prepare(path)
         self.db = sqlite3.connect(path, timeout=30)
         os.chmod(path, 0o600)
@@ -41,6 +41,9 @@ class Store:
                 upgrade606(self.db)
                 upgrade607(self.db)
                 upgrade608(self.db)
+                upgrade609(self.db)
+                upgrade610(self.db)
+                upgrade611(self.db)
         except Exception:
             self.db.close()
             raise
@@ -93,6 +96,7 @@ class Store:
                     'SELECT 1 FROM decisions WHERE repository=? AND event_id=?', (repository, str(event_id))).fetchone():
                 return 'duplicate'
             row = self.get(repository, number)
+            valid = valid and not self.stop_requested(row)
             valid = valid and not (action == 'approve' and self.configuration_blocked(row))
             valid = valid and (expected_state is None or (row is not None and row['state'] == expected_state))
             valid = valid and (expected_synced_at is None or (row is not None and row['synced_at'] == expected_synced_at))
@@ -125,7 +129,11 @@ class Store:
 
     def configuration_blocked(self, row):
         from dispatcher.preparation_error import blocked
-        return blocked(self, row)
+        return self.stop_requested(row) or blocked(self, row)
+
+    def stop_requested(self, row):
+        return bool(row is not None and self.db.execute(
+            'SELECT 1 FROM stop_requests WHERE issue_id=? AND active=1', (row['issue_id'],)).fetchone())
 
     def reset_confirmation(self, repository, number, expected_version):
         """Compare-and-reset operation for stage 3; never changes active attempts."""
@@ -207,6 +215,36 @@ class Store:
                 seen.add(number)
                 row = self.get(repository, number)
                 persisted = {key: value for key, value in issue.items() if key != 'server_observed_at'}
+                names = {n.casefold() for n in issue.get('labels', [])}
+                emergency = project.label('emergency_stop').name.casefold() in names
+                if row and row['issue_id'] != issue['id']:
+                    raise sqlite3.IntegrityError('GitHub issue identity conflict')
+                if row:
+                    from dispatcher.detachment import accept_observation
+                    if not accept_observation(self, row, issue.get('server_observed_at')):
+                        counts['unchanged'] += 1
+                        continue
+                if row and 'labels' in issue and project.task_label.casefold() not in names and not emergency:
+                    from dispatcher.detachment import request_in_transaction
+                    request_in_transaction(self, row, 'ready_removed', {'observation': persisted, 'observed_at': issue.get('server_observed_at')})
+                    row = self.get(repository, number)
+                if row and row['state'] == 'detached' and issue['eligible'] and not emergency:
+                    stop = self.db.execute('SELECT * FROM stop_requests WHERE issue_id=? AND active=1', (row['issue_id'],)).fetchone()
+                    from dispatcher.detachment import newer_observation
+                    if stop and stop['finalized_at'] and newer_observation(stop, issue) and not self.db.execute(
+                            "SELECT 1 FROM cleanup_jobs WHERE issue_id=? AND state!='completed'", (row['issue_id'],)).fetchone():
+                        self._record_transition(row, 'discovered', 'reattach:' + str(stop['request_id']), 'ready_observer', {'observed_at':issue.get('server_observed_at')})
+                        self._history(repository, number, row['version'], 'reattached', json.dumps(persisted), stamp)
+                        self.db.execute('UPDATE stop_requests SET active=0 WHERE request_id=?', (stop['request_id'],))
+                        self.db.execute("UPDATE tasks SET state='discovered',available=1,approved_version=NULL,current_iteration_id=NULL WHERE issue_id=?", (row['issue_id'],))
+                        row = self.get(repository, number)
+                if row and (self.stop_requested(row) or emergency):
+                    self.db.execute('UPDATE tasks SET available=0,observed=?,synced_at=? WHERE issue_id=?',
+                                    (json.dumps(persisted), stamp, row['issue_id']))
+                    counts['unchanged'] += 1
+                    continue
+                if emergency:
+                    issue = dict(issue, eligible=False)
                 if not issue['eligible']:
                     if issue['author'].casefold() not in {a.casefold() for a in project.allowed_authors}:
                         counts['skipped_untrusted'] += 1
@@ -296,7 +334,7 @@ class Store:
 
     def _set_state(self, row, target, approved_version, *, current_iteration=None):
         """Shared CAS primitive; caller verifies authority/evidence and journals atomically."""
-        if row is None or row['state'] in ('done', 'cancelled', 'review_on_error'):
+        if row is None or self.stop_requested(row) or row['state'] in ('done', 'cancelled', 'review_on_error'):
             return False
         expected_iteration = row['current_iteration_id'] if current_iteration is None else current_iteration
         cursor = self.db.execute("""UPDATE tasks SET state=?,approved_version=?

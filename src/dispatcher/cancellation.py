@@ -17,6 +17,8 @@ class CancellationDelivery:
             AND c.issue_closed=0''', (project.repository.casefold(),)).fetchall()
         errors = []
         for row in rows:
+            if self.store.stop_requested(row):
+                continue
             database = Path(db.execute('PRAGMA database_list').fetchone()[2])
             with (database.parent / f'cancel-{row["issue_id"]}.lock').open('a') as lock:
                 try:
@@ -32,6 +34,8 @@ class CancellationDelivery:
                         if issue['id'] != row['issue_id']:
                             raise GitHubError()
                         if issue['state'] != 'closed' or issue.get('state_reason') != 'not_planned':
+                            if self.store.stop_requested(self.store.get(project.repository, row['number'])):
+                                continue
                             self.adapter.write(endpoint, 'PATCH', dict(state='closed', state_reason='not_planned'))
                             issue = self.adapter.request(endpoint)
                         if (issue['id'] != row['issue_id'] or issue['state'] != 'closed'
