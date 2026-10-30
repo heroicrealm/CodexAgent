@@ -419,3 +419,11 @@ def upgrade610(db):
     if 'codex_started_at' not in {r[1] for r in db.execute('PRAGMA table_info(attempts)')}:
         db.execute('ALTER TABLE attempts ADD COLUMN codex_started_at TEXT')
     db.execute('INSERT OR IGNORE INTO schema_migrations VALUES(610)')
+
+
+def upgrade611(db):
+    """Write-ahead ref ownership and archive intent survive cleanup and restart."""
+    db.execute('''CREATE TABLE IF NOT EXISTS detach_refs(
+        attempt_id TEXT PRIMARY KEY REFERENCES attempts(attempt_id),
+        branch TEXT NOT NULL, sha TEXT, archive TEXT UNIQUE NOT NULL)''')
+    db.execute('INSERT OR IGNORE INTO schema_migrations VALUES(611)')

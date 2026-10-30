@@ -362,7 +362,10 @@ def test_stale_snapshot_cannot_reattach_and_dirty_unknown_artifact_preserved(env
         d.admit()
         assert not d.active
         assert d.store.db.execute('SELECT count(*) FROM attempts').fetchone()[0]==2
-        assert d.store.db.execute('SELECT code FROM configuration_errors').fetchone()[0]=='branch_ownership_conflict'
+        latest = d.store.db.execute('SELECT * FROM attempts ORDER BY rowid DESC LIMIT 1').fetchone()
+        assert latest['error_code'] == 'detach_remote_branch_conflict'
+        assert not latest['codex_started']
+        assert git(env[4], 'rev-parse', latest['branch']) == git(d.git.paths(project, 1)[0], 'rev-parse', latest['branch'])
     finally:
         d.lifecycle.cancel()
         d.close()

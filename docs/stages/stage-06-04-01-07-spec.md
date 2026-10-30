@@ -72,3 +72,31 @@
 8. README/implementation/variant-b report обновить с явной ссылкой на изменение решения и новой матрицей ручной приёмки.
 
 Приоритет: **безопасность данных и отсутствие ложных гарантий**, затем переносимость. Запрещено заменять невозможность доказать безопасность очистки безусловным force-remove.
+
+## Повторное утверждение после завершённого Detach (#41/#42)
+
+После natural drain, подтверждённого завершения stop request и cleanup новая
+утверждённая iteration начинает работу от свежего `origin/<base_branch>` после
+fetch. Она не наследует результаты отменённой попытки. Классификация основана на
+неактивном durable stop request предыдущего attempt; rejected PR сохраняет
+существующий repeat_branch и продолжает историю актуальной remote ветки.
+
+Локальная ветка отменённой попытки переименовывается без force в
+`archive/detach/<attempt_id>`. Миграция 611 добавляет `detach_refs`: cleanup
+записывает точный SHA после проверки ownership и до удаления worktree. Журнал
+сохраняется вместе с архивом; повторный prepare после rename проверяет тот же
+SHA и не создаёт дубликат. Отсутствующий ref не требует искусственного архива.
+Для cleanup, завершённого старой версией, допустим bootstrap только при совпадении
+clone origin, task/project/branch/iteration/attempt, подтверждённом cleanup,
+сохранённом reflog создания от initial_sha и непрерывной истории commit entries.
+Неоднозначность, отсутствующий reflog или изменённый ref означают отказ.
+
+До архивирования проверяются актуальная base, отсутствие активных worktrees,
+незавершённых зарегистрированных процессов, чужих branch claims и опубликованных
+результатов. Любая существующая remote рабочая ветка означает
+`detach_remote_branch_conflict`; dispatcher не удаляет её и не выполняет force push.
+Прочие отказы: `detach_identity_conflict`, `detach_cleanup_incomplete`,
+`detach_active_worktree`, `detach_branch_ownership_conflict`,
+`detach_archive_conflict`, `detach_published_result_conflict`.
+Git-диагностика содержит операцию, return code и классификацию stderr;
+произвольные stderr, argv, URL и credentials в журнал не записываются.

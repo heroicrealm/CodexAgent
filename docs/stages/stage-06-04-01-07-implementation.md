@@ -111,3 +111,51 @@ lock в основном потоке и не блокирует админис�
 Незакрытых обязательных автоматических проверок нет. Live GitHub приёмка и
 stronger containment не выполнялись; residual risk escaped descendants и порядок
 ручного разрешения неопределённости описаны выше.
+
+## Исправление повторного запуска после Detach (#41/#42), 2026-10-31
+
+Первопричина воспроизведена на временном реальном Git repository после
+running → ready removed → natural exit → detached → cleanup → approved.
+Старый `worktree add -b codex/issue-1` завершается ненулевым кодом и stderr
+`fatal: a branch named 'codex/issue-1' already exists`. Worktree удалён, но
+локальная ветка остаётся; прежний prepare не отличал этот случай от первой попытки.
+
+Scheduler передаёт идентификатор detached attempt отдельно от repeat_branch.
+Cleanup записывает проверенный ref в SQLite `detach_refs` (миграция 611).
+Prepare проверяет stop/iteration/attempt/project/repository и завершённый cleanup,
+origin, процессы, Git metadata, remote conflicts и точный SHA. Затем сохраняет
+старую ветку в `archive/detach/<attempt_id>` и создаёт рабочую ветку от свежей base.
+Архивы переживают cleanup и restart. Уже выполненный rename распознаётся по
+сохранённому SHA; сторонние refs и конфликтующие архивы не изменяются.
+Подробная политика legacy bootstrap и коды отказа приведены в ТЗ.
+
+Автотесты `tests/test_detach_repeat.py` используют real local Git и stub Codex/GitHub:
+ошибка Git, committed/dirty output, свежая base, полный запуск и публикация,
+custom base/branch, повторный Detach, чужой ref, архив, remote conflict,
+неполный cleanup, неверная identity, изоляция проектов, активный worktree,
+отсутствующая base/ref, legacy cleanup и crash/reopen SQLite после rename.
+Существующий тест rejected PR проверяет продолжение remote истории и того же PR.
+
+Ручная проверка на Playground после обновления:
+1. Запустить approved issue и снять codex-ready во время исполнения. Дождаться
+   естественного exit, detached и completed cleanup; проверить отсутствие worktree.
+2. Записать SHA старой локальной ветки и attempt_id. Обновить базовую ветку remote,
+   вернуть codex-ready, дождаться discovered и явно утвердить новую iteration.
+3. Проверить initial_sha новой попытки против свежего origin/base, отсутствие
+   отменённых файлов, архив с прежним SHA. Дождаться публикации обычного PR.
+4. На отдельной неопубликованной попытке повторить Detach и утверждение;
+   убедиться в появлении второго архива и независимости других проектов.
+5. При существующей remote рабочей ветке проверить ранний
+   detach_remote_branch_conflict и неизменность local/remote refs.
+
+В этой сессии live Playground/GitHub/Codex не запускались; сетевой жизненный цикл
+проверен существующим mock adapter и реальными локальными push в bare remote.
+Ограничения обнаружения процессов исходного natural-drain контракта сохраняются.
+
+Результаты проверок: финальный `scripts/test.sh` с Python из временного venv —
+**675 passed, 30 subtests passed, 118.45 s**, последующий compileall завершён
+успешно; `git diff --check` — без ошибок. В системном Python отсутствовал pytest,
+поэтому зависимости `.[test]` установлены в `/tmp/codexagent-detach-venv`.
+Промежуточные прогоны во время исправлений включали неактуальные ожидания старого
+кода/миграции и сбои ожидания worker/cleanup/publication при параллельном запуске
+проверок. Финальный прогон после завершения остальных проверок прошёл целиком.

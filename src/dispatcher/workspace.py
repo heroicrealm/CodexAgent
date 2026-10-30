@@ -134,6 +134,16 @@ class GitWorkspaceManager:
         except (OSError, subprocess.TimeoutExpired):
             raise TaskError('git_unavailable', 'GIT') from None
         if check and result.returncode:
+            from dispatcher.logging import event
+            # Classify stderr; never persist arbitrary Git output, URLs or argv.
+            reason = 'branch_already_exists' if 'already exists' in result.stderr and args[:2] == ('worktree', 'add') else 'git_command_failed'
+            self.config.logs.mkdir(parents=True, exist_ok=True)
+            operations = {'worktree', 'branch', 'fetch', 'push', 'rev-parse', 'show-ref',
+                          'status', 'symbolic-ref', 'merge-base', 'reflog', 'remote',
+                          'commit', 'checkout', 'add', 'diff', 'ls-remote', 'cat-file'}
+            operation = next((arg for arg in args if arg in operations), 'git')
+            event(self.config.logs / 'dispatcher.jsonl', 'git_failed', level='WARN',
+                  action=operation, reason=reason, result=result.returncode)
             raise TaskError('git_operation_failed', 'GIT')
         return result
 
@@ -244,6 +254,10 @@ class GitWorkspaceManager:
             self.git(repo, 'worktree', 'add', '-b', branch, str(worktree), sha)
             worktree.chmod(0o700)
             return worktree, sha
+        if issue.get('detach_attempt'):
+            if self.git(repo, 'rev-parse', '--verify', f'refs/remotes/origin/{project.base_branch}^{{commit}}', check=False).returncode:
+                raise TaskError('base_branch_missing', 'GIT')
+            self.detach_branch(project, issue, branch, exists)
         if exists and not issue.get('retry_sha'):
             raise TaskError('branch_ownership_conflict', 'GIT')
         if self.git(repo, 'show-ref', '--verify', f'refs/remotes/origin/{project.base_branch}', check=False).returncode:
@@ -255,6 +269,78 @@ class GitWorkspaceManager:
         self.git(repo, 'worktree', 'add', '-b', branch, str(worktree), base)
         worktree.chmod(0o700)
         return worktree, self.git(worktree, 'rev-parse', 'HEAD').stdout.strip()
+
+    def detach_branch(self, project, issue, branch, remote_exists):
+        """Archive only a proven, fully cleaned generation; never reuse its HEAD."""
+        from dispatcher.detachment import live_processes
+        if not self.execution:
+            raise TaskError('detach_identity_conflict', 'GIT')
+        db = self.execution.db
+        previous = self.execution.get(issue['detach_attempt'])
+        row = self.execution.store.get(project.repository, issue['number'])
+        stop = db.execute('SELECT * FROM stop_requests WHERE attempt_id=? ORDER BY request_id DESC LIMIT 1',
+                          (issue['detach_attempt'],)).fetchone()
+        repo, task, worktree = self.paths(project, issue['number'])
+        if (not previous or not row or row['project_id'] != project.id or
+                previous['repository'] != project.repository.casefold() or previous['number'] != issue['number'] or
+                previous['branch'] != branch or row['work_branch'] != branch or not previous['initial_sha'] or
+                previous['worktree'] != str(worktree) or previous['state'] == 'running' or
+                previous['iteration_id'] == row['current_iteration_id'] or not stop or stop['active'] or
+                stop['issue_id'] != row['issue_id'] or stop['iteration_id'] != previous['iteration_id'] or
+                not stop['finalized_at'] or stop['process_status'] != 'confirmed'):
+            raise TaskError('detach_identity_conflict', 'GIT')
+        cleanup = db.execute("""SELECT 1 FROM cleanup_jobs WHERE issue_id=? AND attempt_id=?
+            AND generation=? AND version=? AND state='completed'""",
+            (row['issue_id'], previous['attempt_id'], stop['iteration_id'], stop['version'])).fetchone()
+        if (not cleanup or live_processes(self.execution.store, previous) or
+                db.execute('SELECT 1 FROM attempt_processes WHERE attempt_id=? AND finished_at IS NULL',
+                           (previous['attempt_id'],)).fetchone() or worktree.exists()):
+            raise TaskError('detach_cleanup_incomplete', 'GIT')
+        if (not previous['origin_url'] or self.git(repo, 'remote', 'get-url', 'origin').stdout.strip() != previous['origin_url'] or
+                Path(self.git(repo, 'rev-parse', '--path-format=absolute', '--git-common-dir').stdout.strip()) != repo / '.git'):
+            raise TaskError('detach_identity_conflict', 'GIT')
+        if db.execute('SELECT 1 FROM attempts WHERE repository=? AND branch=? AND number!=?',
+                      (previous['repository'], branch, issue['number'])).fetchone():
+            raise TaskError('detach_branch_ownership_conflict', 'GIT')
+        for entry in self.git(repo, 'worktree', 'list', '--porcelain').stdout.split('\n\n'):
+            if 'branch refs/heads/' + branch in entry.splitlines() or 'worktree ' + str(worktree) in entry.splitlines():
+                raise TaskError('detach_active_worktree', 'GIT')
+        if remote_exists:
+            raise TaskError('detach_remote_branch_conflict', 'GIT')
+        if db.execute('SELECT 1 FROM task_pull_requests WHERE issue_id=?', (row['issue_id'],)).fetchone() or previous['pushed']:
+            raise TaskError('detach_published_result_conflict', 'GIT')
+        ref = 'refs/heads/' + branch
+        local = self.git(repo, 'rev-parse', '--verify', ref, check=False)
+        sha = local.stdout.strip() if local.returncode == 0 else None
+        intent = db.execute('SELECT * FROM detach_refs WHERE attempt_id=?', (previous['attempt_id'],)).fetchone()
+        if intent is None:
+            # Compatibility with already completed cleanup from older versions.
+            # The recorded initial commit and clone identity must prove lineage.
+            if sha:
+                history = self.git(repo, 'reflog', 'show', '--format=%H%x00%gs', ref).stdout.splitlines()
+                created = previous['initial_sha'] + '\0branch: Created from refs/remotes/origin/' + project.base_branch
+                if (not history or history[-1] != created or
+                        any('\0commit' not in entry for entry in history[:-1]) or
+                        self.git(repo, 'merge-base', '--is-ancestor', previous['initial_sha'], sha, check=False).returncode):
+                    raise TaskError('detach_branch_ownership_conflict', 'GIT')
+            archive = 'archive/detach/' + previous['attempt_id']
+            if self.git(repo, 'show-ref', '--verify', 'refs/heads/' + archive, check=False).returncode == 0:
+                raise TaskError('detach_archive_conflict', 'GIT')
+            with db:
+                db.execute('INSERT INTO detach_refs VALUES(?,?,?,?)', (previous['attempt_id'], branch, sha, archive))
+            intent = db.execute('SELECT * FROM detach_refs WHERE attempt_id=?', (previous['attempt_id'],)).fetchone()
+        if intent['branch'] != branch:
+            raise TaskError('detach_identity_conflict', 'GIT')
+        archived = self.git(repo, 'rev-parse', '--verify', 'refs/heads/' + intent['archive'], check=False)
+        archived_sha = archived.stdout.strip() if archived.returncode == 0 else None
+        if archived_sha:
+            if archived_sha != intent['sha'] or sha is not None:
+                raise TaskError('detach_archive_conflict', 'GIT')
+            return  # Rename committed before a crash; do not archive twice.
+        if sha != intent['sha']:
+            raise TaskError('detach_branch_ownership_conflict', 'GIT')
+        if sha:
+            self.git(repo, 'branch', '-m', branch, intent['archive'])
 
     def retry_source(self, project, number, sha):
         import re

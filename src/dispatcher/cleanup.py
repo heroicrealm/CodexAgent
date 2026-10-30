@@ -102,7 +102,21 @@ class CleanupService:
         return result
 
     def cleanup(self, project, row):
-        TaskWorkspaceCleanup(self.manager).cleanup(project, self.owned_row(project, row))
+        owned = self.owned_row(project, row)
+        if row['state'] == 'detached':
+            attempt = self.store.db.execute(
+                'SELECT * FROM attempts WHERE repository=? AND number=? ORDER BY rowid DESC LIMIT 1',
+                (row['repository'], row['number'])).fetchone()
+            repo, _, worktree = self.manager.paths(project, row['number'])
+            # A missing worktree cannot attest to the current local branch tip.
+            # Leave legacy/ref-only verification to preparation in that case.
+            if attempt and attempt['initial_sha'] and worktree.exists():
+                ref = self.manager.git(repo, 'rev-parse', '--verify', 'refs/heads/' + attempt['branch'], check=False)
+                sha = ref.stdout.strip() if ref.returncode == 0 else None
+                with self.store.db:
+                    self.store.db.execute('INSERT OR IGNORE INTO detach_refs VALUES(?,?,?,?)',
+                        (attempt['attempt_id'], attempt['branch'], sha, 'archive/detach/' + attempt['attempt_id']))
+        TaskWorkspaceCleanup(self.manager).cleanup(project, owned)
 
     def tick(self, project_id=None, stop=None):
         self.reconcile()

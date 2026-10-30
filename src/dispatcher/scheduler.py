@@ -131,6 +131,7 @@ class Dispatcher:
                         'SELECT * FROM attempts WHERE repository=? AND number=? AND (codex_started=1 OR initial_sha IS NOT NULL) ORDER BY rowid DESC LIMIT 1',
                         (current['repository'], current['number'])).fetchone()
                     if previous and self.store.db.execute("SELECT 1 FROM stop_requests WHERE attempt_id=? AND active=0", (previous['attempt_id'],)).fetchone():
+                        issue['detach_attempt'] = previous['attempt_id']
                         previous = None
                     if previous:
                         source = self.store.db.execute("""SELECT DISTINCT p.* FROM task_pull_requests p
