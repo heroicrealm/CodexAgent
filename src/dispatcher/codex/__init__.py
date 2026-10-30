@@ -1,6 +1,7 @@
 """Noninteractive executor. Lifecycle alone owns child polling and reaping."""
 import json
 import subprocess
+from dispatcher.process_wait import run as natural_run
 import time
 from dispatcher.workspace import TaskError, private_file, register_artifacts
 
@@ -14,8 +15,8 @@ class CodexExecutor:
         if self.checked:
             return
         try:
-            version = subprocess.run([self.config.executable, '--version'], capture_output=True, text=True, timeout=15)
-            help_ = subprocess.run([self.config.executable, 'exec', '--help'], capture_output=True, text=True, timeout=15)
+            version = natural_run([self.config.executable, '--version'], capture_output=True, text=True, timeout=15)
+            help_ = natural_run([self.config.executable, 'exec', '--help'], capture_output=True, text=True, timeout=15)
             if version.returncode or help_.returncode or '--dangerously-bypass-approvals-and-sandbox' not in help_.stdout:
                 raise ValueError
         except (OSError, ValueError, subprocess.TimeoutExpired):
@@ -23,8 +24,6 @@ class CodexExecutor:
         self.checked = True
 
     def start(self, issue, branch, paths, worktree, task, attempt, before_exec=None):
-        from dispatcher import containment
-        containment.require_control()
         self.check()
         prompt = ('Implement this approved GitHub Issue. Work on branch ' + branch + '.\n'
                   'Run available tests and create a Git commit. Do not push, change GitHub Issues, create PRs or merge.\n'
@@ -42,7 +41,8 @@ class CodexExecutor:
             child = self.lifecycle.submit([self.config.executable, 'exec',
                 '--dangerously-bypass-approvals-and-sandbox', '--json', '-'],
                 cwd=worktree, stdin=stdin, stdout=stdout, stderr=subprocess.STDOUT, before_exec=before_exec)
-        return dict(child=child, deadline=time.monotonic() + self.config.timeout_seconds, output=output)
+        started = time.monotonic()
+        return dict(child=child, execution_started=started, deadline=started + self.config.timeout_seconds, output=output)
 
     @staticmethod
     def quota_exhausted(path):

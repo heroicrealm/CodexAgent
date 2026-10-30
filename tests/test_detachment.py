@@ -1,4 +1,4 @@
-"""Legacy 6.4.1.7 regression with a mocked boundary; not variant B kernel acceptance."""
+"""6.4.1.7 natural-drain, fencing, ownership and restart acceptance."""
 import json
 from dataclasses import replace
 from pathlib import Path
@@ -114,6 +114,7 @@ def test_running_detach_natural_exit_no_publication_dirty_cleanup(env):
 def test_emergency_only_target_group_and_labels(env, with_ready):
     config, project, control, *_ = env
     config = replace(config, max_parallel_tasks=2)
+    Path(config.executable).write_text(Path(config.executable).read_text().replace('time.sleep(60)', 'time.sleep(.7)'))
     control.write_text(json.dumps({'exec':'sleep'}))
     items = [issue(project), issue(project, id=2, number=2)]
     api = adapter(items)
@@ -127,9 +128,14 @@ def test_emergency_only_target_group_and_labels(env, with_ready):
         other = d.active[second]['child']
         items[0]['labels'] = [project.label('emergency_stop').name, 'bug', 'dispatcher:custom'] + ([project.task_label] if with_ready else [])
         d.stops.observe(project, d.store.get(project.repository, 1))
-        d.collect(); d.collect()
+        d.collect()
+        assert group_members(d.active[first]['child'].pid)
+        deadline = time.monotonic() + 5
+        while first in d.active and time.monotonic() < deadline:
+            d.collect()
+            time.sleep(.01)
         assert d.store.get(project.repository, 1)['state'] == 'detached'
-        assert group_members(other.pid)
+        assert other.returncode is None or other.returncode == 0
         assert not lifecycle.stopping
         # Reconcile exact configured names, preserving the emergency and user labels.
         labels = items[0]['labels'] + [project.label('running').name, project.label('approve').name]
@@ -246,7 +252,8 @@ def test_restart_drain_preserves_group_and_never_restarts_codex(env):
         while group_members(child.pid) and time.monotonic()<deadline:
             time.sleep(.02)
         d.recover_stops()
-        assert d.store.queue()[0]['state'] == 'detached'
+        assert d.store.queue()[0]['state'] == 'running'
+        assert d.store.db.execute('SELECT error FROM stop_requests').fetchone()[0] == 'process_completion_unconfirmed'
         assert d.store.db.execute('SELECT count(*) FROM attempts').fetchone()[0] == 1
     finally:
         lifecycle.cancel()
@@ -313,11 +320,12 @@ print('HTTP/2.0 200 OK\\nDate: Sat, 24 Oct 2026 00:10:00 GMT\\n\\n'+json.dumps(v
         watcher.start()
         # No scheduler polling or collect while the independent watcher works.
         deadline=time.monotonic()+6
-        while group_members(child.pid) and time.monotonic()<deadline:
+        while not d.store.stop_requested(d.store.queue()[0]) and time.monotonic()<deadline:
             time.sleep(.02)
-        assert not group_members(child.pid)
+        assert d.store.stop_requested(d.store.queue()[0])
+        assert group_members(child.pid)
         d.collect()
-        assert d.store.queue()[0]['state']=='detached'
+        assert d.store.queue()[0]['state']=='running'
         assert not lifecycle.stopping
     finally:
         watcher.close()
@@ -413,13 +421,14 @@ def test_unconfirmed_stop_preserves_worktree_until_group_gone(env):
         assert group_members(child.pid)
         assert Path(d.execution.get(attempt)['worktree']).exists()
         stop=d.store.db.execute('SELECT * FROM stop_requests').fetchone()
-        assert stop['process_status']=='unconfirmed' and not stop['finalized_at']
+        assert stop['process_status'] in ('pending','unconfirmed') and not stop['finalized_at']
         assert not d.store.db.execute('SELECT * FROM cleanup_jobs').fetchall()
         lifecycle.cancel()
         d.collect()
-        assert d.store.queue()[0]['state']=='detached'
+        assert d.store.queue()[0]['state']=='running'
+        assert d.store.db.execute('SELECT error FROM stop_requests').fetchone()[0] == 'process_completion_unconfirmed'
         CleanupService(config,d.store).tick()
-        assert not Path(d.execution.get(attempt)['worktree']).exists()
+        assert Path(d.execution.get(attempt)['worktree']).exists()
     finally:
         lifecycle.cancel()
         d.close()
@@ -452,7 +461,7 @@ def test_upgrade_from_608_preserves_attempts_and_rolls_back(store):
         reopened.close()
 
 
-def test_restart_emergency_continues_addressed_stop(env):
+def test_restart_emergency_preserves_natural_drain(env):
     config,project,control,*_=env
     control.write_text(json.dumps({'exec':'sleep'}))
     registry=config.workspace/'.runtime'/'children.json'
@@ -470,10 +479,10 @@ def test_restart_emergency_continues_addressed_stop(env):
         replacement.recover(lambda pid: True)
         d=Dispatcher(config,replacement,adapter([issue(project)]))
         d.recover_stops(); d.recover_stops()
-        assert not group_members(child.pid)
-        assert d.store.queue()[0]['state']=='detached'
+        assert group_members(child.pid)
+        assert d.store.queue()[0]['state']=='running'
         assert d.store.db.execute('SELECT count(*) FROM attempts').fetchone()[0]==1
-        assert d.store.db.execute('SELECT method FROM stop_requests').fetchone()[0]=='SIGTERM'
+        assert d.store.db.execute('SELECT method FROM stop_requests').fetchone()[0]=='not_required'
     finally:
         old.cancel()
         if replacement:
@@ -566,7 +575,7 @@ def test_preparation_helper_groups_are_durable_and_addressable(env, reason):
                            cwd=config.workspace,capture_output=True,text=True,timeout=5,stdin=subprocess.DEVNULL)
         worker.join(timeout=5)
         assert not worker.is_alive() and not errors
-        assert (result.returncode==0) if reason=='ready_removed' else (result.returncode<0)
+        assert result.returncode == 0
         assert store.db.execute('SELECT finished_at FROM attempt_processes').fetchone()[0]
         assert StopController(config,store,Mock()).finalize(store.queue()[0])
         assert store.queue()[0]['state']=='detached'

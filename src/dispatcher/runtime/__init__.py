@@ -120,7 +120,7 @@ class Lifecycle:
             os.close(descriptor)
 
     def recover(self, preserve=None):
-        """Only signal old groups with a verified leader start identity.
+        """Preserve old groups for natural drain with verified leader identity.
 
         Unknown surviving groups block daemon startup instead of risking PID reuse.
         This is recovery of non-child processes, not Popen polling/reaping.
@@ -153,17 +153,7 @@ class Lifecycle:
                 raise RuntimeError('Unverifiable surviving task group; inspect process registry') from None
             if start != value['identity']:
                 raise RuntimeError('Recovery process identity mismatch; inspect process registry')
-            os.killpg(pid, signal.SIGTERM)
-            deadline = time.monotonic() + self.force_grace_timeout_seconds
-            while members() and time.monotonic() < deadline:
-                time.sleep(.02)
-            if members():
-                os.killpg(pid, signal.SIGKILL)
-            deadline = time.monotonic() + 5
-            while members():
-                if time.monotonic() >= deadline:
-                    raise RuntimeError('Recovered process group did not stop')
-                time.sleep(.02)
+            self.orphans.append(value)
         if self.orphans:
             self.save_registry()
         else:
@@ -217,6 +207,7 @@ class Lifecycle:
                     str(gate_read), str(os.getpid()), *argv]
         try:
             child = subprocess.Popen(argv, start_new_session=True, **kwargs)
+            child.dispatcher_identity = identity(child.pid)
             self.children.append(child)
             if self.registry:
                 self.save_registry()
@@ -228,13 +219,19 @@ class Lifecycle:
                 self.services.append(child)
             return child
         except (OSError, RuntimeError):
-            if 'child' in locals():
-                self.cancel_child(child)
+            # A failed registration never opens the gate. EOF lets the inert
+            # wrapper exit naturally; no task command or signal is needed.
+            if gate_write is not None:
+                os.close(gate_write)
+                gate_write = None
+                while 'child' in locals() and child in self._active():
+                    time.sleep(.01)
             raise
         finally:
             if gate_read is not None:
                 os.close(gate_read)
-                os.close(gate_write)
+                if gate_write is not None:
+                    os.close(gate_write)
 
     @serialized
     def cancel_child(self, child):
@@ -349,6 +346,8 @@ def serve(config):
             lifecycle.recover(preserve)
         finally:
             recovery_store.close()
+        from dispatcher.process_wait import bind
+        bind(lifecycle)
         state_fd = os.open(temporary, os.O_CREAT | os.O_TRUNC | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
         with os.fdopen(state_fd, 'w') as stream:
             os.fchmod(stream.fileno(), 0o600)
@@ -364,7 +363,10 @@ def serve(config):
         lifecycle.drain()
         event(config.logs / 'dispatcher.jsonl', 'stopped_force' if lifecycle.forced else 'stopped')
     finally:
-        lifecycle.cancel()
+        from dispatcher.process_wait import bind
+        bind(None)
+        if lifecycle.forced:
+            lifecycle.cancel()
         state.unlink(missing_ok=True)
         temporary.unlink(missing_ok=True)
         os.close(fd)

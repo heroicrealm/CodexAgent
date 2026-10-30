@@ -1,19 +1,17 @@
 """Durable per-Issue stop intent, recovery and deduplicated diagnostics.
 
-Lifecycle owns signaling/reaping. This module never substitutes a global stop.
+Lifecycle owns draining/reaping. This module never substitutes a global stop.
 Network calls do not run under a SQLite writer transaction.
 """
 import fcntl
 import json
 import re
 from pathlib import Path
-from datetime import datetime, timedelta, timezone
 from threading import Event, Thread
 
 from dispatcher.github import Adapter, GitHubError
 from dispatcher.storage import Store, now
 from dispatcher.workspace import TaskError
-from dispatcher import containment
 
 
 def live_processes(store, attempt):
@@ -52,15 +50,14 @@ def request_in_transaction(store, row, reason, evidence):
     db.execute('UPDATE tasks SET available=0,approved_version=NULL WHERE issue_id=? AND version=? AND current_iteration_id IS ?',
                (row['issue_id'], row['version'], row['current_iteration_id']))
     store._history(row['repository'], row['number'], row['version'], reason, json.dumps(evidence), now())
-    if attempt:
-        try:
-            containment.require_control()
-        except TaskError:
-            db.execute("UPDATE stop_requests SET process_status='unconfirmed',error='descendant_boundary_unverified' WHERE request_id=?", (cursor.lastrowid,))
-            return cursor.lastrowid
     from dispatcher.runtime import group_members
     cleaning = db.execute("SELECT 1 FROM cleanup_jobs WHERE issue_id=? AND state='running'", (row['issue_id'],)).fetchone()
-    if not cleaning and (not attempt or attempt['state'] != 'running') and not live_processes(store, attempt):
+    uncertain = attempt and (attempt['recovery_diagnostic'] == 'process_identity_unconfirmed' or
+        attempt['pid'] and (attempt['exit_code'] is None or not attempt['process_identity']) or
+        db.execute('SELECT 1 FROM attempt_processes WHERE attempt_id=? AND finished_at IS NULL', (attempt['attempt_id'],)).fetchone())
+    if uncertain:
+        db.execute("UPDATE stop_requests SET process_status='unconfirmed',error='process_completion_unconfirmed' WHERE request_id=?", (cursor.lastrowid,))
+    if not cleaning and not uncertain and (not attempt or attempt['state'] != 'running') and not live_processes(store, attempt):
         if row['state'] not in ('done','cancelled','detached'):
             db.execute("UPDATE tasks SET state='detached' WHERE issue_id=?", (row['issue_id'],))
             store._record_transition(row, 'detached', 'detach:' + str(cursor.lastrowid), 'stop_controller', evidence)
@@ -138,45 +135,25 @@ class StopController:
         return names
 
     def signal(self, lifecycle, stop, attempt):
-        try:
-            containment.require_control()
-        except TaskError:
-            with self.store.db as db:
-                db.execute("UPDATE stop_requests SET process_status='unconfirmed',error='descendant_boundary_unverified' WHERE request_id=? AND (process_status!='unconfirmed' OR error IS NOT 'descendant_boundary_unverified')", (stop['request_id'],))
-            return
-        # Share Lifecycle ownership, and recheck durable backoff under its lock:
-        # simultaneous watcher/recovery must not repeatedly TERM a stuck group.
-        with lifecycle.mutex:
-            current = self.store.db.execute('SELECT * FROM stop_requests WHERE request_id=?', (stop['request_id'],)).fetchone()
-            stamp = datetime.now(timezone.utc)
-            if current['next_signal_at'] and datetime.fromisoformat(current['next_signal_at']) > stamp:
-                return
-            method, confirmed = lifecycle.stop_attempt(attempt['pid'], attempt['process_identity'])
-            with self.store.db as db:
-                db.execute("""UPDATE stop_requests SET method=CASE WHEN ?='not_required' THEN method ELSE ? END,
-                    process_status=?,error=?,next_signal_at=? WHERE request_id=?""",
-                    (method, method, 'confirmed' if confirmed else 'unconfirmed',
-                     None if confirmed else 'process_stop_unconfirmed',
-                     None if confirmed else (datetime.now(timezone.utc) + timedelta(seconds=self.config.emergency_poll_interval_seconds)).isoformat(), stop['request_id']))
+        # Labels only fence effects; they never authorize process signals.
+        return
 
-    def finalize(self, row, *, recovered=False):
+    def finalize(self, row, *, recovered=False, forced=False):
         """Only the scheduler calls this for running attempts after its work ends."""
         from dispatcher.runtime import group_members
         db = self.store.db
         stop = db.execute('SELECT * FROM stop_requests WHERE issue_id=? AND active=1', (row['issue_id'],)).fetchone()
         if not stop:
             return False
-        if stop['attempt_id']:
-            try:
-                containment.require_control()
-            except TaskError:
-                with db:
-                    db.execute("UPDATE stop_requests SET process_status='unconfirmed',error='descendant_boundary_unverified',finalized_at=NULL WHERE request_id=? AND (process_status!='unconfirmed' OR error IS NOT 'descendant_boundary_unverified' OR finalized_at IS NOT NULL)", (stop['request_id'],))
-                return False
         if stop['finalized_at']:
             return True
         attempt = db.execute('SELECT * FROM attempts WHERE attempt_id=?', (stop['attempt_id'],)).fetchone()
         if live_processes(self.store, attempt):
+            return False
+        if attempt and (attempt['recovery_diagnostic'] == 'process_identity_unconfirmed' or recovered and attempt['pid'] and attempt['exit_code'] is None or
+                db.execute('SELECT 1 FROM attempt_processes WHERE attempt_id=? AND finished_at IS NULL', (attempt['attempt_id'],)).fetchone()):
+            with db:
+                db.execute("UPDATE stop_requests SET process_status='unconfirmed',error='process_completion_unconfirmed' WHERE request_id=?", (stop['request_id'],))
             return False
         with db:
             db.execute('BEGIN IMMEDIATE')
@@ -189,10 +166,10 @@ class StopController:
                 db.execute('UPDATE attempt_processes SET finished_at=COALESCE(finished_at,?) WHERE attempt_id=?', (now(), attempt['attempt_id']))
             if attempt and attempt['state'] == 'running':
                 # A successful natural exit remains successful, while task detaches.
-                outcome = 'completed' if attempt['exit_code'] == 0 else 'interrupted' if stop['reason'] == 'emergency_stop' or recovered else 'failed'
+                outcome = 'interrupted' if forced else 'completed' if attempt['exit_code'] == 0 else 'interrupted' if stop['reason'] == 'emergency_stop' or recovered else 'failed'
                 db.execute('''UPDATE attempts SET state=?,finished_at=COALESCE(finished_at,?),
                     error_code=?,category='DISPATCHER' WHERE attempt_id=? AND state='running' ''',
-                    (outcome, now(), stop['reason'], attempt['attempt_id']))
+                    (outcome, now(), 'force_stop' if forced else stop['reason'], attempt['attempt_id']))
             if current['state'] not in ('done','cancelled','detached'):
                 changed = db.execute("""UPDATE tasks SET state='detached',available=0,approved_version=NULL
                     WHERE issue_id=? AND version=? AND current_iteration_id IS ? AND state=?""",
@@ -264,7 +241,6 @@ class StopController:
 
 def fence(store, adapter, project, attempt):
     """Fresh labels plus durable generation check before each irreversible step."""
-    containment.require_control()
     task = store.get(attempt['repository'], attempt['number'])
     if store.stop_requested(task):
         raise TaskError('task_detached', 'DISPATCHER')
@@ -304,12 +280,11 @@ class StopWatcher:
                             controller.observe(project, row)
                         except (GitHubError, KeyError, TypeError, ValueError):
                             pass
-                        saved = store.db.execute("SELECT * FROM stop_requests WHERE issue_id=? AND active=1 AND reason='emergency_stop'", (row['issue_id'],)).fetchone()
-                        if saved:
-                            attempt = store.db.execute('SELECT * FROM attempts WHERE attempt_id=?', (saved['attempt_id'],)).fetchone()
-                            for process in live_processes(store, attempt):
-                                controller.signal(self.lifecycle, saved, process)
                     controller.diagnostics()
+                    from dispatcher.timeout_diagnostic import TimeoutDiagnostics
+                    timeouts = TimeoutDiagnostics(store, adapter)
+                    timeouts.recovered(self.config.timeout_seconds)
+                    timeouts.flush()
                 except Exception:
                     # Intent stays durable; a transient adapter/SQLite failure
                     # cannot disable future emergency observations.

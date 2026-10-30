@@ -407,3 +407,15 @@ def upgrade609(db):
         BEGIN SELECT RAISE(ABORT,'Terminal review_on_error'); END""")
     validate(db)
     db.execute('INSERT OR IGNORE INTO schema_migrations VALUES(609)')
+
+
+def upgrade610(db):
+    """Durable per-attempt diagnostic timeout delivery; no execution transition."""
+    db.execute('''CREATE TABLE IF NOT EXISTS timeout_outbox(
+        attempt_id TEXT PRIMARY KEY REFERENCES attempts(attempt_id),
+        elapsed_seconds REAL NOT NULL, limit_seconds REAL NOT NULL,
+        body TEXT NOT NULL, delivered INTEGER NOT NULL DEFAULT 0,
+        comment_id TEXT, error TEXT)''')
+    if 'codex_started_at' not in {r[1] for r in db.execute('PRAGMA table_info(attempts)')}:
+        db.execute('ALTER TABLE attempts ADD COLUMN codex_started_at TEXT')
+    db.execute('INSERT OR IGNORE INTO schema_migrations VALUES(610)')

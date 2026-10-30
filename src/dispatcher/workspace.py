@@ -4,6 +4,7 @@ import os
 import json
 import shlex
 import subprocess
+from dispatcher.process_wait import run as natural_run
 
 
 class TaskError(RuntimeError):
@@ -67,14 +68,11 @@ class GitWorkspaceManager:
 
     def run(self, argv, **kwargs):
         """Register task helpers before exec; Lifecycle alone reaps their groups."""
-        if self.lifecycle and self.operation_attempt:
-            from dispatcher import containment
-            containment.require_control()
         allow_stopped = kwargs.pop('_allow_stopped', False)
         if self.cleanup_lock_fd is not None:
             kwargs['pass_fds'] = (self.cleanup_lock_fd,)
         if not self.lifecycle or not self.operation_attempt:
-            return subprocess.run(argv, **kwargs)
+            return natural_run(argv, **kwargs)
         import tempfile
         import time
         from dispatcher.runtime import identity
@@ -106,12 +104,10 @@ class GitWorkspaceManager:
             deadline = time.monotonic() + timeout
             expired = False
             while child in self.lifecycle._active():
+                if self.lifecycle.forced:
+                    self.lifecycle.cancel()
                 if time.monotonic() >= deadline:
                     expired = True
-                    _, confirmed = self.lifecycle.stop_attempt(child.pid, self.execution.db.execute(
-                        'SELECT process_identity FROM attempt_processes WHERE process_id=?', (process_id,)).fetchone()[0])
-                    if not confirmed:
-                        raise subprocess.TimeoutExpired(argv, timeout)
                 time.sleep(.01)
             with self.execution.db as db:
                 db.execute('UPDATE attempt_processes SET finished_at=?,exit_code=? WHERE process_id=?',
@@ -345,6 +341,17 @@ class TaskWorkspaceCleanup:
             raise TaskError('cleanup_requires_done')
         repo, task, worktree = self.manager.paths(project, row['number'])
         root = self.manager.config.workspace
+        # A positive /proc observation is a veto, never a completeness proof.
+        for entry in Path('/proc').glob('[0-9]*/cwd'):
+            try:
+                if entry.resolve(strict=True).is_relative_to(task):
+                    raise TaskError('cleanup_active_execution')
+            except FileNotFoundError:
+                pass
+            except PermissionError:
+                # Unrelated protected processes are outside the registry contract.
+                # Registered-process uncertainty is checked by CleanupService.
+                pass
         archived = dict(row).get('owned_worktrees', ())
         if any(not isinstance(name, str) or not name.startswith('previous-')
                or Path(name).name != name for name in archived):
@@ -360,9 +367,6 @@ class TaskWorkspaceCleanup:
             if candidate.is_relative_to(task) and candidate not in worktrees:
                 raise TaskError('cleanup_ownership_unproven')
         self.verify_metadata(repo, worktrees)
-        if task.exists() or any(str(path) in registered for path in worktrees):
-            from dispatcher import containment
-            containment.require_control()
         if not task.exists():
             # A crash may leave Git metadata after the worktree disappeared.
             for path in worktrees:

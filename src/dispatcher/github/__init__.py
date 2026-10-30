@@ -2,6 +2,7 @@
 import json
 import re
 import subprocess
+from dispatcher.process_wait import run as natural_run
 import time
 from email.utils import parsedate_to_datetime
 from urllib.parse import urlencode
@@ -32,7 +33,7 @@ def valid_branch(value):
 
 
 class Adapter:
-    def __init__(self, executable='gh', run=subprocess.run, sleep=time.sleep, attempts=3):
+    def __init__(self, executable='gh', run=natural_run, sleep=time.sleep, attempts=3):
         self.executable, self.run, self.sleep, self.attempts = executable, run, sleep, attempts
         self.response_date = None
 

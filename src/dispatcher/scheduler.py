@@ -17,7 +17,7 @@ from dispatcher.publisher import TaskResultPublisher
 from dispatcher.pr_publication import PullRequestPublisher
 from dispatcher.terminal_error import TerminalError, canonical_merged
 from dispatcher.runtime import identity
-from dispatcher.storage import Store
+from dispatcher.storage import Store, now
 from dispatcher.workspace import GitWorkspaceManager, TaskError
 
 SAFE_CODES = frozenset('''attachment_download_failed git_unavailable git_operation_failed
@@ -39,6 +39,8 @@ class Dispatcher:
         self.quota = CodexQuotaProvider(config, lifecycle, self.execution.quota)
         self.publisher = TaskResultPublisher(self.execution, self.adapter, config.projects)
         self.pr_publisher = PullRequestPublisher(self.execution, self.adapter, self.git)
+        from dispatcher.timeout_diagnostic import TimeoutDiagnostics
+        self.timeouts = TimeoutDiagnostics(self.store, self.adapter)
         self.active = {}
         self.stops = StopController(config, self.store, self.adapter)
         self.projects = [p for p in config.projects if ready(p)]
@@ -50,6 +52,11 @@ class Dispatcher:
             if self.store.stop_requested(self.store.get(row['repository'], row['number'])):
                 self.stops.finalize(self.store.get(row['repository'], row['number']), recovered=True)
                 continue
+            if live_processes(self.store, row):
+                self.execution.update(row['attempt_id'], recovery_diagnostic='process_completion_unconfirmed')
+                continue
+            if row['pid'] and row['exit_code'] is None:
+                self.execution.update(row['attempt_id'], recovery_diagnostic='process_completion_unconfirmed')
             if row['exit_code'] == 0 and row['codex_started'] and not self.pr_publisher.pending(row['attempt_id']):
                 self.pr_publisher.intent(row['attempt_id'])
             if self.pr_publisher.pending(row["attempt_id"]):
@@ -86,15 +93,6 @@ class Dispatcher:
         self.execution.update(row['attempt_id'], recovery_diagnostic=diagnostic)
 
     def admit(self):
-        from dispatcher import containment
-        try:
-            containment.require_control()
-        except TaskError:
-            if not getattr(self, '_containment_reported', False):
-                event(self.config.logs / 'dispatcher.jsonl', 'admission_unavailable', level='WARN',
-                      reason='descendant_boundary_unverified')
-                self._containment_reported = True
-            return
         order = self.projects[self.cursor:] + self.projects[:self.cursor]
         for project in order:
             if self.lifecycle.stopping or len(self.active) >= self.config.max_parallel_tasks:
@@ -221,8 +219,8 @@ class Dispatcher:
                                 current_task = self.store.get(project.repository, issue['number'])
                                 if self.store.stop_requested(current_task):
                                     raise RuntimeError('Task detached before launch')
-                                db.execute('UPDATE attempts SET codex_started=1,pid=?,process_identity=? WHERE attempt_id=?',
-                                           (child.pid, identity(child.pid), attempt))
+                                db.execute('UPDATE attempts SET codex_started=1,pid=?,process_identity=?,codex_started_at=? WHERE attempt_id=?',
+                                           (child.pid, identity(child.pid), now(), attempt))
                         process = self.executor.start(issue, branch, paths, worktree, task, attempt, before_exec=before_exec)
                         self.active[attempt] = dict(process, project=preparation_project, worktree=worktree, origin=origin,
                                                     initial_sha=sha, branch=branch, issue=issue, started=started, failure=None)
@@ -265,17 +263,18 @@ class Dispatcher:
         live = self.lifecycle._active()
         for attempt, task in list(self.active.items()):
             child = task['child']
-            stop = self.store.db.execute('SELECT reason FROM stop_requests WHERE issue_id=? AND active=1', (self.store.get(task['project'].repository, task['issue']['number'])['issue_id'],)).fetchone()
-            if child in live and time.monotonic() >= task['deadline'] and not stop:
-                task['failure'] = 'codex_timeout'
-                self.lifecycle.cancel_child(child)
-            elif child in live:
+            if child in live and time.monotonic() >= task['deadline']:
+                self.timeouts.record(attempt, time.monotonic() - task['execution_started'], self.config.timeout_seconds)
+            if child in live:
                 continue
             state, code, category = 'review', None, 'CODEX'
             try:
                 self.execution.update(attempt, exit_code=child.returncode)
+                saved = self.execution.get(attempt)
+                if not saved['process_identity'] or saved['process_identity'] != child.dispatcher_identity:
+                    self.execution.update(attempt, recovery_diagnostic='process_identity_unconfirmed')
                 if self.store.stop_requested(self.store.get(task['project'].repository, task['issue']['number'])):
-                    self.stops.finalize(self.store.get(task['project'].repository, task['issue']['number']))
+                    self.stops.finalize(self.store.get(task['project'].repository, task['issue']['number']), forced=self.lifecycle.forced)
                     del self.active[attempt]
                     continue
                 if self.lifecycle.forced:
@@ -316,9 +315,6 @@ class Dispatcher:
             attempt = self.execution.get(stop['attempt_id']) if stop['attempt_id'] else None
             processes = live_processes(self.store, attempt)
             if processes:
-                if stop['reason'] == 'emergency_stop':
-                    for process in processes:
-                        self.stops.signal(self.lifecycle, stop, process)
                 continue
             if not attempt or attempt['attempt_id'] not in self.active:
                 self.stops.finalize(self.store.get(stop['repository'], stop['number']), recovered=True)
@@ -343,6 +339,8 @@ class Dispatcher:
                 self.pr_publisher.flush(self.config.projects)
                 self.publisher.flush()
                 self.stops.diagnostics()
+                self.timeouts.recovered(self.config.timeout_seconds)
+                self.timeouts.flush()
                 self.next_publish = time.monotonic() + min(30, self.config.poll_interval_seconds)
             time.sleep(.05)
         self.publisher.flush()

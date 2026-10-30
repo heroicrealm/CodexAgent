@@ -1,13 +1,6 @@
-"""Fail-closed variant B boundary contract.
-
-No production backend is installed yet. PGID/PPID/cwd and an empty /proc scan
-are never accepted as proof. Delegation capabilities alone are not a boundary:
-launch gating, migration protection, durable identity and recovery are required.
-"""
+"""Optional stronger-containment capability diagnostics, never an admission gate."""
 import os
 from pathlib import Path
-
-from dispatcher.workspace import TaskError
 
 
 def capabilities():
@@ -29,9 +22,5 @@ def capabilities():
 
 
 def require_control():
-    """Future backend must supply a verifiable, non-reopenable empty boundary.
-
-    Intentionally unconditional until that backend is implemented and tested.
-    Neither writable cgroup files nor an operator boolean can bypass this guard.
-    """
-    raise TaskError('descendant_boundary_unverified', 'DISPATCHER')
+    """Compatibility shim: optional cgroups do not gate Lifecycle execution."""
+    return None

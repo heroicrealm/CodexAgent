@@ -1,4 +1,4 @@
-"""Variant B refusal acceptance. No kernel backend acceptance is claimed."""
+"""Portable natural drain supersedes mandatory variant B containment."""
 from unittest.mock import Mock
 
 import pytest
@@ -6,98 +6,153 @@ import pytest
 from dispatcher import containment
 from dispatcher.detachment import StopController, request_in_transaction
 from dispatcher.scheduler import Dispatcher
-from dispatcher.runtime import Lifecycle
-from dispatcher.workspace import TaskError
+from dispatcher.runtime import Lifecycle, group_members
+from dispatcher.timeout_diagnostic import TimeoutDiagnostics
+from dispatcher.github import GitHubError
 from test_stage04 import env, adapter, issue, register
 from test_stage602 import store, PROJECT, running
-from test_stage603 import publication
-
-# Capture the actual gate before legacy fixtures inject their business-test mock.
-REAL_REQUIRE_CONTROL = containment.require_control
 
 
-def test_kernel_capabilities_are_not_a_boundary_certificate(monkeypatch):
-    monkeypatch.setattr(containment, 'capabilities', lambda: dict(cgroup_v2=True,delegated_writable=True))
-    with pytest.raises(TaskError, match='descendant_boundary_unverified'):
-        REAL_REQUIRE_CONTROL()
-
-
-def test_production_admission_refuses_without_backend(env, monkeypatch):
-    config,project,*_=env
-    monkeypatch.setattr(containment,'require_control',REAL_REQUIRE_CONTROL)
-    d=Dispatcher(config,Lifecycle(),adapter([issue(project)]))
+def test_execution_without_cgroup_delegation(env, monkeypatch):
+    config, project, *_ = env
+    monkeypatch.setattr(containment, 'capabilities', lambda: dict(cgroup_v2=False, delegated_writable=False))
+    # Any obsolete production gate call is a regression.
+    monkeypatch.setattr(containment, 'require_control', lambda: pytest.fail('obsolete gate'))
+    lifecycle = Lifecycle()
+    d = Dispatcher(config, lifecycle, adapter([issue(project)]))
     try:
-        register(d,project,[issue(project)])
-        d.admit(); d.admit()
-        assert not d.active
-        assert not d.store.db.execute('SELECT * FROM attempts').fetchall()
-        assert d.store.queue()[0]['state']=='pending'
-        assert 'descendant_boundary_unverified' in (config.logs/'dispatcher.jsonl').read_text()
+        register(d, project, [issue(project)])
+        d.admit()
+        assert len(d.active) == 1
     finally:
+        lifecycle.cancel()
         d.close()
 
 
-def test_legacy_publication_does_not_resume_without_backend(publication, monkeypatch):
-    publisher,execution,attempt,api,git,*_=publication
-    monkeypatch.setattr(containment,'require_control',REAL_REQUIRE_CONTROL)
-    publisher.publish(PROJECT,execution.get(attempt))
-    git.publication_commit.assert_not_called()
-    git.push.assert_not_called()
-    api.write.assert_not_called()
+@pytest.mark.parametrize('failure', ['outage', 'lost_response'])
+def test_timeout_outbox_survives_restart_and_lost_response(store, failure):
+    execution, attempt = running(store)
+    api = Mock()
+    comments = []
+    api.pages.side_effect = lambda endpoint: list(comments)
+    def write(endpoint, method, payload):
+        if failure == 'lost_response':
+            comments.append(dict(id=51, **payload))
+        raise GitHubError(kind='transport')
+    api.write.side_effect = write
+    outbox = TimeoutDiagnostics(store, api)
+    outbox.record(attempt, 20, 10)
+    outbox.record(attempt, 30, 10)
+    outbox.flush()
+    assert store.db.execute('SELECT delivered FROM timeout_outbox').fetchone()[0] == 0
+    from dispatcher.storage import Store
+    path = store.db.execute('PRAGMA database_list').fetchone()[2]
+    reopened = Store(path)
+    try:
+        def success(endpoint, method, payload):
+            comments.append(dict(id=52, **payload))
+            return comments[-1]
+        api.write.side_effect = success
+        recovered = TimeoutDiagnostics(reopened, api)
+        recovered.flush(); recovered.flush()
+        assert len(comments) == 1
+        saved = reopened.db.execute('SELECT * FROM timeout_outbox').fetchone()
+        assert saved['delivered'] and saved['elapsed_seconds'] == 20
+        assert execution.get(attempt)['state'] == 'running'
+        assert reopened.queue()[0]['state'] == 'running'
+    finally:
+        reopened.close()
 
 
-def test_unverified_stop_is_durable_and_diagnostic_is_deliverable(store):
-    execution,attempt=running(store)
-    row=store.queue()[0]
-    with store.db:
-        request_in_transaction(store,row,'emergency_stop',{})
-    api=Mock()
-    api.pages.return_value=[]
-    api.write.return_value={'id':51}
-    controller=StopController(None,store,api)
-    assert not controller.finalize(row,recovered=True)
-    controller.diagnostics()
-    saved=store.db.execute('SELECT * FROM stop_requests').fetchone()
-    assert saved['error']=='descendant_boundary_unverified'
-    assert saved['process_status']=='unconfirmed' and not saved['finalized_at']
-    assert store.db.execute('SELECT delivered FROM stop_outbox').fetchone()[0]==1
-    assert 'descendant_boundary_unverified' in api.write.call_args.args[2]['body']
+@pytest.mark.parametrize('reason', [None, 'ready_removed', 'emergency_stop'])
+def test_deadline_and_labels_never_signal_codex(env, monkeypatch, reason):
+    import json
+    import time
+    from pathlib import Path
+    from test_stage04 import finish
+    from test_detachment import request_stop
+    config, project, control, *_ = env
+    Path(config.executable).write_text(Path(config.executable).read_text().replace('time.sleep(60)', 'time.sleep(.4)'))
+    control.write_text(json.dumps({'exec': 'sleep'}))
+    lifecycle = Lifecycle()
+    d = Dispatcher(config, lifecycle, adapter([issue(project)]))
+    try:
+        register(d, project, [issue(project)])
+        d.admit()
+        attempt = next(iter(d.active))
+        d.active[attempt]['deadline'] = 0
+        if reason:
+            request_stop(d.store, reason)
+        with monkeypatch.context() as guard:
+            guard.setattr('os.killpg', lambda *args: pytest.fail('unexpected signal'))
+            d.collect(); d.collect()
+            assert d.execution.get(attempt)['state'] == 'running'
+            assert group_members(d.active[attempt]['child'].pid)
+            assert d.store.db.execute('SELECT count(*) FROM timeout_outbox').fetchone()[0] == 1
+            finish(d)
+        saved = d.execution.get(attempt)
+        assert saved['exit_code'] == 0
+        assert saved['error_code'] != 'codex_timeout'
+        assert d.store.db.execute('SELECT count(*) FROM attempts').fetchone()[0] == 1
+    finally:
+        lifecycle.cancel()
+        d.close()
 
 
-@pytest.mark.skip(reason='BLOCKED: strong boundary backend is unimplemented; current WSL cgroup is not delegated')
-@pytest.mark.parametrize('scenario', ['setsid','setpgid','leader_exit','reparent','ordinary_drain',
-                                     'emergency_term_kill','restart','concurrent_attempts'])
-def test_real_kernel_boundary_acceptance(scenario):
-    # Explicitly unexecuted requirements, not simulated with a directory or /proc.
-    raise AssertionError('Requires an implemented backend and delegated integration environment')
+def test_force_stop_during_detach_is_not_natural_success(env):
+    import json
+    from test_detachment import request_stop
+    from test_stage04 import finish
+    config, project, control, *_ = env
+    control.write_text(json.dumps({'exec': 'sleep'}))
+    lifecycle = Lifecycle(force_grace_timeout_seconds=1)
+    d = Dispatcher(config, lifecycle, adapter([issue(project)]))
+    try:
+        register(d, project, [issue(project)])
+        d.admit()
+        attempt = next(iter(d.active))
+        request_stop(d.store, 'emergency_stop')
+        lifecycle.request_stop(True)
+        finish(d)
+        saved = d.execution.get(attempt)
+        assert saved['state'] == 'interrupted' and saved['error_code'] == 'force_stop'
+        assert not saved['pushed']
+    finally:
+        lifecycle.cancel()
+        d.close()
 
 
-def test_old_pgid_confirmation_cannot_reconnect_or_release_unknown_boundary(store):
-    execution,attempt=running(store)
-    with store.db:
-        request_in_transaction(store,store.queue()[0],'ready_removed',{'observed_at':'2026-10-26T10:00:00Z'})
-        store.db.execute("UPDATE attempts SET state='completed'")
-        store.db.execute("UPDATE tasks SET state='detached'")
-        store.db.execute("UPDATE stop_requests SET finalized_at='2026-10-26T10:01:00Z',process_status='confirmed'")
-        store.db.execute("UPDATE cleanup_jobs SET state='completed'")
-    from test_stage602 import item
-    store.apply(PROJECT,[item(server_observed_at='2026-10-26T10:02:00Z')])
-    assert store.queue()[0]['state']=='detached'
-    saved=store.db.execute('SELECT * FROM stop_requests').fetchone()
-    assert saved['active'] and saved['finalized_at'] is None
-    assert saved['error']=='descendant_boundary_unverified'
+def test_helper_deadline_waits_without_signals(monkeypatch):
+    import subprocess
+    import sys
+    from dispatcher.process_wait import run
+    with monkeypatch.context() as guard:
+        guard.setattr('os.kill', lambda *args: pytest.fail('unexpected helper signal'))
+        guard.setattr('os.killpg', lambda *args: pytest.fail('unexpected helper group signal'))
+        with pytest.raises(subprocess.TimeoutExpired) as error:
+            run([sys.executable, '-c', 'import time; time.sleep(.05); print("natural exit")'],
+                timeout=.001, capture_output=True, text=True)
+        assert error.value.output.strip() == 'natural exit'
 
 
-def test_child_launches_refused_before_exec_or_prompt_files(tmp_path):
-    from dispatcher.workspace import GitWorkspaceManager
-    from dispatcher.codex import CodexExecutor
-    lifecycle=Mock()
-    config=Mock()
-    manager=GitWorkspaceManager(config,lifecycle,Mock())
-    manager.operation_attempt='unknown'
-    with pytest.raises(TaskError,match='descendant_boundary_unverified'):
-        manager.run(['never-execute'])
-    with pytest.raises(TaskError,match='descendant_boundary_unverified'):
-        CodexExecutor(config,lifecycle).start({},'branch',[],tmp_path,tmp_path,'unknown')
-    lifecycle.submit.assert_not_called()
-    assert list(tmp_path.iterdir())==[]
+def test_force_interrupts_daemon_helper_without_waiting_for_deadline():
+    import sys
+    import time
+    from threading import Thread
+    from dispatcher.process_wait import bind, run
+    lifecycle = Lifecycle(force_grace_timeout_seconds=1)
+    bind(lifecycle)
+    def force():
+        time.sleep(.1)
+        lifecycle.request_stop(True)
+    thread = Thread(target=force)
+    thread.start()
+    try:
+        result = run([sys.executable, '-c', 'import time; time.sleep(60)'],
+                     capture_output=True, text=True, timeout=120)
+        assert result.returncode < 0
+        assert lifecycle.forced and not lifecycle.children
+    finally:
+        thread.join()
+        bind(None)
+        lifecycle.cancel()

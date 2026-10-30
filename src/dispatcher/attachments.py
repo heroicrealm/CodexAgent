@@ -4,6 +4,7 @@ from http.client import HTTPException
 import json
 import re
 import subprocess
+from dispatcher.process_wait import run as natural_run
 import time
 from urllib.parse import urlsplit, unquote, urljoin
 from urllib.request import Request, build_opener, HTTPRedirectHandler
@@ -64,7 +65,7 @@ class IssueAttachmentManager:
         if self.operation_guard:
             self.operation_guard()
         try:
-            result = subprocess.run([self.config.github_executable, 'auth', 'token', '--hostname', 'github.com'],
+            result = natural_run([self.config.github_executable, 'auth', 'token', '--hostname', 'github.com'],
                                     capture_output=True, text=True, timeout=15)
             if result.returncode or not result.stdout.strip():
                 raise ValueError

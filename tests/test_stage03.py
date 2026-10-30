@@ -315,7 +315,7 @@ def test_doctor_read_only(setup):
         checks = diagnose(config, which=lambda _: '/stub',
                           run=Mock(return_value=subprocess.CompletedProcess([], 0, stdout='')), environ={})
     assert not any(level == 'FAIL' and 'Descendant containment:' not in message for level, message in checks)
-    assert any(level == 'FAIL' and 'Descendant containment:' in message for level, message in checks)
+    assert any(level == 'WARN' and 'Descendant containment:' in message for level, message in checks)
     adapter.write.assert_not_called()
     assert config.source.read_bytes() == before
     assert not config.workspace.exists() and not config.logs.exists()
@@ -736,7 +736,7 @@ def test_doctor_separates_read_access_reported_flags_and_unproven_label_rights(s
         return diagnose(config, which=lambda _: '/stub',
                         run=Mock(return_value=subprocess.CompletedProcess([], 0, stdout='')), environ={})
     with patch('dispatcher.doctor.Adapter', return_value=adapter), patch('dispatcher.cli.diagnose', side_effect=run_diagnose):
-        assert main(['--config', str(config.source), 'doctor']) == 1
+        assert main(['--config', str(config.source), 'doctor']) == 0
     output = capsys.readouterr().out
     assert 'PASS: one: repository accessible (read access)' in output
     assert 'INFO: one: GitHub repository permission flags:' in output

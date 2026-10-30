@@ -37,8 +37,7 @@ def git(path, *args):
 
 @pytest.fixture
 def env(tmp_path, legacy_boundary_contract):
-    # Legacy business/ownership regression uses a mocked boundary contract.
-    # This is not variant B kernel acceptance; production has no such switch.
+    # Business regressions use production process tracking without a cgroup gate.
     executable = tmp_path / 'codex-stub'
     control = tmp_path / 'control.json'
     control.write_text('{}')
@@ -288,8 +287,14 @@ def test_max_parallel_timeout_force_and_graceful_stop(env):
         lifecycle.request_stop()
         dispatcher.admit()
         assert dispatcher.store.get(project.repository, 3)['state'] == 'pending'
+        for task in dispatcher.active.values():
+            task['deadline'] = 0
+        dispatcher.collect()
+        assert len(dispatcher.active) == 2
+        assert dispatcher.store.db.execute('SELECT count(*) FROM timeout_outbox').fetchone()[0] == 2
+        lifecycle.request_stop(True)
         finish(dispatcher)
-        assert {r['error_code'] for r in dispatcher.execution.db.execute('SELECT * FROM attempts')} == {'codex_timeout'}
+        assert {r['error_code'] for r in dispatcher.execution.db.execute('SELECT * FROM attempts')} == {'force_stop'}
     finally:
         lifecycle.cancel()
         dispatcher.close()
@@ -479,7 +484,7 @@ def test_outbox_uncertain_write_recovery_and_migration(env):
     try:
         execution = ExecutionStore(store)
         ExecutionStore(store)
-        assert [r[0] for r in store.db.execute('SELECT version FROM schema_migrations ORDER BY version')] == [1,2,3,602,604,605,606,607,608,609]
+        assert [r[0] for r in store.db.execute('SELECT version FROM schema_migrations ORDER BY version')] == [1,2,3,602,604,605,606,607,608,609,610]
         assert store.get(project.repository,1)['approved_version'] == 1
         api.pages.return_value = [dict(id=456,body=body)]
         TaskResultPublisher(execution,api).flush()
@@ -541,9 +546,11 @@ def test_recovery_verified_process_group_and_unrelated_process(env):
     try:
         new = Lifecycle(force_grace_timeout_seconds=1,registry=registry)
         new.recover()
-        assert identity(child.pid) is None
+        assert identity(child.pid) is not None
         assert unrelated.poll() is None
-        assert not registry.exists()
+        assert registry.exists()
+        new.request_stop(True)
+        new.cancel()
     finally:
         child.wait()
         unrelated.terminate()
@@ -694,7 +701,7 @@ def test_daemon_comment_diagnostic_handles_status_timeout(tmp_path, monkeypatch)
     assert len(diagnostic) < 4500
 
 
-def test_real_daemon_blocks_uncontrolled_attempt_and_stops(env):
+def test_real_daemon_executes_without_cgroup_and_stops(env):
     """Exercise actual CLI daemon and stub gh over its real subprocess boundary."""
     config, project, _, _, remote = env
     api_state = config.source.parent / 'github-state.json'
@@ -720,14 +727,16 @@ def test_real_daemon_blocks_uncontrolled_attempt_and_stops(env):
         deadline = time.monotonic()+10
         log = config.logs / 'dispatcher.jsonl'
         while time.monotonic()<deadline:
-            if log.exists() and 'descendant_boundary_unverified' in log.read_text():
+            with sqlite3.connect(config.workspace / '.runtime' / 'tasks.sqlite3') as db:
+                launched = db.execute('SELECT count(*) FROM attempts').fetchone()[0]
+            if launched:
                 break
             time.sleep(.05)
-        assert 'descendant_boundary_unverified' in log.read_text()
+        assert launched == 1
         state = json.loads(api_state.read_text())
         assert state['comments'] == []
         with sqlite3.connect(config.workspace / '.runtime' / 'tasks.sqlite3') as db:
-            assert db.execute('SELECT count(*) FROM attempts').fetchone()[0] == 0
+            assert db.execute('SELECT count(*) FROM attempts').fetchone()[0] == 1
     finally:
         result=subprocess.run([*argv,'stop'],capture_output=True,text=True,timeout=10)
         assert result.returncode == 0, result.stderr

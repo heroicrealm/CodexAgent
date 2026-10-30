@@ -1,6 +1,6 @@
-"""Variant B: real escaped descendants, legacy history and safe cleanup refusal.
+"""Real escaped descendants: cleanup refusal on unresolved process completion.
 
-These tests prove the refusal path, not a working cgroup containment backend.
+These tests do not claim a strong containment boundary.
 A subprocess subreaper owns and reaps every escaped child created here.
 """
 import ctypes
@@ -61,8 +61,7 @@ def reproduce(root, escape='setsid', reason='emergency_stop', leader_exit=False)
     lifecycle = Lifecycle(force_grace_timeout_seconds=1)
     pid = None
     try:
-        # Model an already-running pre-variant-B attempt. The production
-        # scheduler now refuses such a launch; this low-level test does it openly.
+        # Model a real attempt with an escaped child and unresolved completion.
         neighbor = lifecycle.submit([sys.executable,'-c','import time;time.sleep(60)'], service=True, cwd=root)
         leader = lifecycle.submit([sys.executable, '-c', leader_code], cwd=worktree)
         execution.update(attempt, codex_started=1, pid=leader.pid, process_identity=identity(leader.pid))
@@ -87,17 +86,15 @@ def reproduce(root, escape='setsid', reason='emergency_stop', leader_exit=False)
         assert not controller.finalize(store.queue()[0],recovered=True)
         saved = store.db.execute('SELECT * FROM stop_requests').fetchone()
         assert saved['process_status'] == 'unconfirmed' and saved['finalized_at'] is None
-        assert saved['error'] == 'descendant_boundary_unverified'
+        assert saved['error'] == 'process_completion_unconfirmed'
         # Also cover a historical false-finalized task/job from the previous
         # release. Valid ownership and an empty original group must not delete it.
         with store.db:
             store.db.execute("UPDATE attempts SET state='interrupted'")
             store.db.execute("UPDATE tasks SET state='detached'")
-        with pytest.raises(TaskError, match='descendant_boundary_unverified'):
-            TaskWorkspaceCleanup(manager).cleanup(project,dict(store.queue()[0],owned_attempts=[attempt]))
         CleanupService(config,store).tick()
         job = store.db.execute('SELECT * FROM cleanup_jobs').fetchone()
-        assert job['state'] == 'pending' and job['last_error'] == 'descendant_boundary_unverified'
+        assert job['state'] == 'pending' and job['last_error'] == 'cleanup_process_unconfirmed'
         assert (worktree/'user-file').read_text() == 'preserve me'
         assert neighbor in lifecycle._active()
         store.close()
@@ -106,7 +103,7 @@ def reproduce(root, escape='setsid', reason='emergency_stop', leader_exit=False)
             store.db.execute('UPDATE cleanup_jobs SET next_retry_at=NULL')
         CleanupService(config,store).tick()
         assert (worktree/'user-file').read_text() == 'preserve me'
-        assert store.db.execute('SELECT last_error FROM cleanup_jobs').fetchone()[0] == 'descendant_boundary_unverified'
+        assert store.db.execute('SELECT last_error FROM cleanup_jobs').fetchone()[0] == 'cleanup_process_unconfirmed'
         assert Path(f'/proc/{pid}/cwd').resolve() == worktree
         print('original group stopped; escaped descendant still uses worktree; cleanup refused', flush=True)
     finally:

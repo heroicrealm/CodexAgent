@@ -1,6 +1,5 @@
 dispatcher:
-  # Variant B is blocked: strong descendant containment backend is not implemented.
-  # There is no PGID fallback or option to bypass boundary verification; see README.
+  # Natural drain works without delegated cgroups. Only stop --force sends signals.
   poll_interval_seconds: 30
   emergency_poll_interval_seconds: 5 # Independent checks of active attempts.
   max_parallel_tasks: 1
@@ -13,7 +12,7 @@ github:
   auth_method: gh
 codex:
   executable: codex
-  timeout_seconds: 7200
+  timeout_seconds: 7200 # Diagnostic comment once per attempt; execution continues.
   # Dispatcher mode: codex exec bypasses approvals and the sandbox. Use a dedicated OS account.
   execution_mode: full-auto
   quota:

@@ -60,6 +60,10 @@ class CleanupService:
             for helper in self.store.db.execute('SELECT * FROM attempt_processes WHERE attempt_id=? AND finished_at IS NULL', (a['attempt_id'],)):
                 if group_members(helper['pid']) or identity(helper['pid']) == helper['process_identity']:
                     raise TaskError('cleanup_active_execution')
+                raise TaskError('cleanup_process_unconfirmed')
+            if a['pid'] and (a['exit_code'] is None or not a['process_identity'] or
+                    a['recovery_diagnostic'] == 'process_identity_unconfirmed'):
+                raise TaskError('cleanup_process_unconfirmed')
             if not re.fullmatch('[0-9a-f]{32}', a['attempt_id']):
                 raise TaskError('cleanup_invalid_attempt')
             if a['state'] == 'running' or (a['pid'] and (group_members(a['pid']) or (a['process_identity'] and identity(a['pid']) == a['process_identity']))):
@@ -95,9 +99,6 @@ class CleanupService:
                 raise TaskError('cleanup_ownership_unproven')
             if path == worktree and attempt['worktree'] != str(worktree):
                 raise TaskError('cleanup_ownership_unproven')
-        if attempts:
-            from dispatcher import containment
-            containment.require_control()
         return result
 
     def cleanup(self, project, row):
@@ -163,7 +164,7 @@ class CleanupService:
                         self.manager.cleanup_lock_fd = None
                 except (TaskError, OSError, ValueError, TypeError) as exc:
                     error = exc.code if isinstance(exc, TaskError) else 'cleanup_preserved_artifacts'
-                    delay = (60, 300, 900)[count - 1] if count < 4 else (900 if row['state'] == 'detached' or error == 'descendant_boundary_unverified' else None)
+                    delay = (60, 300, 900)[count - 1] if count < 4 else (900 if row['state'] == 'detached' or error == 'cleanup_process_unconfirmed' else None)
                     with db:
                         db.execute('''UPDATE cleanup_jobs SET state=?,updated_at=?,next_retry_at=?,last_error=? WHERE cleanup_id=?''',
                                    ('pending' if delay else 'failed', self.clock().isoformat(),
