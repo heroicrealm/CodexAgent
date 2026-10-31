@@ -28,7 +28,7 @@ def live_processes(store, attempt):
 def request_in_transaction(store, row, reason, evidence):
     """Caller owns BEGIN IMMEDIATE; row is the verified current generation."""
     db = store.db
-    if reason == 'ready_removed' and row['state'] in ('done','cancelled'):
+    if reason == 'ready_removed' and row['state'] in ('done','cancelled','review_on_error'):
         return None
     prior = db.execute('SELECT * FROM stop_requests WHERE issue_id=? AND active=1', (row['issue_id'],)).fetchone()
     if prior:
@@ -58,7 +58,7 @@ def request_in_transaction(store, row, reason, evidence):
     if uncertain:
         db.execute("UPDATE stop_requests SET process_status='unconfirmed',error='process_completion_unconfirmed' WHERE request_id=?", (cursor.lastrowid,))
     if not cleaning and not uncertain and (not attempt or attempt['state'] != 'running') and not live_processes(store, attempt):
-        if row['state'] not in ('done','cancelled','detached'):
+        if row['state'] not in ('done','cancelled','review_on_error','detached'):
             db.execute("UPDATE tasks SET state='detached' WHERE issue_id=?", (row['issue_id'],))
             store._record_transition(row, 'detached', 'detach:' + str(cursor.lastrowid), 'stop_controller', evidence)
         db.execute("UPDATE stop_requests SET process_status='confirmed',finalized_at=? WHERE request_id=?", (now(), cursor.lastrowid))
@@ -170,7 +170,7 @@ class StopController:
                 db.execute('''UPDATE attempts SET state=?,finished_at=COALESCE(finished_at,?),
                     error_code=?,category='DISPATCHER' WHERE attempt_id=? AND state='running' ''',
                     (outcome, now(), 'force_stop' if forced else stop['reason'], attempt['attempt_id']))
-            if current['state'] not in ('done','cancelled','detached'):
+            if current['state'] not in ('done','cancelled','review_on_error','detached'):
                 changed = db.execute("""UPDATE tasks SET state='detached',available=0,approved_version=NULL
                     WHERE issue_id=? AND version=? AND current_iteration_id IS ? AND state=?""",
                     (current['issue_id'], current['version'], current['current_iteration_id'], current['state'])).rowcount
