@@ -12,10 +12,12 @@ from dispatcher.workspace import TaskError
 
 
 @pytest.fixture
-def publication(store):
+def publication(store, legacy_boundary_contract):
+    # Publication regression injects the boundary contract; no kernel claim.
     execution, attempt = running(store)
     execution.update(attempt, worktree='/tmp/worktree', initial_sha='b'*40, origin_url='origin')
     api, git = Mock(), Mock()
+    api.control_issue.return_value = dict(id=101, number=1, labels=[dict(name=PROJECT.task_label)])
     api.repository_identity.return_value = 11
     api.response_date = '2026-10-24T00:10:00Z'
     git.publication_commit.return_value = SHA
@@ -160,7 +162,7 @@ def test_concurrent_publishers_do_not_duplicate(publication):
     publisher, execution, attempt, api, git, _ = publication
     entered, release = Event(), Event()
     path = execution.db.execute('PRAGMA database_list').fetchone()[2]
-    def pause(*args):
+    def pause(*args, **kwargs):
         entered.set()
         assert release.wait(5)
     git.push.side_effect = pause
@@ -274,6 +276,7 @@ def test_same_issue_number_in_two_projects(publication):
     api.repository_identity.side_effect = lambda p: 11 if p.repository == PROJECT.repository else 12
     api.write.side_effect = lambda endpoint, *args: first_pr if endpoint.startswith('repos/owner/') else second_pr
     api.request.side_effect = lambda endpoint: first_pr if endpoint.startswith('repos/owner/') else second_pr
+    api.control_issue.side_effect = lambda project, number: dict(id=101 if project.repository == PROJECT.repository else 102, number=number, labels=[dict(name=project.task_label)])
     publisher.flush([PROJECT, other])
     assert execution.get(attempt)['state'] == execution.get(second)['state'] == 'review'
     assert {(r['issue_id'], r['repository_id'], r['pr_id']) for r in execution.db.execute('SELECT * FROM task_pull_requests')} == {(101, 11, 301), (102, 12, 302)}

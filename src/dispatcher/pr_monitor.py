@@ -25,9 +25,13 @@ class PullRequestMonitor:
         rows = db.execute('''SELECT DISTINCT p.*,h.iteration_id,t.number,t.repository,t.state AS task_state
             FROM task_pull_requests p JOIN iteration_pr_history h USING(pr_id)
             JOIN tasks t ON t.issue_id=p.issue_id
-            LEFT JOIN pr_resolutions r USING(pr_id)
-            LEFT JOIN publication_operations o ON o.operation_key='resolution:'||p.pr_id
-            WHERE t.repository=? AND
+            LEFT JOIN pr_resolutions r ON r.pr_id=p.pr_id AND r.iteration_id=h.iteration_id
+            JOIN task_iterations i ON i.iteration_id=h.iteration_id
+            LEFT JOIN publication_operations legacy ON legacy.operation_key='resolution:'||p.pr_id
+            LEFT JOIN publication_operations o ON o.operation_key='resolution:'||p.pr_id||
+                CASE WHEN i.iteration_number=1 OR legacy.iteration_id=h.iteration_id
+                THEN '' ELSE ':'||h.iteration_id END
+            WHERE t.repository=? AND t.state!='review_on_error' AND
             ((t.state='review' AND t.current_iteration_id=h.iteration_id)
              OR (r.pr_id IS NOT NULL AND (o.outcome IS NULL OR o.outcome!='completed')))''',
             (project.repository.casefold(),)).fetchall()
@@ -40,20 +44,28 @@ class PullRequestMonitor:
                 except BlockingIOError:
                     continue
                 key = 'resolution:' + str(linked['pr_id'])
+                legacy = db.execute('SELECT iteration_id FROM publication_operations WHERE operation_key=?',
+                                    (key,)).fetchone()
+                number = db.execute('SELECT iteration_number FROM task_iterations WHERE iteration_id=?',
+                                    (linked['iteration_id'],)).fetchone()[0]
+                if number > 1 and (legacy is None or legacy['iteration_id'] != linked['iteration_id']):
+                    key += ':' + str(linked['iteration_id'])
                 try:
                     self.resolve(project, linked, key)
                 except (GitHubError, ValueError, TypeError, KeyError, AttributeError, sqlite3.Error, OSError):
                     self.store.publication(key, linked['iteration_id'], 'retry', 'failed', retry=True)
                     with db:
-                        db.execute('UPDATE pr_resolutions SET error=? WHERE pr_id=?',
-                                   ('github_or_storage_unavailable', linked['pr_id']))
+                        db.execute('UPDATE pr_resolutions SET error=? WHERE pr_id=? AND iteration_id=?',
+                                   ('github_or_storage_unavailable', linked['pr_id'], linked['iteration_id']))
                     errors.append(linked['number'])
         return errors
 
     def resolve(self, project, linked, key):
         db, api = self.store.db, self.adapter
-        saved = db.execute('SELECT * FROM pr_resolutions WHERE pr_id=?', (linked['pr_id'],)).fetchone()
+        saved = db.execute('SELECT * FROM pr_resolutions WHERE pr_id=? AND iteration_id=?', (linked['pr_id'], linked['iteration_id'])).fetchone()
         task = self.store.get(project.repository, linked['number'])
+        if self.store.stop_requested(task) or task['state'] == 'review_on_error':
+            return
         if task['state'] == 'review' and task['current_iteration_id'] == linked['iteration_id']:
             pr = api.request(f'repos/{project.repository}/pulls/{linked["pr_number"]}')
             observed = utc(api.response_date)
@@ -105,14 +117,14 @@ class PullRequestMonitor:
             self.store.publication(key, linked['iteration_id'])
             with db:
                 db.execute('''INSERT INTO pr_resolutions(pr_id,iteration_id,target,metadata) VALUES(?,?,?,?)
-                    ON CONFLICT(pr_id) DO UPDATE SET target=excluded.target,metadata=excluded.metadata''',
+                    ON CONFLICT(pr_id,iteration_id) DO UPDATE SET target=excluded.target,metadata=excluded.metadata''',
                     (linked['pr_id'], linked['iteration_id'], target, json.dumps(metadata)))
             result = self.store.transition(repository=project.repository, number=task['number'],
                 expected_state='review', version=task['version'], iteration_id=linked['iteration_id'],
                 target=target, event_key=key, authority=Authority('github-pr-observer', ('github-pr-observer',), role='observer'), evidence=proof)
             if result not in ('applied', 'already_applied'):
                 raise GitHubError(kind='invalid_response')
-            saved = db.execute('SELECT * FROM pr_resolutions WHERE pr_id=?', (linked['pr_id'],)).fetchone()
+            saved = db.execute('SELECT * FROM pr_resolutions WHERE pr_id=? AND iteration_id=?', (linked['pr_id'], linked['iteration_id'])).fetchone()
         if saved is None:
             return
         # Only deliver an intent whose guarded decision actually committed.
@@ -127,14 +139,16 @@ class PullRequestMonitor:
             if issue['id'] != linked['issue_id']:
                 raise GitHubError(kind='invalid_response')
             if issue['state'] != 'closed' or issue.get('state_reason') != 'completed':
+                if self.store.stop_requested(self.store.get(project.repository, linked['number'])):
+                    return
                 api.write(endpoint, 'PATCH', dict(state='closed', state_reason='completed'))
                 issue = api.request(endpoint)
             if issue['id'] != linked['issue_id'] or issue['state'] != 'closed' or issue.get('state_reason') != 'completed':
                 raise GitHubError(kind='invalid_response')
             issue_closed_at = utc(issue['closed_at'])
             with db:
-                db.execute('UPDATE pr_resolutions SET issue_closed_at=? WHERE pr_id=?',
-                           (issue_closed_at, linked['pr_id']))
+                db.execute('UPDATE pr_resolutions SET issue_closed_at=? WHERE pr_id=? AND iteration_id=?',
+                           (issue_closed_at, linked['pr_id'], linked['iteration_id']))
         marker = f'<!-- codex-resolution:{linked["repository_id"]}:{linked["issue_id"]}:{linked["iteration_id"]}:{linked["pr_id"]} -->'
         if not saved['comment_id']:
             comments = api.pages(endpoint + '/comments')
@@ -145,13 +159,15 @@ class PullRequestMonitor:
                 if saved['target'] == 'done':
                     body += f'merged_at: {metadata["merged_at"]}\nIssue closed_at: {issue_closed_at}\n'
                 body += marker
+                if self.store.stop_requested(self.store.get(project.repository, linked['number'])):
+                    return
                 existing = api.write(endpoint + '/comments', 'POST', dict(body=body))
             if not rest_id(existing.get('id')):
                 raise GitHubError(kind='invalid_response')
             with db:
-                db.execute('UPDATE pr_resolutions SET comment_id=?,error=NULL WHERE pr_id=?',
-                           (existing['id'], linked['pr_id']))
-        api.reconcile(project, self.store.get(project.repository, linked['number']))
+                db.execute('UPDATE pr_resolutions SET comment_id=?,error=NULL WHERE pr_id=? AND iteration_id=?',
+                           (existing['id'], linked['pr_id'], linked['iteration_id']))
+        api.reconcile(project, self.store.get(project.repository, linked['number']), store=self.store)
         with db:
-            db.execute('UPDATE pr_resolutions SET error=NULL WHERE pr_id=?', (linked['pr_id'],))
+            db.execute('UPDATE pr_resolutions SET error=NULL WHERE pr_id=? AND iteration_id=?', (linked['pr_id'], linked['iteration_id']))
         self.store.publication(key, linked['iteration_id'], 'delivered', 'completed')

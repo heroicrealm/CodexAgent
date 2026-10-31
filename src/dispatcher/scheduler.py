@@ -1,6 +1,10 @@
 """Single daemon loop combining polling, fair admission, execution and delivery."""
 import json
+import sqlite3
 import time
+from dataclasses import replace
+from dispatcher import preparation_error
+from dispatcher.detachment import StopController, StopWatcher, fence, live_processes
 from dispatcher.attachments import IssueAttachmentManager
 from dispatcher.codex import CodexExecutor
 from dispatcher.codex.quota import CodexQuotaProvider
@@ -11,12 +15,13 @@ from dispatcher.initialization import ready
 from dispatcher.logging import event
 from dispatcher.publisher import TaskResultPublisher
 from dispatcher.pr_publication import PullRequestPublisher
+from dispatcher.terminal_error import TerminalError, canonical_merged
 from dispatcher.runtime import identity
-from dispatcher.storage import Store
+from dispatcher.storage import Store, now
 from dispatcher.workspace import GitWorkspaceManager, TaskError
 
 SAFE_CODES = frozenset('''attachment_download_failed git_unavailable git_operation_failed
-    retry_sha_unavailable retry_workspace_conflict no_diff non_fast_forward publication_conflict publication_unavailable origin_changed default_branch_unavailable invalid_branch default_branch_protected worktree_already_exists clone_url_unavailable
+    branch_ownership_conflict retry_identity_conflict remote_branch_missing fetch_failed remote_head_changed reopen_failed pr_merged pr_identity_conflict retry_sha_unavailable retry_workspace_conflict no_diff non_fast_forward publication_conflict publication_unavailable origin_changed default_branch_unavailable invalid_branch default_branch_protected worktree_already_exists clone_url_unavailable
     unexpected_branch dirty_worktree no_commit rewritten_history unsupported_codex_cli
     codex_failed codex_timeout force_stop stop_requested quota_exhausted crash_recovery internal_error unsafe_path'''.split())
 
@@ -28,19 +33,30 @@ class Dispatcher:
         self.execution = ExecutionStore(self.store)
         self.adapter = adapter or Adapter(config.github_executable)
         self.sync = SyncService(config, self.store, self.adapter)
-        self.git = GitWorkspaceManager(config)
+        self.git = GitWorkspaceManager(config, lifecycle, self.execution)
         self.attachments = IssueAttachmentManager(config)
         self.executor = CodexExecutor(config, lifecycle)
         self.quota = CodexQuotaProvider(config, lifecycle, self.execution.quota)
-        self.publisher = TaskResultPublisher(self.execution, self.adapter)
+        self.publisher = TaskResultPublisher(self.execution, self.adapter, config.projects)
         self.pr_publisher = PullRequestPublisher(self.execution, self.adapter, self.git)
+        from dispatcher.timeout_diagnostic import TimeoutDiagnostics
+        self.timeouts = TimeoutDiagnostics(self.store, self.adapter)
         self.active = {}
+        self.stops = StopController(config, self.store, self.adapter)
         self.projects = [p for p in config.projects if ready(p)]
         self.cursor = 0
         self.next_poll = 0
         self.next_publish = 0
         # The process-wide runtime lock is held by serve. Never retry execution.
         for row in self.execution.db.execute("SELECT * FROM attempts WHERE state='running'").fetchall():
+            if self.store.stop_requested(self.store.get(row['repository'], row['number'])):
+                self.stops.finalize(self.store.get(row['repository'], row['number']), recovered=True)
+                continue
+            if live_processes(self.store, row):
+                self.execution.update(row['attempt_id'], recovery_diagnostic='process_completion_unconfirmed')
+                continue
+            if row['pid'] and row['exit_code'] is None:
+                self.execution.update(row['attempt_id'], recovery_diagnostic='process_completion_unconfirmed')
             if row['exit_code'] == 0 and row['codex_started'] and not self.pr_publisher.pending(row['attempt_id']):
                 self.pr_publisher.intent(row['attempt_id'])
             if self.pr_publisher.pending(row["attempt_id"]):
@@ -96,21 +112,85 @@ class Dispatcher:
                     if (not current or current['state'] != 'pending' or not current['available']
                             or current['version'] != candidate['version']):
                         continue
+                    current = dict(current, **self.store.branches(project.repository, candidate['number']))
                     issue = json.loads(current['snapshot'])
-                    branch = self.git.branch(project, issue)
+                    try:
+                        params = preparation_error.parameters(issue['body'])
+                        preparation_project = replace(project, base_branch=current['base_branch'] or params.get('base_branch', project.base_branch))
+                        branch = params.get('branch_name') or self.git.branch(preparation_project, issue)
+                        self.git.validate_branch(branch)
+                        self.git.validate_branch(preparation_project.base_branch)
+                    except TaskError as exc:
+                        if self.store.stop_requested(self.store.get(project.repository, issue['number'])):
+                            self.stops.finalize(self.store.get(project.repository, issue['number']))
+                            continue
+                        if exc.code in preparation_error.CODES:
+                            preparation_error.record(self.store, current, exc.code)
+                        raise
                     previous = self.store.db.execute(
-                        'SELECT * FROM attempts WHERE repository=? AND number=? ORDER BY rowid DESC LIMIT 1',
+                        'SELECT * FROM attempts WHERE repository=? AND number=? AND (codex_started=1 OR initial_sha IS NOT NULL) ORDER BY rowid DESC LIMIT 1',
                         (current['repository'], current['number'])).fetchone()
+                    if previous and self.store.db.execute("SELECT 1 FROM stop_requests WHERE attempt_id=? AND active=0", (previous['attempt_id'],)).fetchone():
+                        sources = self.store.db.execute('SELECT * FROM task_pull_requests WHERE issue_id=?', (current['issue_id'],)).fetchall()
+                        if len(sources) > 1:
+                            raise TaskError('pr_identity_conflict', 'GITHUB')
+                        for source in sources:
+                            remote_pr = self.adapter.request(f'repos/{project.repository}/pulls/{source["pr_number"]}')
+                            if (not isinstance(remote_pr, dict) or remote_pr.get('id') != source['pr_id'] or
+                                    remote_pr.get('number') != source['pr_number'] or
+                                    remote_pr.get('head', {}).get('ref') != previous['branch'] or
+                                    remote_pr.get('base', {}).get('ref') != preparation_project.base_branch or
+                                    remote_pr.get('head', {}).get('repo', {}).get('id') != current['repository_id'] or
+                                    remote_pr.get('base', {}).get('repo', {}).get('id') != current['repository_id'] or
+                                    remote_pr.get('merged') is not False or remote_pr.get('merged_at') or
+                                    remote_pr.get('state') not in ('open', 'closed')):
+                                raise TaskError('pr_identity_conflict', 'GITHUB')
+                        issue['detach_attempt'] = previous['attempt_id']
+                        previous = None
                     if previous:
-                        source = self.store.db.execute("""SELECT p.head_sha FROM task_pull_requests p
-                            JOIN iteration_pr_history h USING(pr_id) JOIN pr_resolutions r USING(pr_id)
-                            WHERE h.iteration_id=? AND r.target='rejected' ORDER BY h.id DESC LIMIT 1""",
-                            (previous['iteration_id'],)).fetchone()
-                        sha = source['head_sha'] if source else previous['result_sha']
-                        self.git.retry_source(project, issue['number'], sha)
-                        issue['retry_sha'] = sha
+                        source = self.store.db.execute("""SELECT DISTINCT p.* FROM task_pull_requests p
+                            JOIN iteration_pr_history h USING(pr_id)
+                            WHERE h.iteration_id=? AND p.issue_id=? AND p.repository_id=?""",
+                            (previous['iteration_id'], current['issue_id'], current['repository_id'])).fetchall()
+                        rejected = self.store.db.execute('''SELECT 1 FROM task_transitions
+                            WHERE issue_id=? AND iteration_id=? AND to_state='rejected' ''',
+                            (current['issue_id'], previous['iteration_id'])).fetchone()
+                        if (not rejected or len(source) != 1 or source[0]['merged_at'] or
+                                source[0]['head'] != previous['branch'] or
+                                source[0]['base'] != preparation_project.base_branch or
+                                current['work_branch'] != previous['branch']):
+                            raise TaskError('retry_identity_conflict', 'GIT')
+                        remote_pr = self.adapter.request(
+                            f'repos/{project.repository}/pulls/{source[0]["pr_number"]}')
+                        if (not isinstance(remote_pr, dict) or remote_pr.get('id') != source[0]['pr_id']
+                                or remote_pr.get('number') != source[0]['pr_number']
+                                or remote_pr.get('head', {}).get('ref') != source[0]['head']
+                                or remote_pr.get('base', {}).get('ref') != source[0]['base']
+                                or remote_pr.get('head', {}).get('repo', {}).get('id') != current['repository_id']
+                                or remote_pr.get('base', {}).get('repo', {}).get('id') != current['repository_id']
+                                or remote_pr.get('state') not in ('open', 'closed')):
+                            raise TaskError('pr_identity_conflict', 'GITHUB')
+                        if canonical_merged(remote_pr, source[0], current, previous, preparation_project):
+                            # No new attempt or workspace is needed to preserve
+                            # the previous result. Fence the pending decision.
+                            TerminalError(self.pr_publisher).record(previous, source[0], preparation=current)
+                            self.pr_publisher.publish(preparation_project, previous)
+                            continue
+                        if remote_pr.get('merged') is not False or remote_pr.get('merged_at'):
+                            raise TaskError('pr_merged', 'GITHUB')
+                        issue['repeat_branch'] = True
                         issue['previous_attempt'] = previous['attempt_id']
-                        branch = f'codex/issue-{issue["number"]}-iteration-{current["current_iteration_id"]}'
+                        branch = current['work_branch']
+                    elif current['work_branch']:
+                        branch = current['work_branch']
+                    else:
+                        if not self.store.save_branches(project.repository, current['number'],
+                                expected_version=current['version'], expected_iteration_id=current['current_iteration_id'],
+                                expected=self.store.branches(project.repository, current['number']),
+                                base_branch=preparation_project.base_branch, work_branch=branch,
+                                branch_source='generated' if branch != issue['target_branch'] else 'explicit',
+                                branch_status='resolved'):
+                            continue
                     if self.lifecycle.stopping:
                         return
                     attempt = self.execution.reserve(current, branch, self.config.max_parallel_tasks,
@@ -120,7 +200,17 @@ class Dispatcher:
                     self.cursor = (self.projects.index(project) + 1) % len(self.projects)
                     started = time.monotonic()
                     try:
-                        worktree, sha = self.git.prepare(project, issue, branch)
+                        fence(self.store, self.adapter, project, self.execution.get(attempt))
+                        def local_guard():
+                            current_task = self.store.get(project.repository, issue['number'])
+                            if self.store.stop_requested(current_task) or current_task['current_iteration_id'] != self.execution.get(attempt)['iteration_id']:
+                                raise TaskError('task_detached','DISPATCHER')
+                        self.git.operation_guard = local_guard
+                        self.git.operation_attempt = attempt
+                        expected_worktree = self.git.paths(project, issue['number'])[2]
+                        self.execution.update(attempt, worktree=str(expected_worktree))
+                        worktree, sha = self.git.prepare(preparation_project, issue, branch)
+                        self.git.operation_guard = None
                         self.execution.update(attempt, worktree=str(worktree), initial_sha=sha)
                         if issue.get('previous_attempt'):
                             archived = worktree.parent / ('previous-' + issue['previous_attempt'])
@@ -129,20 +219,52 @@ class Dispatcher:
                         _, task, _ = self.git.paths(project, issue['number'])
                         origin = self.git.git(worktree, 'remote', 'get-url', 'origin').stdout.strip()
                         self.execution.update(attempt, origin_url=origin)
+                        fence(self.store, self.adapter, project, self.execution.get(attempt))
+                        self.attachments.operation_guard = local_guard
                         paths = self.attachments.prepare(issue['body'], task)
+                        self.attachments.operation_guard = None
                         if self.lifecycle.stopping:
                             self.execution.finish(attempt, 'interrupted', 'force_stop' if self.lifecycle.forced else 'stop_requested',
                                                   'DISPATCHER', time.monotonic() - started)
                             return
-                        process = self.executor.start(issue, branch, paths, worktree, task, attempt)
-                        self.execution.update(attempt, codex_started=1, pid=process['child'].pid,
-                                              process_identity=identity(process['child'].pid))
-                        self.active[attempt] = dict(process, project=project, worktree=worktree, origin=origin,
+                        fence(self.store, self.adapter, project, self.execution.get(attempt))
+                        def before_exec(child):
+                            with self.store.db as db:
+                                db.execute('BEGIN IMMEDIATE')
+                                current_task = self.store.get(project.repository, issue['number'])
+                                if self.store.stop_requested(current_task):
+                                    raise RuntimeError('Task detached before launch')
+                                db.execute('UPDATE attempts SET codex_started=1,pid=?,process_identity=?,codex_started_at=? WHERE attempt_id=?',
+                                           (child.pid, identity(child.pid), now(), attempt))
+                        process = self.executor.start(issue, branch, paths, worktree, task, attempt, before_exec=before_exec)
+                        self.active[attempt] = dict(process, project=preparation_project, worktree=worktree, origin=origin,
                                                     initial_sha=sha, branch=branch, issue=issue, started=started, failure=None)
+                    except GitHubError:
+                        if self.store.stop_requested(self.store.get(project.repository, issue['number'])):
+                            self.stops.finalize(self.store.get(project.repository, issue['number']))
+                        else:
+                            self.execution.finish(attempt, 'failed', 'publication_unavailable', 'GITHUB', time.monotonic() - started)
                     except TaskError as exc:
-                        self.execution.finish(attempt, 'failed', exc.code, exc.category, time.monotonic() - started)
+                        if self.store.stop_requested(self.store.get(project.repository, issue['number'])):
+                            self.stops.finalize(self.store.get(project.repository, issue['number']))
+                            continue
+                        if exc.code in preparation_error.CODES:
+                            preparation_error.record(self.store, current, exc.code)
+                        else:
+                            self.execution.finish(attempt, 'failed', exc.code, exc.category, time.monotonic() - started)
                     except (OSError, RuntimeError):
+                        if self.store.stop_requested(self.store.get(project.repository, issue['number'])):
+                            self.stops.finalize(self.store.get(project.repository, issue['number']))
+                            continue
                         self.execution.finish(attempt, 'failed', 'internal_error', 'DISPATCHER', time.monotonic() - started)
+                    finally:
+                        self.git.operation_guard = None
+                        self.git.operation_attempt = None
+                        self.attachments.operation_guard = None
+                    break
+                except sqlite3.IntegrityError:
+                    event(self.config.logs / 'dispatcher.jsonl', 'admission_unavailable', level='WARN',
+                          project=project.id, task=candidate['number'], reason='branch_ownership_conflict')
                     break
                 except (GitHubError, TaskError) as exc:
                     event(self.config.logs / 'dispatcher.jsonl', 'admission_unavailable', level='WARN', project=project.id,
@@ -150,19 +272,26 @@ class Dispatcher:
                     break
 
     def collect(self):
+        self.recover_stops()
         if self.lifecycle.forced:
             self.lifecycle.cancel()
         live = self.lifecycle._active()
         for attempt, task in list(self.active.items()):
             child = task['child']
             if child in live and time.monotonic() >= task['deadline']:
-                task['failure'] = 'codex_timeout'
-                self.lifecycle.cancel_child(child)
-            elif child in live:
+                self.timeouts.record(attempt, time.monotonic() - task['execution_started'], self.config.timeout_seconds)
+            if child in live:
                 continue
             state, code, category = 'review', None, 'CODEX'
             try:
                 self.execution.update(attempt, exit_code=child.returncode)
+                saved = self.execution.get(attempt)
+                if not saved['process_identity'] or saved['process_identity'] != child.dispatcher_identity:
+                    self.execution.update(attempt, recovery_diagnostic='process_identity_unconfirmed')
+                if self.store.stop_requested(self.store.get(task['project'].repository, task['issue']['number'])):
+                    self.stops.finalize(self.store.get(task['project'].repository, task['issue']['number']), forced=self.lifecycle.forced)
+                    del self.active[attempt]
+                    continue
                 if self.lifecycle.forced:
                     state, code = 'interrupted', 'force_stop'
                 elif task['failure']:
@@ -190,12 +319,29 @@ class Dispatcher:
             del self.active[attempt]
             try:
                 self.adapter.reconcile(task['project'], self.store.get(task['project'].repository,
-                                                                      self.execution.get(attempt)['number']))
+                                                                      self.execution.get(attempt)['number']), store=self.store)
             except GitHubError:
                 pass
 
+    def recover_stops(self):
+        self.lifecycle.prune_orphans()
+        from dispatcher.runtime import group_members
+        for stop in self.store.db.execute('SELECT s.*,t.repository,t.number FROM stop_requests s JOIN tasks t USING(issue_id) WHERE active=1').fetchall():
+            attempt = self.execution.get(stop['attempt_id']) if stop['attempt_id'] else None
+            processes = live_processes(self.store, attempt)
+            if processes:
+                continue
+            if not attempt or attempt['attempt_id'] not in self.active:
+                self.stops.finalize(self.store.get(stop['repository'], stop['number']), recovered=True)
+
     def run(self):
-        while not self.lifecycle.stopping or self.active:
+        from dispatcher.cleanup import CleanupWorker
+        self.cleanup_worker = CleanupWorker(self.config)
+        self.cleanup_worker.start()
+        self.stop_watcher = StopWatcher(self.config, self.lifecycle)
+        self.stop_watcher.start()
+        from dispatcher.runtime import group_members
+        while not self.lifecycle.stopping or self.active or any(group_members(o['pid']) for o in self.lifecycle.orphans):
             self.collect()
             if not self.lifecycle.stopping:
                 if time.monotonic() >= self.next_poll:
@@ -204,12 +350,20 @@ class Dispatcher:
                 self.quota.check()
                 self.admit()
             if time.monotonic() >= self.next_publish:
-                self.pr_publisher.flush(self.projects)
+                preparation_error.flush(self.store, self.adapter, self.config.projects)
+                self.pr_publisher.flush(self.config.projects)
                 self.publisher.flush()
+                self.stops.diagnostics()
+                self.timeouts.recovered(self.config.timeout_seconds)
+                self.timeouts.flush()
                 self.next_publish = time.monotonic() + min(30, self.config.poll_interval_seconds)
             time.sleep(.05)
         self.publisher.flush()
 
     def close(self):
+        if hasattr(self, 'stop_watcher'):
+            self.stop_watcher.close()
+        if hasattr(self, 'cleanup_worker'):
+            self.cleanup_worker.close()
         self.quota.close()
         self.store.close()

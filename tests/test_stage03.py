@@ -196,7 +196,7 @@ def test_reconcile_preserves_ready_and_unrelated_and_retries(setup, state):
     adapter.reconcile(project, row)
     calls = adapter.write.call_args_list
     deletes = [c.args[0] for c in calls if c.args[1] == 'DELETE']
-    assert len(deletes) == 3 and all('ready' not in url and 'other' not in url for url in deletes)
+    assert len(deletes) == 1 and all('ready' not in url and 'other' not in url for url in deletes)
     assert calls[-1].args[2] == dict(labels=[project.label(state).name])
     adapter.pages.return_value = [dict(name=name) for name in [project.task_label, 'other', project.label(state).name]]
     adapter.write.reset_mock()
@@ -314,7 +314,8 @@ def test_doctor_read_only(setup):
     with patch('dispatcher.doctor.Adapter', return_value=adapter):
         checks = diagnose(config, which=lambda _: '/stub',
                           run=Mock(return_value=subprocess.CompletedProcess([], 0, stdout='')), environ={})
-    assert not any(level == 'FAIL' for level, _ in checks)
+    assert not any(level == 'FAIL' and 'Descendant containment:' not in message for level, message in checks)
+    assert any(level == 'WARN' and 'Descendant containment:' in message for level, message in checks)
     adapter.write.assert_not_called()
     assert config.source.read_bytes() == before
     assert not config.workspace.exists() and not config.logs.exists()

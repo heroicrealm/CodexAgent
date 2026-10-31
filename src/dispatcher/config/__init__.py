@@ -13,6 +13,10 @@ COLORS = dict(zip(
     'ready discovered approve reject pending running review done failed rejected revoked cancelled interrupted'.split(),
     '0E8A16 D4C5F9 0E8A16 B60205 FBCA04 1D76DB 5319E7 0E8A16 D93F0B B60205 C2E0C6 E99695 F9D0C4'.split()))
 
+COLORS['review_on_error'] = 'D93F0B'
+COLORS['emergency_stop'] = 'B60205'
+COLORS['detached'] = 'C2E0C6'
+
 
 @dataclass(frozen=True)
 class Label:
@@ -35,7 +39,8 @@ class Project:
     init_fingerprint: str = ''
 
     def label(self, key):
-        return self.labels.get(key, Label(self.task_label if key == 'ready' else f'dispatcher:{key}', COLORS[key]))
+        return self.labels.get(key, Label(self.task_label if key == 'ready' else f'dispatcher:{key.replace("_", "-")}', COLORS[key],
+            'Terminal error; manual resolution required' if key == 'review_on_error' else 'Emergency stop; remove manually to reconnect' if key == 'emergency_stop' else ''))
 
 
 @dataclass(frozen=True)
@@ -58,6 +63,7 @@ class Config:
     attachment_max_files: int = 20
     attachment_max_bytes: int = 20971520
     attachment_timeout_seconds: int = 30
+    emergency_poll_interval_seconds: int = 5
 
 
 def load(path: str | Path) -> Config:
@@ -102,7 +108,7 @@ def load(path: str | Path) -> Config:
     attachments = section('attachments')
     if not isinstance(quota, dict):
         raise ConfigError('codex.quota must be a mapping')
-    options = {}
+    options = {'emergency_poll_interval_seconds': positive('emergency_poll_interval_seconds', 5)}
     for key, values, name, default in (
         ('timeout_seconds', codex, 'timeout_seconds', 7200),
         ('quota_check_interval_seconds', quota, 'check_interval_seconds', 300),
@@ -138,14 +144,14 @@ def load(path: str | Path) -> Config:
             raise ConfigError('project labels/security must be mappings')
         parsed = {}
         for key, color in COLORS.items():
-            value = labels.get(key, item.get('task_label', 'codex-ready') if key == 'ready' else f'dispatcher:{key}')
+            value = labels.get(key, item.get('task_label', 'codex-ready') if key == 'ready' else ('dispatcher:emergency-stop' if key == 'emergency_stop' else f'dispatcher:{key}'))
             if isinstance(value, str):
                 value = dict(name=value)
             if not isinstance(value, dict):
                 raise ConfigError('label must be a string or mapping')
             name = string(value.get('name'), f'labels.{key}.name')
             color = value.get('color', color)
-            description = value.get('description', '')
+            description = value.get('description', 'Emergency stop; remove manually to reconnect' if key == 'emergency_stop' else '')
             if not isinstance(color, str) or not re.fullmatch('[0-9a-fA-F]{6}', color):
                 raise ConfigError('label color must be six RGB hex digits')
             if not isinstance(description, str) or '\x00' in description:

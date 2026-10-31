@@ -4,6 +4,7 @@ from http.client import HTTPException
 import json
 import re
 import subprocess
+from dispatcher.process_wait import run as natural_run
 import time
 from urllib.parse import urlsplit, unquote, urljoin
 from urllib.request import Request, build_opener, HTTPRedirectHandler
@@ -20,6 +21,7 @@ class NoRedirect(HTTPRedirectHandler):
 class IssueAttachmentManager:
     def __init__(self, config, opener=None):
         self.config = config
+        self.operation_guard = None
         self.opener = opener or build_opener(NoRedirect())
 
     @staticmethod
@@ -60,8 +62,10 @@ class IssueAttachmentManager:
         return list(dict.fromkeys(url.rstrip("'") for url in candidates if self.recognized(url.rstrip("'"))))
 
     def token(self):
+        if self.operation_guard:
+            self.operation_guard()
         try:
-            result = subprocess.run([self.config.github_executable, 'auth', 'token', '--hostname', 'github.com'],
+            result = natural_run([self.config.github_executable, 'auth', 'token', '--hostname', 'github.com'],
                                     capture_output=True, text=True, timeout=15)
             if result.returncode or not result.stdout.strip():
                 raise ValueError
@@ -72,6 +76,8 @@ class IssueAttachmentManager:
     def download(self, url, destination, token):
         deadline = time.monotonic() + self.config.attachment_timeout_seconds
         for _ in range(6):
+            if self.operation_guard:
+                self.operation_guard()
             if not self.allowed(url):
                 raise ValueError
             headers = {'Accept': 'application/octet-stream', 'User-Agent': 'CodexAgent'}
@@ -125,6 +131,8 @@ class IssueAttachmentManager:
         raise ValueError
 
     def prepare(self, body, task):
+        if self.operation_guard:
+            self.operation_guard()
         try:
             directory = private_dir(self.config.workspace, task / 'attachments')
         except (OSError, TaskError):
@@ -133,6 +141,8 @@ class IssueAttachmentManager:
         urls = self.urls(body)
         failed = len(urls) > self.config.attachment_max_files
         for index, url in enumerate(urls[:self.config.attachment_max_files]):
+            if self.operation_guard:
+                self.operation_guard()
             entry = dict(source_url=url, local_path=None, size=None, sha256=None, status='failed')
             try:
                 name = unquote(urlsplit(url).path.rsplit('/', 1)[-1])

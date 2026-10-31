@@ -25,7 +25,7 @@ def main(argv=None):
                        help='Output format (default: table; json preserves the machine contract)')
     init = sub.add_parser('init')
     init.add_argument('--update', action='store_true')
-    for command in ('show', 'approve', 'reject'):
+    for command in ('show', 'approve', 'reject', 'cleanup-retry'):
         task = sub.add_parser(command)
         task.add_argument('project')
         task.add_argument('issue', type=int)
@@ -66,7 +66,7 @@ def main(argv=None):
                     event(config.logs / 'dispatcher.jsonl', 'project_not_initialized', level='WARN', project=project.id)
             if not any(ready(p) for p in config.projects):
                 raise RuntimeError('No initialized enabled projects; run init')
-        if args.command in ('queue', 'show', 'approve', 'reject'):
+        if args.command in ('queue', 'show', 'approve', 'reject', 'cleanup-retry'):
             project = None
             if args.command != 'queue':
                 project = next((p for p in config.projects if p.id == args.project), None)
@@ -78,11 +78,28 @@ def main(argv=None):
                     projects = {p.repository.casefold(): p.id for p in config.projects if ready(p)}
                     render_queue([_display_task(r) for r in store.queue() if r['repository'] in projects],
                                  projects, args.format)
+                elif args.command == 'cleanup-retry':
+                    from dispatcher.cleanup import CleanupService
+                    applied = CleanupService(config, store).retry(project, args.issue)
+                    print('queued' if applied else 'no failed cleanup for current generation')
+                    return 0 if applied else 1
                 elif args.command == 'show':
                     row = store.get(project.repository, args.issue)
                     if row is None:
                         raise RuntimeError('Unknown issue')
                     value = _display_task(row)
+                    value['stop_requests'] = [dict(r) for r in store.db.execute(
+                        'SELECT request_id,iteration_id,version,attempt_id,reason,previous_state,stage,requested_at,finalized_at,active,process_status,method,error FROM stop_requests WHERE issue_id=? ORDER BY request_id', (row['issue_id'],))]
+                    value['detach_publications'] = [dict(r) for r in store.db.execute(
+                        'SELECT p.* FROM detach_publications p JOIN stop_requests s USING(request_id) WHERE s.issue_id=?', (row['issue_id'],))]
+                    value['stop_outbox'] = [dict(r) for r in store.db.execute(
+                        'SELECT o.request_id,o.delivered,o.comment_id,o.error FROM stop_outbox o JOIN stop_requests s USING(request_id) WHERE s.issue_id=?', (row['issue_id'],))]
+                    value['configuration_errors'] = [dict(r) for r in store.db.execute(
+                        'SELECT * FROM configuration_errors WHERE issue_id=?', (row['issue_id'],))]
+                    value['terminal_errors'] = [dict(r) for r in store.db.execute(
+                        'SELECT * FROM terminal_errors WHERE issue_id=?', (row['issue_id'],))]
+                    value['cleanup_jobs'] = [dict(r) for r in store.db.execute(
+                        'SELECT * FROM cleanup_jobs WHERE issue_id=? ORDER BY cleanup_id', (row['issue_id'],))]
                     value['decisions'] = [dict(r) for r in store.db.execute(
                         'SELECT * FROM decisions WHERE repository=? AND number=? ORDER BY id',
                         (project.repository.casefold(), args.issue))]
