@@ -132,6 +132,7 @@ def render_queue(rows, projects, format='table', stream=None):
 # Explicit fields avoid dumping internal snapshots, remote credentials or process data.
 DETAIL_FIELDS = {
     'stop_requests': ('request_id','reason','previous_state','stage','attempt_id','requested_at','finalized_at','active','process_status','method','error'),
+    'detach_publications': ('request_id','state','sha','remote_sha','no_diff','error','confirmed_at'),
     'stop_outbox': ('request_id','delivered','comment_id','error'),
     'configuration_errors': ('content_hash', 'code', 'created_at', 'delivered', 'comment_id'),
     'terminal_errors': ('reason', 'pr_number', 'pr_id', 'created_at', 'publication', 'diagnostic', 'comment_id', 'delivered'),

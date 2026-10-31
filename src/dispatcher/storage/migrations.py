@@ -427,3 +427,12 @@ def upgrade611(db):
         attempt_id TEXT PRIMARY KEY REFERENCES attempts(attempt_id),
         branch TEXT NOT NULL, sha TEXT, archive TEXT UNIQUE NOT NULL)''')
     db.execute('INSERT OR IGNORE INTO schema_migrations VALUES(611)')
+
+
+def upgrade612(db):
+    """Detach publication journal, independent of ordinary PR publication."""
+    db.execute('''CREATE TABLE IF NOT EXISTS detach_publications(
+        request_id INTEGER PRIMARY KEY REFERENCES stop_requests(request_id),
+        state TEXT NOT NULL DEFAULT 'pending', sha TEXT, remote_sha TEXT,
+        no_diff INTEGER, error TEXT, confirmed_at TEXT)''')
+    db.execute('INSERT OR IGNORE INTO schema_migrations VALUES(612)')

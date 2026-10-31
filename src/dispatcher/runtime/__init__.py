@@ -31,7 +31,7 @@ def group_members(pgid):
             fields = stat.read_text().rsplit(')', 1)[1].split()
             if int(fields[2]) == pgid and fields[0] != 'Z':
                 result.append(int(stat.parent.name))
-        except FileNotFoundError:
+        except (FileNotFoundError, ProcessLookupError):
             pass
     return result
 
@@ -139,7 +139,7 @@ class Lifecycle:
                         fields = stat.read_text().rsplit(')', 1)[1].split()
                         if int(fields[2]) == pid and fields[0] != 'Z':
                             result.append(stat)
-                    except FileNotFoundError:
+                    except (FileNotFoundError, ProcessLookupError):
                         pass
                 return result
             if not members():
@@ -180,7 +180,7 @@ class Lifecycle:
             for stat in Path('/proc').glob('[0-9]*/stat'):
                 try:
                     fields = stat.read_text().rsplit(')', 1)[1].split()
-                except FileNotFoundError:
+                except (FileNotFoundError, ProcessLookupError):
                     continue
                 if int(fields[2]) == child.pid and fields[0] != 'Z':
                     live = True

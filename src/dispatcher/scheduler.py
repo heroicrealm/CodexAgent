@@ -131,6 +131,20 @@ class Dispatcher:
                         'SELECT * FROM attempts WHERE repository=? AND number=? AND (codex_started=1 OR initial_sha IS NOT NULL) ORDER BY rowid DESC LIMIT 1',
                         (current['repository'], current['number'])).fetchone()
                     if previous and self.store.db.execute("SELECT 1 FROM stop_requests WHERE attempt_id=? AND active=0", (previous['attempt_id'],)).fetchone():
+                        sources = self.store.db.execute('SELECT * FROM task_pull_requests WHERE issue_id=?', (current['issue_id'],)).fetchall()
+                        if len(sources) > 1:
+                            raise TaskError('pr_identity_conflict', 'GITHUB')
+                        for source in sources:
+                            remote_pr = self.adapter.request(f'repos/{project.repository}/pulls/{source["pr_number"]}')
+                            if (not isinstance(remote_pr, dict) or remote_pr.get('id') != source['pr_id'] or
+                                    remote_pr.get('number') != source['pr_number'] or
+                                    remote_pr.get('head', {}).get('ref') != previous['branch'] or
+                                    remote_pr.get('base', {}).get('ref') != preparation_project.base_branch or
+                                    remote_pr.get('head', {}).get('repo', {}).get('id') != current['repository_id'] or
+                                    remote_pr.get('base', {}).get('repo', {}).get('id') != current['repository_id'] or
+                                    remote_pr.get('merged') is not False or remote_pr.get('merged_at') or
+                                    remote_pr.get('state') not in ('open', 'closed')):
+                                raise TaskError('pr_identity_conflict', 'GITHUB')
                         issue['detach_attempt'] = previous['attempt_id']
                         previous = None
                     if previous:
