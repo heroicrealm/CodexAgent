@@ -61,7 +61,7 @@ def test_task_json_utf8_and_unchanged_storage(unicode_task, command):
     if command == 'queue':
         assert set(row) == set(before)
     else:
-        extra = {'stop_requests', 'stop_outbox', 'configuration_errors', 'terminal_errors', 'cleanup_jobs', 'decisions', 'command_diagnostics', 'attempts', 'quota', 'result_publication', 'pull_requests', 'pr_resolutions', 'pr_sync_operations'}
+        extra = {'detach_publications', 'stop_requests', 'stop_outbox', 'configuration_errors', 'terminal_errors', 'cleanup_jobs', 'decisions', 'command_diagnostics', 'attempts', 'quota', 'result_publication', 'pull_requests', 'pr_resolutions', 'pr_sync_operations'}
         assert set(row) == set(before) | extra
         assert all(row[key] == [] for key in extra)
     store = Store(config.workspace / '.runtime' / 'tasks.sqlite3')

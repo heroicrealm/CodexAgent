@@ -181,22 +181,55 @@ class StopController:
                        (now(), stop['request_id']))
         return True
 
+    def detach_actor(self, stop, proof):
+        """Only a complete GitHub timeline at/before the stop observation is proof."""
+        from dispatcher.queue import timestamp
+        fallback = 'Не удалось определить'
+        try:
+            project = next(p for p in self.config.projects if p.repository.casefold() == stop['repository'])
+            events, issue = self.adapter.command_events(project, stop['number'])
+            if issue['databaseId'] != stop['issue_id'] or issue['labels']['pageInfo']['hasNextPage']:
+                return fallback
+            observed = timestamp(proof['observed_at'])
+            if observed.tzinfo is None:
+                return fallback
+            relevant = [e for e in events if e.get('event') in ('labeled', 'unlabeled')
+                and e.get('label', {}).get('name', '').casefold() == project.task_label.casefold()
+                and timestamp(e['created_at']).tzinfo is not None and timestamp(e['created_at']) <= observed]
+            latest = max(relevant, key=lambda e: (timestamp(e['created_at']), e['id']), default=None)
+            actor = (latest or {}).get('actor') or {}
+            if latest and latest['event'] == 'unlabeled' and actor.get('type') == 'User' and re.fullmatch(r'[A-Za-z0-9-]{1,39}', actor.get('login', '')):
+                return actor['login']
+        except (GitHubError, KeyError, TypeError, ValueError, StopIteration, AttributeError):
+            pass
+        return fallback
+
     def diagnostics(self):
         """One durable, reconcilable comment; pending cleanup is explicitly reported.
 
         Later cleanup progress edits the same comment, never creates a second one.
         """
         db = self.store.db
-        for stop in db.execute("SELECT s.*,t.repository,t.number FROM stop_requests s JOIN tasks t USING(issue_id) WHERE reason='emergency_stop'").fetchall():
+        for stop in db.execute("SELECT s.*,t.repository,t.number FROM stop_requests s JOIN tasks t USING(issue_id) WHERE reason IN ('emergency_stop','ready_removed')").fetchall():
             cleanup = db.execute('SELECT state,last_error FROM cleanup_jobs WHERE issue_id=? AND generation=? AND version=?',
                                  (stop['issue_id'], stop['iteration_id'] or 0, stop['version'])).fetchone()
             attempt = db.execute('SELECT * FROM attempts WHERE attempt_id=?', (stop['attempt_id'],)).fetchone()
-            published = dict(branch=attempt['branch'], sha=attempt['result_sha'], remote_sha=attempt['remote_sha'], pushed=attempt['pushed']) if attempt else {}
-            if published and (not re.fullmatch(r'[A-Za-z0-9_./-]{1,200}', published['branch']) or re.search(r'(?:gh[pousr]_|github_pat_|sk-|AKIA)', published['branch'])):
+            published = dict(branch=attempt['branch'], sha=attempt['result_sha'], remote_sha=attempt['remote_sha'], pushed=attempt['pushed']) if attempt else dict(branch=self.store.branches(stop['repository'], stop['number'])['work_branch'], sha=None)
+            if published.get('branch') and (not re.fullmatch(r'[A-Za-z0-9_./-]{1,200}', published['branch']) or re.search(r'(?:gh[pousr]_|github_pat_|sk-|AKIA)', published['branch'])):
                 published['branch'] = '[redacted]'
             prs = [r[0] for r in db.execute('SELECT pr_number FROM task_pull_requests WHERE issue_id=?', (stop['issue_id'],))]
             prs += [r[0] for r in db.execute('SELECT p.pr_number FROM attempt_publications p JOIN attempts a USING(attempt_id) WHERE a.repository=? AND a.number=?', (stop['repository'], stop['number'])) if r[0] not in prs]
-            body = ('Emergency stop\n' + json.dumps(dict(reason=stop['reason'], previous_state=stop['previous_state'],
+            proof = json.loads(stop['evidence'])
+            if stop['reason'] == 'ready_removed' and 'detach_actor' not in proof:
+                proof['detach_actor'] = self.detach_actor(stop, proof)
+                with db:
+                    db.execute('UPDATE stop_requests SET evidence=? WHERE request_id=?',
+                               (json.dumps(proof), stop['request_id']))
+            publication = db.execute('SELECT * FROM detach_publications WHERE request_id=?', (stop['request_id'],)).fetchone()
+            body = (('Tracking stopped' if stop['reason'] == 'ready_removed' else 'Emergency stop') + '\n' + json.dumps(dict(
+                utc_time=stop['requested_at'], actor=proof.get('detach_actor', 'Не удалось определить'),
+                detach_publication=dict(publication) if publication else {'state':'pending'},
+                reason=stop['reason'], previous_state=stop['previous_state'],
                 stage=stop['stage'], attempt=stop['attempt_id'], method=stop['method'],
                 process_status=stop['process_status'], cleanup=dict(cleanup) if cleanup else {'state':'pending'},
                 published=published, prs=prs, error=stop['error'],

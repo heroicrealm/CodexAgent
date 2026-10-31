@@ -165,7 +165,9 @@ def test_received_command_cannot_commit_after_cycle_and_restart(store):
 def test_old_pr_intent_cannot_publish_after_reattach(publication):
     publisher, execution, attempt, api, git, _ = publication
     store = execution.store
-    # Fixture records a worktree path but creates no filesystem artifacts.
+    # This stale-intent unit test has no filesystem result to publish.
+    # Actual owned Git publication/cleanup is covered by test_detach_publication.
+    execution.update(attempt, worktree=None, initial_sha=None, origin_url=None)
     detach(store, 10)
     store.apply(PROJECT, [snapshot(11)])
     assert store.confirm(PROJECT.repository, 1, 1)

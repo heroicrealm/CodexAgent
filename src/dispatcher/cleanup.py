@@ -104,18 +104,8 @@ class CleanupService:
     def cleanup(self, project, row):
         owned = self.owned_row(project, row)
         if row['state'] == 'detached':
-            attempt = self.store.db.execute(
-                'SELECT * FROM attempts WHERE repository=? AND number=? ORDER BY rowid DESC LIMIT 1',
-                (row['repository'], row['number'])).fetchone()
-            repo, _, worktree = self.manager.paths(project, row['number'])
-            # A missing worktree cannot attest to the current local branch tip.
-            # Leave legacy/ref-only verification to preparation in that case.
-            if attempt and attempt['initial_sha'] and worktree.exists():
-                ref = self.manager.git(repo, 'rev-parse', '--verify', 'refs/heads/' + attempt['branch'], check=False)
-                sha = ref.stdout.strip() if ref.returncode == 0 else None
-                with self.store.db:
-                    self.store.db.execute('INSERT OR IGNORE INTO detach_refs VALUES(?,?,?,?)',
-                        (attempt['attempt_id'], attempt['branch'], sha, 'archive/detach/' + attempt['attempt_id']))
+            from dispatcher.detach_publication import publish
+            publish(self, project, row)
         TaskWorkspaceCleanup(self.manager).cleanup(project, owned)
 
     def tick(self, project_id=None, stop=None):
@@ -189,6 +179,14 @@ class CleanupService:
                     with db:
                         db.execute("UPDATE cleanup_jobs SET state='completed',completed_at=?,updated_at=?,last_error=NULL,next_retry_at=NULL WHERE cleanup_id=?",
                                    (self.clock().isoformat(), self.clock().isoformat(), job['cleanup_id']))
+                        if row['state'] == 'detached':
+                            publication = db.execute('''SELECT p.* FROM detach_publications p
+                                JOIN stop_requests s USING(request_id) WHERE s.issue_id=? AND s.iteration_id IS ?
+                                AND s.version=? AND p.state='confirmed' ''',
+                                (row['issue_id'], row['current_iteration_id'], row['version'])).fetchone()
+                            if publication and publication['sha']:
+                                db.execute('UPDATE attempts SET result_sha=?,remote_sha=?,pushed=1 WHERE attempt_id=?',
+                                           (publication['sha'], publication['remote_sha'], job['attempt_id']))
                         db.execute('UPDATE cancellations SET cleaned=1 WHERE issue_id=?', (row['issue_id'],))
                     self.log(project, job, count, 'completed')
             finally:

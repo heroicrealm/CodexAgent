@@ -107,7 +107,7 @@ class PullRequestPublisher:
             repeated = self.store.db.execute('SELECT iteration_number FROM task_iterations WHERE iteration_id=?',
                                              (iteration,)).fetchone()[0] > 1
             if self.store.db.execute('SELECT 1 FROM stop_requests WHERE issue_id=? AND active=0', (task['issue_id'],)).fetchone():
-                repeated = False
+                repeated = prior is not None
             if repeated and prior is None:
                 raise TaskError('pr_identity_conflict', 'GITHUB')
             if task['state'] not in ('running', 'review'):

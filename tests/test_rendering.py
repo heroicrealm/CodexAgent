@@ -119,6 +119,7 @@ def test_show_json_populated_sections(unicode_task, capsys):
     expected['attempts'] = [dict(r) for r in store.db.execute('SELECT * FROM attempts')]
     expected['stop_requests'] = []
     expected['stop_outbox'] = []
+    expected['detach_publications'] = []
     expected['configuration_errors'] = []
     expected['terminal_errors'] = []
     expected['cleanup_jobs'] = []

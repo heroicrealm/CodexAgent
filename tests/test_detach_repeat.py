@@ -1,4 +1,4 @@
-"""Detach restart uses a fresh base, with real refs and durable cleanup evidence."""
+"""Detach reuses its published canonical SHA; ambiguity preserves refs."""
 import json
 from dataclasses import replace
 from pathlib import Path
@@ -37,15 +37,18 @@ def detached(env, request):
     finish(d)
     old = d.execution.get(attempt)
     repo, _, worktree = d.git.paths(project, 1)
-    # Both committed and dirty abandoned output must disappear from the new run.
-    (worktree / 'abandoned.txt').write_text('abandoned commit')
+    # Both committed and dirty output must survive on the canonical remote.
+    (worktree / 'abandoned.txt').write_text('saved commit')
     git(worktree, 'add', '.')
-    git(worktree, 'commit', '-m', 'Abandoned result')
-    (worktree / 'dirty.txt').write_text('abandoned')
-    old_sha = git(worktree, 'rev-parse', 'HEAD')
+    git(worktree, 'commit', '-m', 'Saved result')
+    (worktree / 'dirty.txt').write_text('saved dirty output')
     CleanupService(config, d.store).tick()
     assert not worktree.exists()
     assert d.store.db.execute('SELECT state FROM cleanup_jobs').fetchone()[0] == 'completed'
+    old = d.execution.get(attempt)
+    old_sha = old['result_sha']
+    assert git(remote, 'rev-parse', old['branch']) == old_sha
+    control.write_text(json.dumps({'exec': 'dirty'}))
     (seed / 'fresh.txt').write_text('fresh base')
     git(seed, 'add', '.')
     git(seed, 'commit', '-m', 'Advance base')
@@ -80,34 +83,37 @@ def test_exact_git_failure_reproduced(detached):
     assert any(r.get('reason') == 'branch_already_exists' and r.get('action') == 'worktree' for r in records)
 
 
-def test_fresh_base_archive_and_full_lifecycle(detached):
+def test_published_sha_and_full_lifecycle(detached):
     d, project, items, old, old_sha, base = detached
     d.admit()
     assert len(d.active) == 1
     attempt = next(iter(d.active))
     current = d.execution.get(attempt)
-    assert current['initial_sha'] == base
+    assert current['initial_sha'] == old_sha
     worktree = Path(current['worktree'])
-    assert (worktree / 'fresh.txt').exists()
-    assert not (worktree / 'dirty.txt').exists()
-    repo, _, _ = d.git.paths(project, 1)
-    assert git(repo, 'rev-parse', 'archive/detach/' + old['attempt_id']) == old_sha
+    assert (worktree / 'dirty.txt').read_text() == 'saved dirty output'
+    assert (worktree / 'abandoned.txt').exists()
+    assert not (worktree / 'fresh.txt').exists()
     finish(d)
     assert d.store.queue()[0]['state'] == 'review'
     assert d.execution.get(attempt)['pushed']
 
 
-@pytest.mark.parametrize('failure', ['foreign', 'archive', 'remote', 'cleanup', 'identity', 'project'])
+@pytest.mark.parametrize('failure', ['foreign', 'remote', 'missing_remote', 'cleanup', 'identity', 'project', 'legacy', 'missing_ref'])
 def test_conflicts_preserve_refs(detached, failure):
     d, project, _, old, old_sha, base = detached
     repo, _, _ = d.git.paths(project, 1)
-    archive = 'archive/detach/' + old['attempt_id']
     if failure == 'foreign':
         git(repo, 'update-ref', 'refs/heads/' + old['branch'], base)
-    elif failure == 'archive':
-        git(repo, 'branch', archive, base)
     elif failure == 'remote':
-        git(repo, 'push', 'origin', old['branch'])
+        git(repo, 'push', 'origin', 'main:refs/heads/' + old['branch'], '--force')
+    elif failure == 'missing_remote':
+        git(repo, 'push', 'origin', '--delete', old['branch'])
+    elif failure == 'missing_ref':
+        git(repo, 'update-ref', '-d', 'refs/heads/' + old['branch'])
+    elif failure == 'legacy':
+        with d.store.db:
+            d.store.db.execute('DELETE FROM detach_publications')
     elif failure == 'cleanup':
         with d.store.db:
             d.store.db.execute("UPDATE cleanup_jobs SET state='pending'")
@@ -116,7 +122,6 @@ def test_conflicts_preserve_refs(detached, failure):
             d.store.db.execute("UPDATE stop_requests SET process_status='unconfirmed'")
     else:
         project = replace(project, id='another-project')
-        # Use the same repo explicitly to exercise identity rather than clone.
         other, _, _ = d.git.paths(project, 1)
         other.parent.mkdir(parents=True, exist_ok=True)
         git(repo.parent, 'clone', '--no-checkout', str(repo), str(other))
@@ -126,7 +131,7 @@ def test_conflicts_preserve_refs(detached, failure):
     assert git(repo, 'show-ref', '--heads') == before
 
 
-def test_crash_after_rename_and_restart(detached, monkeypatch):
+def test_crash_before_worktree_add_and_restart(detached, monkeypatch):
     d, project, _, old, old_sha, base = detached
     manager = GitWorkspaceManager(d.config, execution=d.execution)
     original = manager.git
@@ -137,32 +142,16 @@ def test_crash_after_rename_and_restart(detached, monkeypatch):
     monkeypatch.setattr(manager, 'git', crash)
     with pytest.raises(TaskError, match='injected_crash'):
         manager.prepare(project, dict(detached[2][0], detach_attempt=old['attempt_id']), old['branch'])
-    # Reopen SQLite as a restarted process; journal and renamed ref must agree.
     from dispatcher.storage import Store
     from dispatcher.execution_store import ExecutionStore
     restarted = Store(d.config.workspace / '.runtime' / 'tasks.sqlite3')
     try:
         fresh = GitWorkspaceManager(d.config, execution=ExecutionStore(restarted))
         path, sha = fresh.prepare(project, dict(detached[2][0], detach_attempt=old['attempt_id']), old['branch'])
-        assert sha == base
-        assert not (path / 'result.txt').exists()
-        repo, _, _ = fresh.paths(project, 1)
-        assert git(repo, 'rev-parse', 'archive/detach/' + old['attempt_id']) == old_sha
-        assert len(git(repo, 'branch', '--list', 'archive/detach/*').splitlines()) == 1
+        assert sha == old_sha
+        assert (path / 'dirty.txt').exists()
     finally:
         restarted.close()
-
-
-def test_absent_ref_creates_no_archive(detached):
-    d, project, _, old, _, base = detached
-    repo, _, _ = d.git.paths(project, 1)
-    git(repo, 'update-ref', '-d', 'refs/heads/' + old['branch'])
-    with d.store.db:
-        d.store.db.execute('UPDATE detach_refs SET sha=NULL')
-    path, sha = prepare_again(detached)
-    assert sha == base
-    assert not git(repo, 'branch', '--list', 'archive/detach/*')
-    assert not (path / 'result.txt').exists()
 
 
 @pytest.mark.parametrize('detached', ['custom'], indirect=True)
@@ -170,13 +159,11 @@ def test_custom_base_and_branch(detached):
     d, project, _, old, old_sha, base = detached
     path, sha = prepare_again(detached)
     assert old['branch'] == 'tasks/custom-42'
-    assert sha == base
+    assert sha == old_sha
     assert git(path, 'symbolic-ref', '--short', 'HEAD') == 'tasks/custom-42'
-    repo, _, _ = d.git.paths(project, 1)
-    assert git(repo, 'rev-parse', 'archive/detach/' + old['attempt_id']) == old_sha
 
 
-def test_second_detach_archives_each_iteration(detached):
+def test_second_detach_preserves_each_iteration(detached):
     d, project, items, old, old_sha, base = detached
     d.admit()
     second = next(iter(d.active))
@@ -184,40 +171,26 @@ def test_second_detach_archives_each_iteration(detached):
     d.adapter.response_date = '2026-10-24T00:12:00Z'
     d.stops.observe(project, d.store.queue()[0])
     finish(d)
-    assert d.store.queue()[0]['state'] == 'detached'
     CleanupService(d.config, d.store).tick()
+    second_sha = d.execution.get(second)['result_sha']
     items[0] = issue(project, server_observed_at='2026-10-24T00:13:00Z')
     d.store.apply(project, items)
     assert d.store.confirm(project.repository, 1, 1)
     d.admit()
     assert len(d.active) == 1
     third = next(iter(d.active))
-    assert d.execution.get(third)['initial_sha'] == base
-    repo, _, _ = d.git.paths(project, 1)
-    assert len(git(repo, 'branch', '--list', 'archive/detach/*').splitlines()) == 2
-    assert git(repo, 'rev-parse', 'archive/detach/' + old['attempt_id']) == old_sha
+    assert d.execution.get(third)['initial_sha'] == second_sha
+    assert d.execution.get(old['attempt_id'])['result_sha'] == old_sha
     finish(d)
     assert d.execution.get(third)['pushed']
 
 
-def test_legacy_completed_cleanup(detached):
-    d, project, _, old, old_sha, base = detached
-    with d.store.db:
-        d.store.db.execute('DELETE FROM detach_refs')
-    path, sha = prepare_again(detached)
-    assert sha == base
-    assert not (path / 'abandoned.txt').exists()
-    repo, _, _ = d.git.paths(project, 1)
-    assert git(repo, 'rev-parse', 'archive/detach/' + old['attempt_id']) == old_sha
-
-
-def test_missing_base_does_not_archive(detached):
+def test_missing_base_preserves_branch(detached):
     d, project, _, old, old_sha, _ = detached
     with pytest.raises(TaskError, match='base_branch_missing'):
         prepare_again(detached, replace(project, base_branch='missing-base'))
     repo, _, _ = d.git.paths(project, 1)
     assert git(repo, 'rev-parse', old['branch']) == old_sha
-    assert not git(repo, 'branch', '--list', 'archive/detach/*')
 
 
 def test_active_worktree_preserved(detached, tmp_path):
@@ -228,26 +201,3 @@ def test_active_worktree_preserved(detached, tmp_path):
     with pytest.raises(TaskError, match='detach_active_worktree'):
         prepare_again(detached)
     assert git(elsewhere, 'rev-parse', 'HEAD') == old_sha
-
-
-def test_legacy_replaced_ref_fails_closed(detached):
-    d, project, _, old, _, base = detached
-    repo, _, _ = d.git.paths(project, 1)
-    with d.store.db:
-        d.store.db.execute('DELETE FROM detach_refs')
-    git(repo, 'update-ref', 'refs/heads/' + old['branch'], base)
-    with pytest.raises(TaskError, match='detach_branch_ownership_conflict'):
-        prepare_again(detached)
-    assert git(repo, 'rev-parse', old['branch']) == base
-    assert not git(repo, 'branch', '--list', 'archive/detach/*')
-
-
-def test_legacy_absent_ref_creates_no_archive(detached):
-    d, project, _, old, _, base = detached
-    repo, _, _ = d.git.paths(project, 1)
-    with d.store.db:
-        d.store.db.execute('DELETE FROM detach_refs')
-    git(repo, 'update-ref', '-d', 'refs/heads/' + old['branch'])
-    _, sha = prepare_again(detached)
-    assert sha == base
-    assert not git(repo, 'branch', '--list', 'archive/detach/*')

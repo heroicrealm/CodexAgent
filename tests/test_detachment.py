@@ -68,7 +68,7 @@ def test_completed_results_survive_stop(store, state):
     assert store.stop_requested(store.queue()[0])
 
 
-def test_running_detach_natural_exit_no_publication_dirty_cleanup(env):
+def test_running_detach_natural_exit_publication_before_cleanup(env):
     config, project, control, *_ = env
     stub = config.executable
     Path(stub).write_text(Path(stub).read_text().replace("if mode == 'sleep': time.sleep(60)", "if mode == 'sleep': time.sleep(.3)").replace("if mode != 'dirty':", "if mode not in ('dirty','sleep'):"))
@@ -97,6 +97,8 @@ def test_running_detach_natural_exit_no_publication_dirty_cleanup(env):
         assert not d.execution.db.execute('SELECT * FROM task_pull_requests').fetchall()
         CleanupService(config, d.store).tick()
         assert not task['worktree'].exists()
+        published = d.execution.get(attempt)
+        assert published['pushed'] and published['remote_sha'] == published['result_sha']
         assert d.store.db.execute('SELECT state FROM cleanup_jobs').fetchone()[0] == 'completed'
         # New cycle retains history, and reserves a fresh approved iteration.
         old_iteration = saved['iteration_id']
@@ -356,16 +358,17 @@ def test_stale_snapshot_cannot_reattach_and_dirty_unknown_artifact_preserved(env
             d.store.db.execute('UPDATE cleanup_jobs SET next_retry_at=NULL')
         cleanup.tick()
         assert not worktree.exists()
-        # No remote branch is deleted, and reconnect cannot overwrite it.
+        # Reconnect preserves the published canonical branch and previous PR.
+        published = d.store.db.execute('SELECT * FROM attempts').fetchone()
         d.store.apply(project,[issue(project,server_observed_at='2026-10-24T00:21:00Z')])
         assert d.store.confirm(project.repository,1,1)
         d.admit()
-        assert not d.active
-        assert d.store.db.execute('SELECT count(*) FROM attempts').fetchone()[0]==2
-        latest = d.store.db.execute('SELECT * FROM attempts ORDER BY rowid DESC LIMIT 1').fetchone()
-        assert latest['error_code'] == 'detach_remote_branch_conflict'
-        assert not latest['codex_started']
-        assert git(env[4], 'rev-parse', latest['branch']) == git(d.git.paths(project, 1)[0], 'rev-parse', latest['branch'])
+        assert d.active
+        latest = d.execution.get(next(iter(d.active)))
+        assert latest['initial_sha'] == published['result_sha']
+        assert (Path(latest['worktree']) / 'dirty').read_text() == 'owned content'
+        finish(d)
+        assert d.store.db.execute('SELECT count(*) FROM task_pull_requests').fetchone()[0] == 1
     finally:
         d.lifecycle.cancel()
         d.close()
