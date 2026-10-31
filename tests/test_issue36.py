@@ -310,6 +310,8 @@ def test_preparation_failure_returns_discovered(env, problem):
     if problem == 'foreign':
         git(seed, 'branch', 'foreign')
         git(seed, 'push', str(remote), 'foreign')
+        repo = config.workspace / project.id / 'repository'
+        git(repo, 'branch', 'foreign', 'origin/main')
         body = '```codex-config\nbranch_name: foreign\n```'
     if problem == 'yaml': body = '```codex-config\nbranch_name: [\n```'
     api = adapter([issue(project, body=body)])

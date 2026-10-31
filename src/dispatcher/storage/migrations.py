@@ -436,3 +436,12 @@ def upgrade612(db):
         state TEXT NOT NULL DEFAULT 'pending', sha TEXT, remote_sha TEXT,
         no_diff INTEGER, error TEXT, confirmed_at TEXT)''')
     db.execute('INSERT OR IGNORE INTO schema_migrations VALUES(612)')
+
+
+def upgrade613(db):
+    """Add nullable preparation provenance, preserving historical attempts."""
+    columns = {r[1] for r in db.execute('PRAGMA table_info(attempts)')}
+    for name, kind in [('source_base_branch', 'TEXT'), ('branch_existed', 'INTEGER')]:
+        if name not in columns:
+            db.execute(f'ALTER TABLE attempts ADD COLUMN {name} {kind}')
+    db.execute('INSERT OR IGNORE INTO schema_migrations VALUES(613)')

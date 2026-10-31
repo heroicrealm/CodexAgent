@@ -2,46 +2,18 @@
 import fcntl
 import hashlib
 import json
-import re
 from pathlib import Path
 
-import yaml
-from dispatcher.github import GitHubError, valid_branch
+from dispatcher.github import GitHubError
 from dispatcher.storage import now
-from dispatcher.workspace import TaskError
 
 
 CODES = frozenset(('invalid_branch', 'invalid_codex_config', 'base_branch_missing', 'branch_ownership_conflict', 'default_branch_protected'))
 
 
 def parameters(body):
-    class UniqueLoader(yaml.SafeLoader):
-        pass
-    def mapping(loader, node):
-        result = {}
-        for key, value in node.value:
-            name = loader.construct_object(key)
-            if not isinstance(name, str) or name in result:
-                raise ValueError('duplicate or non-string key')
-            result[name] = loader.construct_object(value)
-        return result
-    UniqueLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, mapping)
-    blocks = re.findall(r'^```codex-config[^\S\n]*\n(.*?)^```[^\S\n]*$', body or '', re.M | re.S)
-    if not blocks:
-        if re.search(r'^```codex-config\b', body or '', re.M):
-            raise TaskError('invalid_codex_config', 'GIT')
-        return {}
-    try:
-        if len(blocks) != 1:
-            raise ValueError
-        value = yaml.load(blocks[0], Loader=UniqueLoader)
-        if not isinstance(value, dict) or value.keys() - {'base_branch', 'branch_name'}:
-            raise ValueError
-        if any(not isinstance(v, str) or not valid_branch(v) for v in value.values()):
-            raise ValueError
-        return value
-    except (ValueError, TypeError, yaml.YAMLError):
-        raise TaskError('invalid_codex_config', 'GIT') from None
+    from dispatcher.issue_parameters import parse
+    return parse(body)[0]
 
 
 def blocked(store, row):
@@ -68,6 +40,16 @@ def record(store, row, code):
                    (row['issue_id'], row['content_hash'], code, now(), body, 0))
         db.execute("UPDATE attempts SET state='failed',error_code=?,category='GIT',finished_at=? WHERE repository=? AND number=? AND iteration_id=? AND codex_started=0 AND state='running'",
                    (code, now(), row['repository'], row['number'], row['current_iteration_id']))
+        # Historical contradictory claims can prohibit all task UPDATEs via
+        # ownership triggers. Keep the diagnostic/outbox without altering refs.
+        if code == 'branch_ownership_conflict' and db.execute(
+                '''SELECT 1 FROM attempts a JOIN tasks t USING(repository,number)
+                   WHERE a.repository=? AND a.number!=? AND a.branch=?
+                   AND (a.state='running' OR t.state NOT IN ('done','cancelled','revoked'))''',
+                (row['repository'], row['number'], current['work_branch'])).fetchone():
+            store._history(row['repository'], row['number'], row['version'],
+                           'configuration_error', json.dumps(dict(code=code)), now())
+            return
         store._set_state(current, 'discovered', None)
         if not db.execute('SELECT 1 FROM attempts WHERE repository=? AND number=? AND initial_sha IS NOT NULL',
                           (row['repository'], row['number'])).fetchone():

@@ -24,13 +24,15 @@ class CodexExecutor:
         self.checked = True
 
     def start(self, issue, branch, paths, worktree, task, attempt, before_exec=None):
+        from dispatcher.issue_parameters import parse
+        _, task_body = parse(issue["body"])
         self.check()
         prompt = ('Implement this approved GitHub Issue. Work on branch ' + branch + '.\n'
                   'Run available tests and create a Git commit. Do not push, change GitHub Issues, create PRs or merge.\n'
                   'Only if the approved body explicitly contains No-op allowed: may you leave HEAD unchanged; '
                   'then explain in your final message using NO_OP: <reason>.\n'
                   'Use the following local attachments (outside the repository):\n' + json.dumps(paths) +
-                  '\nApproved title:\n' + issue['title'] + '\nApproved body:\n' + issue['body'])
+                  '\nApproved title:\n' + issue['title'] + '\nApproved body:\n' + task_body)
         # Keep Issue text out of argv and the shared structured log.
         register_artifacts(self.config.workspace, task, f'{attempt}.prompt', f'{attempt}.codex.log')
         prompt_path = task / f'{attempt}.prompt'

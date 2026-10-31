@@ -139,7 +139,7 @@ DETAIL_FIELDS = {
     'cleanup_jobs': ('cleanup_id', 'generation', 'state', 'attempts', 'created_at', 'updated_at', 'started_at', 'completed_at', 'next_retry_at', 'last_error'),
     'decisions': ('id', 'version', 'action', 'source', 'result', 'event_id', 'created_at'),
     'command_diagnostics': ('action', 'event_id', 'reason'),
-    'attempts': ('attempt_id', 'iteration_id', 'previous_attempt_id', 'version', 'branch', 'state', 'started_at', 'finished_at',
+    'attempts': ('attempt_id', 'iteration_id', 'previous_attempt_id', 'version', 'branch', 'source_base_branch', 'branch_existed', 'state', 'started_at', 'finished_at',
                  'duration', 'initial_sha', 'result_sha', 'remote_sha', 'exit_code',
                  'error_code', 'category', 'codex_started', 'pushed', 'recovery_diagnostic'),
     'pull_requests': ('pr_id', 'pr_number', 'iteration_id', 'url', 'state', 'head', 'head_sha', 'merged_at'),
@@ -160,7 +160,7 @@ def render_show(value, format='table', stream=None):
               f'Repository: {value.get("repository", "(unavailable)")}']
     lines = [f'Issue: #{value.get("number", "(unavailable)")}']
     for label, data, key in [('Title', issue, 'title'), ('Status', value, 'state'),
-                             ('Branch', issue, 'target_branch'), ('Author', issue, 'author'),
+                             ('Branch', dict(issue, target_branch=value.get('work_branch') or issue.get('target_branch')), 'target_branch'), ('Author', issue, 'author'),
                              ('Version', value, 'version'), ('Current iteration', value, 'current_iteration_id'), ('Approved version', value, 'approved_version'),
                              ('Available', value, 'available'), ('Created', value, 'created_at'),
                              ('Synced', value, 'synced_at')]:

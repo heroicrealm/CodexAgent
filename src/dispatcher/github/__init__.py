@@ -126,13 +126,14 @@ class Adapter:
                     title, body = raw['title'], raw.get('body') or ''
                     if not all(isinstance(v, str) for v in (title, body, author, raw['updated_at'], raw['html_url'], raw['state'], *labels)):
                         raise ValueError
-                    # A declarative field, never an instruction or shell fragment.
-                    branches = re.findall(r'^(?:Target branch|Целевая ветка):[ \t]*(.*?)[ \t]*$', body, re.MULTILINE | re.IGNORECASE)
-                    if len(branches) > 1:
-                        raise GitHubError('Ambiguous target branch')
-                    branch = branches[0] if branches else project.base_branch
-                    if not valid_branch(branch):
-                        raise GitHubError('Invalid target branch')
+                    # Preserve malformed bodies for per-Issue preparation diagnostics.
+                    from dispatcher.issue_parameters import parse
+                    from dispatcher.workspace import TaskError
+                    try:
+                        params, _ = parse(body)
+                        branch = params.get('branch_name', project.base_branch)
+                    except TaskError:
+                        branch = project.base_branch
                     item = dict(id=raw['id'], repository_id=repository_id, number=number, repository=project.repository.casefold(),
                                 project_id=project.id, title=title, body=body, author=author,
                                 state=raw['state'], labels=labels, updated_at=raw['updated_at'],
