@@ -178,9 +178,13 @@ class GitWorkspaceManager:
             raise TaskError('default_branch_unavailable', 'GIT') from None
 
     def branch(self, project, issue):
-        branch = issue['target_branch']
+        from dispatcher.issue_parameters import parse
+        params, _ = parse(issue['body'])
+        branch = params.get('branch_name', f'codex/issue-{issue["number"]}')
         self.validate_branch(branch)
-        return f'codex/issue-{issue["number"]}' if branch in (project.base_branch, self.default_branch(project)) else branch
+        if branch in (project.base_branch, self.default_branch(project)):
+            raise TaskError('default_branch_protected', 'GIT')
+        return branch
 
     def validate_branch(self, branch):
         if self.operation_guard:
@@ -232,10 +236,14 @@ class GitWorkspaceManager:
         except TaskError:
             raise TaskError('fetch_failed', 'GIT') from None
         actual_default = self.default_branch(project)
-        if branch == actual_default:
+        protected_base = next((p.base_branch for p in self.config.projects if p.id == project.id), project.base_branch)
+        if branch in (actual_default, protected_base):
             raise TaskError('default_branch_protected', 'GIT')
         remote = f'refs/remotes/origin/{branch}'
         exists = self.git(repo, 'show-ref', '--verify', remote, check=False).returncode == 0
+        if self.execution and self.operation_attempt:
+            self.execution.update(self.operation_attempt, branch_existed=int(exists),
+                                  source_base_branch=None if exists else project.base_branch)
         if issue.get('repeat_branch'):
             if not exists:
                 raise TaskError('remote_branch_missing', 'GIT')
@@ -261,11 +269,11 @@ class GitWorkspaceManager:
                 self.git(repo, 'worktree', 'add', str(worktree), branch)
                 worktree.chmod(0o700)
                 return worktree, self.git(worktree, 'rev-parse', 'HEAD').stdout.strip()
-        if exists and not issue.get('retry_sha'):
-            raise TaskError('branch_ownership_conflict', 'GIT')
-        if self.git(repo, 'show-ref', '--verify', f'refs/remotes/origin/{project.base_branch}', check=False).returncode:
+        if not exists and self.git(repo, 'show-ref', '--verify', f'refs/remotes/origin/{project.base_branch}', check=False).returncode:
             raise TaskError('base_branch_missing', 'GIT')
-        base = issue.get('retry_sha') or f'refs/remotes/origin/{project.base_branch}'
+        base = issue.get('retry_sha') or (remote if exists else f'refs/remotes/origin/{project.base_branch}')
+        if self.git(repo, 'show-ref', '--verify', 'refs/heads/' + branch, check=False).returncode == 0:
+            raise TaskError('branch_ownership_conflict', 'GIT')
         if issue.get('retry_sha') and (exists or self.git(repo, 'show-ref', '--verify', 'refs/heads/' + branch, check=False).returncode == 0):
             raise TaskError('retry_workspace_conflict', 'GIT')
         # Never reset/reuse a pre-existing local branch or another task's history.
@@ -378,7 +386,8 @@ class GitWorkspaceManager:
         if expected_origin is not None and self.git(worktree, 'remote', 'get-url', 'origin').stdout.strip() != expected_origin:
             raise TaskError('origin_changed', 'GIT')
         self.validate_branch(branch)
-        if branch in (project.base_branch, self.default_branch(project)):
+        protected_base = next((p.base_branch for p in self.config.projects if p.id == project.id), project.base_branch)
+        if branch in (protected_base, self.default_branch(project)):
             raise TaskError('default_branch_protected', 'GIT')
         if before_push:
             before_push()

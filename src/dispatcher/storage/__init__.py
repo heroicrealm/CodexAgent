@@ -23,7 +23,7 @@ def content_hash(issue):
 
 class Store:
     def __init__(self, path):
-        from .migrations import prepare, initialize, upgrade604, upgrade605, upgrade606, upgrade607, upgrade608, upgrade609, upgrade610, upgrade611, upgrade612, VERSION
+        from .migrations import prepare, initialize, upgrade604, upgrade605, upgrade606, upgrade607, upgrade608, upgrade609, upgrade610, upgrade611, upgrade612, upgrade613, VERSION
         prepare(path)
         self.db = sqlite3.connect(path, timeout=30)
         os.chmod(path, 0o600)
@@ -45,6 +45,7 @@ class Store:
                 upgrade610(self.db)
                 upgrade611(self.db)
                 upgrade612(self.db)
+                upgrade613(self.db)
         except Exception:
             self.db.close()
             raise

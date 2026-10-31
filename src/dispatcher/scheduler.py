@@ -117,7 +117,7 @@ class Dispatcher:
                     try:
                         params = preparation_error.parameters(issue['body'])
                         preparation_project = replace(project, base_branch=current['base_branch'] or params.get('base_branch', project.base_branch))
-                        branch = params.get('branch_name') or self.git.branch(preparation_project, issue)
+                        branch = self.git.branch(project, issue)
                         self.git.validate_branch(branch)
                         self.git.validate_branch(preparation_project.base_branch)
                     except TaskError as exc:
@@ -126,6 +126,7 @@ class Dispatcher:
                             continue
                         if exc.code in preparation_error.CODES:
                             preparation_error.record(self.store, current, exc.code)
+                            continue
                         raise
                     previous = self.store.db.execute(
                         'SELECT * FROM attempts WHERE repository=? AND number=? AND (codex_started=1 OR initial_sha IS NOT NULL) ORDER BY rowid DESC LIMIT 1',
@@ -188,7 +189,7 @@ class Dispatcher:
                                 expected_version=current['version'], expected_iteration_id=current['current_iteration_id'],
                                 expected=self.store.branches(project.repository, current['number']),
                                 base_branch=preparation_project.base_branch, work_branch=branch,
-                                branch_source='generated' if branch != issue['target_branch'] else 'explicit',
+                                branch_source='explicit' if 'branch_name' in params else 'generated',
                                 branch_status='resolved'):
                             continue
                     if self.lifecycle.stopping:
@@ -196,6 +197,14 @@ class Dispatcher:
                     attempt = self.execution.reserve(current, branch, self.config.max_parallel_tasks,
                                                      current['observation_token'])
                     if not attempt:
+                        collision = self.store.db.execute("""SELECT 1 FROM tasks t
+                            LEFT JOIN attempts a ON a.repository=t.repository AND a.number=t.number
+                            WHERE t.repository=? AND t.number!=? AND
+                            ((a.branch=? AND a.state='running') OR
+                             (t.work_branch=? AND t.state NOT IN ('done','cancelled','revoked','detached')))
+                            LIMIT 1""", (current['repository'], current['number'], branch, branch)).fetchone()
+                        if collision:
+                            preparation_error.record(self.store, current, 'branch_ownership_conflict')
                         continue
                     self.cursor = (self.projects.index(project) + 1) % len(self.projects)
                     started = time.monotonic()
@@ -263,10 +272,14 @@ class Dispatcher:
                         self.attachments.operation_guard = None
                     break
                 except sqlite3.IntegrityError:
+                    preparation_error.record(self.store, current, 'branch_ownership_conflict')
                     event(self.config.logs / 'dispatcher.jsonl', 'admission_unavailable', level='WARN',
                           project=project.id, task=candidate['number'], reason='branch_ownership_conflict')
-                    break
+                    continue
                 except (GitHubError, TaskError) as exc:
+                    if isinstance(exc, TaskError) and exc.code in preparation_error.CODES:
+                        preparation_error.record(self.store, current, exc.code)
+                        continue
                     event(self.config.logs / 'dispatcher.jsonl', 'admission_unavailable', level='WARN', project=project.id,
                           task=candidate['number'], reason=exc.code if isinstance(exc, TaskError) else 'github_unavailable')
                     break

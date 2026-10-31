@@ -60,7 +60,7 @@ class ExecutionStore:
 
     def update(self, attempt, **values):
         allowed = {'worktree','initial_sha','result_sha','exit_code','codex_started','pushed','pid','process_identity',
-                   'origin_url','remote_sha','recovery_diagnostic'}
+                   'source_base_branch','branch_existed','origin_url','remote_sha','recovery_diagnostic'}
         if not values or not values.keys() <= allowed:
             raise ValueError('Invalid attempt update')
         with self.db:

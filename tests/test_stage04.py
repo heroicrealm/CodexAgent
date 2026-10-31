@@ -160,13 +160,9 @@ def test_worktree_existing_missing_default_and_push(env, branch):
         git(seed, 'branch', branch)
         git(seed, 'push', str(remote), branch)
     manager = GitWorkspaceManager(config)
-    item = issue(project, target_branch=branch)
+    item = issue(project, target_branch=branch, body='' if branch == 'main' else 'Target branch: ' + branch)
     actual = manager.branch(project, item)
     assert actual == ('codex/issue-1' if branch == 'main' else branch)
-    if branch == 'existing':
-        with pytest.raises(TaskError, match='branch_ownership_conflict'):
-            manager.prepare(project, item, actual)
-        return
     worktree, initial = manager.prepare(project, item, actual)
     (worktree / 'new').write_text('new')
     git(worktree, 'add', '.')
@@ -484,7 +480,7 @@ def test_outbox_uncertain_write_recovery_and_migration(env):
     try:
         execution = ExecutionStore(store)
         ExecutionStore(store)
-        assert [r[0] for r in store.db.execute('SELECT version FROM schema_migrations ORDER BY version')] == [1,2,3,602,604,605,606,607,608,609,610,611,612]
+        assert [r[0] for r in store.db.execute('SELECT version FROM schema_migrations ORDER BY version')] == [1,2,3,602,604,605,606,607,608,609,610,611,612,613]
         assert store.get(project.repository,1)['approved_version'] == 1
         api.pages.return_value = [dict(id=456,body=body)]
         TaskResultPublisher(execution,api).flush()
@@ -749,7 +745,8 @@ def test_default_branch_different_from_config_and_invalid_refs(env):
     git(remote,'branch','production','main')
     git(remote,'symbolic-ref','HEAD','refs/heads/production')
     manager=GitWorkspaceManager(config)
-    assert manager.branch(project,issue(project,target_branch='production'))=='codex/issue-1'
+    with pytest.raises(TaskError, match='default_branch_protected'):
+        manager.branch(project,issue(project,body='Target branch: production'))
     worktree,sha=manager.prepare(project,issue(project),'codex/issue-1')
     assert sha==git(remote,'rev-parse','production')
     for branch in ('../escape','-option','a..b','x\nmain','main.lock'):
