@@ -172,3 +172,58 @@ PATH="$PWD/.venv/bin:$PATH" bash scripts/test.sh
 git diff --check
 # exit 0
 ```
+
+## Исправление ложного child_body_conflict (2026-11-02)
+
+Изменены `src/dispatcher/containers.py`, `tests/test_stage6433.py` и этот отчёт.
+Полное равенство ответов разных API заменено явной проекцией: id, repository_url,
+number, state, title, login/id автора, множество имён labels, body и updated_at.
+Поля repository, closed_by, avatar, цвет/описание labels и другие API-декорации
+не участвуют в сравнении; null body эквивалентен пустому Markdown. Имена labels,
+логин и repository_url сравниваются без учёта регистра, порядок labels неважен.
+Та же проекция применяется при итоговой сверке коллекции Sub-issues с REST
+результатами обновления; порядок детей не влияет на результат.
+
+Старые full-JSON intents читаются без миграции и без удаления SQLite/операций.
+Повторный GET перед PATCH, проверка прав, durable intent, локальные guards
+(version/approve/state/command guard/branch/PR), проверка прямой связи через
+Sub-issues и независимое подтверждение после PATCH сохранены. Изменения
+значимых полей по-прежнему блокируют запись. Только успешный update_child
+с подтверждением снимает child_body_conflict данного ребёнка; остальные
+blockers этим исправлением не снимаются. Если target уже виден, активный
+child_body_conflict всё равно направляет ребёнка на независимую проверку.
+
+Новые тесты воспроизводят разные формы API, два пустых ready body (включая null),
+non-ready ребёнка, старый intent и SQLite restart, отсутствие повторного POST
+ветки/PATCH, сохранение чужого blocker, изменения identity/title/repository,
+родительской связи и локальных approval/guard/branch/state. Существующие тесты
+проверяют body/updated_at/author/ready/state, permission, неопределённый исход,
+approve и отказы владения веткой. Комментарии этим кодом не создаются.
+
+Повторная ручная проверка существующего Issue #88 в heroicrealm/CodexAgentPlayground:
+
+1. Обновить checkout до исправленного коммита ветки STAGE_06_04_03 и перезапустить
+   штатный dispatcher с прежними конфигурацией и SQLite. Не удалять intents,
+   blockers или ContainerBranch3; сохранить исходные body #89/#90/#91.
+2. Выполнить штатный poll. У #89/#90 должна добавиться только настройка
+   dispatcher.base_branch: ContainerBranch3. #91 без codex-ready неизменна.
+3. Проверить: branch operation остаётся confirmed/success; операции двух детей
+   становятся confirmed/success; их child_body_conflict неактивны; #88 достигает
+   awaiting_children, если иных активных blockers нет. Дети не получают approve,
+   контейнер не запускает Codex и не создаёт PR.
+4. Повторить poll и restart/poll: отсутствуют повторные PATCH, публикация ветки
+   и комментарии. Проверить сохранение существующих законных approve и версий.
+
+Ручные изменения Playground не выполнялись. Приёмка не оформлена, PR не создаётся.
+Ограничение варианта A сохраняется: GET → PATCH не является атомарным CAS,
+человеческая правка в последнем сетевом окне может быть потеряна; независимый
+read-back не доказывает отсутствие такой гонки.
+
+Проверки этого исправления:
+
+- `.venv/bin/python -m pytest -q`: **827 passed, 30 subtests passed in 141.06s**,
+  exit 0 (полный прогон, запущенный до добавления последних пяти guard-сценариев).
+- `.venv/bin/python -m pytest tests/test_stage6433.py -q`: **80 passed in 7.45s**,
+  exit 0, включая последние пять guard-сценариев.
+- `.venv/bin/python -m compileall -q src tests`: exit 0.
+- `git diff --check`: exit 0.

@@ -14,6 +14,21 @@ from dispatcher.storage.transitions import Authority, Evidence
 from dispatcher.workspace import TaskError, private_dir, safe_path
 
 
+def child_snapshot(raw):
+    """Project shared significant fields, including for legacy durable intents."""
+    try:
+        user = raw['user']
+        labels = tuple(sorted({label['name'].casefold() for label in raw['labels']}))
+        return dict(id=raw['id'], number=raw['number'],
+                    repository_url=raw['repository_url'].casefold(),
+                    state=raw['state'], title=raw['title'],
+                    author=user['login'].casefold(), author_id=user.get('id'),
+                    labels=labels, body=raw.get('body') or '',
+                    updated_at=raw['updated_at'])
+    except (KeyError, TypeError, AttributeError):
+        raise TaskError('child_body_conflict') from None
+
+
 class ContainerService:
     def __init__(self, store, adapter, git):
         self.store, self.adapter, self.git = store, adapter, git
@@ -111,9 +126,10 @@ class ContainerService:
             if not any(c['id'] == child['id'] for c in members):
                 raise TaskError('child_relation_conflict')
             fresh = self.adapter.request(f'repos/{project.repository}/issues/{child["number"]}')
-            original = proof['original']
-            if (not isinstance(fresh, dict) or any(fresh.get(k) != original.get(k)
-                    for k in ('id', 'repository_url', 'number', 'state', 'user', 'title', 'labels'))
+            original = child_snapshot(proof['original'])
+            observed = child_snapshot(fresh)
+            if (any(observed[k] != original[k]
+                    for k in original if k not in ('body', 'updated_at'))
                     or fresh.get('state') != 'open'
                     or fresh['user']['login'].casefold() not in {a.casefold() for a in project.allowed_authors}
                     or project.task_label.casefold() not in {v['name'].casefold() for v in fresh['labels']}
@@ -136,7 +152,7 @@ class ContainerService:
             self.operation(row, kind, proof)
             self.guard(project, row)
             fresh = read()
-            if fresh != proof['original']:
+            if child_snapshot(fresh) != child_snapshot(proof['original']):
                 raise TaskError('child_body_conflict')
             local_guard()
             target = with_base_branch(fresh.get('body') or '', branch)
@@ -266,6 +282,7 @@ class ContainerService:
                 raise TaskError('child_identity_conflict')
             seen.add(child['id'])
             code = None
+            prepared = False
             participation = 'included' if ready else 'ignored'
             if not ready:
                 participation = 'detached'
@@ -285,10 +302,14 @@ class ContainerService:
                         or self.store.db.execute('SELECT 1 FROM task_pull_requests WHERE issue_id=?', (child['id'],)).fetchone()):
                     if managed['base_branch'] != branch or child_params.get('base_branch') != branch:
                         code = 'child_active_base_conflict'
-                elif (child_params.get('base_branch') != branch or accepted['body'] != (child.get('body') or '')):
+                elif (child_params.get('base_branch') != branch or accepted['body'] != (child.get('body') or '')
+                      or self.store.db.execute(
+                          "SELECT 1 FROM container_blockers WHERE container_issue_id=? AND blocker_key=? AND code='child_body_conflict' AND active=1",
+                          (row['issue_id'], str(child['id']))).fetchone()):
                     try:
                         fresh = self.update_child(project, row, managed, child, branch)
                         children[children.index(child)] = fresh
+                        prepared = True
                     except (TaskError, GitHubError) as exc:
                         code = exc.code if isinstance(exc, TaskError) else 'child_body_unconfirmed'
             if code:
@@ -298,6 +319,9 @@ class ContainerService:
             with self.store.db as db:
                 if not code:
                     db.execute("UPDATE container_blockers SET active=0 WHERE container_issue_id=? AND blocker_key=? AND code IN ('child_body_cas_unavailable','child_body_unconfirmed')",
+                               (row['issue_id'], str(child['id'])))
+                if prepared:
+                    db.execute("UPDATE container_blockers SET active=0 WHERE container_issue_id=? AND blocker_key=? AND code='child_body_conflict'",
                                (row['issue_id'], str(child['id'])))
                 db.execute('''INSERT INTO sub_issue_relations VALUES(?,?,?,?,?)
                     ON CONFLICT(parent_issue_id,child_issue_id) DO UPDATE SET
@@ -310,7 +334,8 @@ class ContainerService:
                 blocked = True
         if blocked:
             return
-        if self.adapter.list_direct_children(project, row) != children:
+        if (sorted((child_snapshot(c) for c in self.adapter.list_direct_children(project, row)), key=lambda c: c['id'])
+                != sorted((child_snapshot(c) for c in children), key=lambda c: c['id'])):
             raise TaskError('child_collection_changed')
         self.guard(project, row)
         # Blockers require explicit operator resolution in this initial stage.

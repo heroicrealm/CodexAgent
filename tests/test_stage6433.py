@@ -602,3 +602,114 @@ def test_historical_intent_cannot_exempt_user_edits(env):
     assert store.get(project.repository, 2)['version'] == 3
     assert store.get(project.repository, 2)['approved_version'] is None
     store.close()
+
+
+def different_api_shapes(adapter):
+    """REST includes decorations absent/different in the Sub-issues API."""
+    read = adapter.request.side_effect
+    def rest(endpoint):
+        result = read(endpoint)
+        result.update(repository={'id': 77}, closed_by=None, extra_rest_field=True)
+        result['user'].update(avatar_url='https://example.com/avatar')
+        result['labels'] = [dict(label, color='abcdef', description=None)
+                            for label in reversed(result['labels'])]
+        return result
+    adapter.request.side_effect = rest
+
+
+def test_real_shapes_empty_children_and_legacy_restart(env):
+    _, project, *_ = env
+    store, adapter, service, remote, patches = controlled_setup(env, ['', ''])
+    remote[2]['body'] = None
+    remote[4] = raw(project, issue(project, id=4, number=4, labels=[], body=None))
+    different_api_shapes(adapter)
+    operation = service.operation
+    def crash(row, kind, payload, phase='intent', remote=None):
+        result = operation(row, kind, payload, phase, remote)
+        if kind == 'child:2':
+            raise RuntimeError('restart with old full JSON intent')
+        return result
+    service.operation = crash
+    with pytest.raises(RuntimeError):
+        service.prepare(project, store.get(project.repository, 1))
+    proof = json.loads(store.db.execute("SELECT payload FROM container_operations WHERE kind='child:2'").fetchone()[0])
+    assert 'original' in proof and proof['original']['body'] is None
+    parent = store.get(project.repository, 1)
+    service.block(parent, 'child_body_conflict', 2)
+    service.block(parent, 'child_body_conflict', 3)
+    store.close()
+    store = Store(env[0].workspace / '.runtime' / 'containers.sqlite3')
+    service = ContainerService(store, adapter, GitWorkspaceManager(env[0]))
+    service.prepare(project, store.get(project.repository, 1))
+    assert patches == [2, 3]
+    assert store.get(project.repository, 1)['state'] == 'awaiting_children'
+    assert remote[4]['body'] is None
+    assert not store.db.execute('SELECT 1 FROM container_blockers WHERE active=1').fetchone()
+    assert all(store.get(project.repository, n)['approved_version'] is None for n in (2, 3))
+    service.prepare(project, store.get(project.repository, 1))
+    assert patches == [2, 3]
+    assert sum(call.args[1] == 'POST' for call in adapter.write.call_args_list) == 1
+    assert not store.db.execute('SELECT 1 FROM attempts').fetchone()
+    assert not store.db.execute('SELECT 1 FROM task_pull_requests').fetchone()
+    store.close()
+
+
+@pytest.mark.parametrize('field,value', [('title', 'changed'), ('repository_url', 'https://api.github.com/repos/other/repo'),
+                                         ('id', 999), ('user', {'login': 'owner', 'id': 999})])
+def test_significant_identity_change_with_different_shapes(env, field, value):
+    _, project, *_ = env
+    store, adapter, service, remote, patches = controlled_setup(env)
+    different_api_shapes(adapter)
+    read = adapter.request.side_effect
+    count = 0
+    def request(endpoint):
+        nonlocal count
+        result = read(endpoint)
+        if endpoint.endswith('/2'):
+            count += 1
+            if count == 2:
+                result[field] = value
+        return result
+    adapter.request.side_effect = request
+    service.prepare(project, store.get(project.repository, 1))
+    assert patches == []
+    assert store.get(project.repository, 1)['state'] == 'pending'
+    store.close()
+
+
+def test_successful_child_does_not_clear_other_blocker(env):
+    _, project, *_ = env
+    store, adapter, service, remote, patches = controlled_setup(env)
+    service.block(store.get(project.repository, 1), 'child_relation_removed', 2)
+    different_api_shapes(adapter)
+    service.prepare(project, store.get(project.repository, 1))
+    assert patches == [2]
+    assert store.db.execute('SELECT code FROM container_blockers WHERE active=1').fetchone()[0] == 'child_relation_removed'
+    assert store.get(project.repository, 1)['state'] == 'pending'
+    store.close()
+
+
+@pytest.mark.parametrize('change', ['relation', 'approval', 'guard', 'branch', 'state'])
+def test_final_child_guards_with_api_shape_difference(env, change):
+    _, project, *_ = env
+    store, adapter, service, remote, patches = controlled_setup(env)
+    different_api_shapes(adapter)
+    def permission(*_):
+        if change == 'relation':
+            adapter.list_direct_children.side_effect = lambda *_: []
+        elif change == 'approval':
+            assert store.confirm(project.repository, 2, 1)
+        elif change == 'branch':
+            with store.db:
+                store.db.execute("UPDATE tasks SET work_branch='feature/owned' WHERE number=2")
+        elif change == 'guard':
+            service.store.guard = Mock(return_value={'changed': True})
+        else:
+            with store.db:
+                store.db.execute("UPDATE tasks SET state='running' WHERE number=2")
+        return True
+    adapter.can_update_issue.side_effect = permission
+    service.prepare(project, store.get(project.repository, 1))
+    assert patches == []
+    assert store.get(project.repository, 1)['state'] == 'pending'
+    store.close()
