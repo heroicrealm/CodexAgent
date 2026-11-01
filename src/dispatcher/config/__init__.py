@@ -145,7 +145,7 @@ def load(path: str | Path) -> Config:
             raise ConfigError('project labels/security must be mappings')
         parsed = {}
         for key, color in COLORS.items():
-            value = labels.get(key, item.get('task_label', 'codex-ready') if key == 'ready' else ('dispatcher:emergency-stop' if key == 'emergency_stop' else f'dispatcher:{key}'))
+            value = labels.get(key, item.get('task_label', 'codex-ready') if key == 'ready' else (f'dispatcher:{key.replace("_", "-")}' if key in ('emergency_stop', 'awaiting_children') else f'dispatcher:{key}'))
             if isinstance(value, str):
                 value = dict(name=value)
             if not isinstance(value, dict):
