@@ -23,7 +23,7 @@ def content_hash(issue):
 
 class Store:
     def __init__(self, path):
-        from .migrations import prepare, initialize, upgrade604, upgrade605, upgrade606, upgrade607, upgrade608, upgrade609, upgrade610, upgrade611, upgrade612, upgrade613, VERSION
+        from .migrations import prepare, initialize, upgrade604, upgrade605, upgrade606, upgrade607, upgrade608, upgrade609, upgrade610, upgrade611, upgrade612, upgrade613, upgrade614, VERSION
         prepare(path)
         self.db = sqlite3.connect(path, timeout=30)
         os.chmod(path, 0o600)
@@ -46,6 +46,7 @@ class Store:
                 upgrade611(self.db)
                 upgrade612(self.db)
                 upgrade613(self.db)
+                upgrade614(self.db)
         except Exception:
             self.db.close()
             raise
@@ -290,6 +291,19 @@ class Store:
             for row in self.db.execute('SELECT * FROM tasks WHERE repository=?', (repository,)).fetchall():
                 if row['number'] not in seen:
                     self._revoke(row, stamp, row['observed'], counts)
+            # Execution metadata follows only the accepted snapshot, never an
+            # unapproved edit of an already active task.
+            from dispatcher.issue_parameters import parse
+            from dispatcher.workspace import TaskError
+            for task in self.queue(repository):
+                try:
+                    params, _ = parse(json.loads(task['snapshot'])['body'])
+                except TaskError:
+                    continue  # Existing preparation error flow blocks admission.
+                kind, run = params.get('issue_type', 'issue'), int(params.get('run_codex', True))
+                if (task['issue_type'], task['run_codex']) != (kind, run):
+                    self.db.execute('UPDATE tasks SET issue_type=?,run_codex=? WHERE issue_id=?',
+                                    (kind, run, task['issue_id']))
             by_number = {issue['number']: issue for issue in issues}
             for current in self.queue(repository):
                 prior = self.guard(repository, current['number'])
@@ -405,7 +419,7 @@ class Store:
                 return False
             if values == expected:
                 return True
-            if row['state'] in ('running', 'review', 'done', 'cancelled', 'review_on_error') or self.db.execute(
+            if row['state'] in ('awaiting_children', 'running', 'review', 'done', 'cancelled', 'review_on_error') or self.db.execute(
                     "SELECT 1 FROM attempts WHERE repository=? AND number=? AND state='running'",
                     (repository, number)).fetchone():
                 return False

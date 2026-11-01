@@ -7,7 +7,7 @@ import unicodedata
 
 
 STATUS_COLORS = {
-    'discovered': '36', 'pending': '33', 'running': '34', 'review': '35',
+    'awaiting_children': '33', 'discovered': '36', 'pending': '33', 'running': '34', 'review': '35',
     'done': '32', 'failed': '31', 'rejected': '31', 'revoked': '90', 'detached': '90',
     'review_on_error': '31', 'cancelled': '90', 'interrupted': '31',
 }
@@ -131,6 +131,8 @@ def render_queue(rows, projects, format='table', stream=None):
 
 # Explicit fields avoid dumping internal snapshots, remote credentials or process data.
 DETAIL_FIELDS = {
+    'container_blockers': ('blocker_key', 'child_issue_id', 'code', 'active', 'updated_at'),
+    'container_operations': ('operation_key', 'kind', 'phase', 'outcome', 'remote_identity', 'updated_at'),
     'stop_requests': ('request_id','reason','previous_state','stage','attempt_id','requested_at','finalized_at','active','process_status','method','error'),
     'detach_publications': ('request_id','state','sha','remote_sha','no_diff','error','confirmed_at'),
     'stop_outbox': ('request_id','delivered','comment_id','error'),
@@ -161,6 +163,7 @@ def render_show(value, format='table', stream=None):
     lines = [f'Issue: #{value.get("number", "(unavailable)")}']
     for label, data, key in [('Title', issue, 'title'), ('Status', value, 'state'),
                              ('Branch', dict(issue, target_branch=value.get('work_branch') or issue.get('target_branch')), 'target_branch'), ('Author', issue, 'author'),
+                             ('Issue type', value, 'issue_type'), ('Run Codex', value, 'run_codex'),
                              ('Version', value, 'version'), ('Current iteration', value, 'current_iteration_id'), ('Approved version', value, 'approved_version'),
                              ('Available', value, 'available'), ('Created', value, 'created_at'),
                              ('Synced', value, 'synced_at')]:

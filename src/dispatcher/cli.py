@@ -88,6 +88,11 @@ def main(argv=None):
                     if row is None:
                         raise RuntimeError('Unknown issue')
                     value = _display_task(row)
+                    if row['issue_type'] == 'container':
+                        value['container_blockers'] = [dict(r) for r in store.db.execute(
+                            'SELECT * FROM container_blockers WHERE container_issue_id=?', (row['issue_id'],))]
+                        value['container_operations'] = [dict(r) for r in store.db.execute(
+                            'SELECT * FROM container_operations WHERE container_issue_id=?', (row['issue_id'],))]
                     value['stop_requests'] = [dict(r) for r in store.db.execute(
                         'SELECT request_id,iteration_id,version,attempt_id,reason,previous_state,stage,requested_at,finalized_at,active,process_status,method,error FROM stop_requests WHERE issue_id=? ORDER BY request_id', (row['issue_id'],))]
                     value['detach_publications'] = [dict(r) for r in store.db.execute(

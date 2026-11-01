@@ -480,7 +480,7 @@ def test_outbox_uncertain_write_recovery_and_migration(env):
     try:
         execution = ExecutionStore(store)
         ExecutionStore(store)
-        assert [r[0] for r in store.db.execute('SELECT version FROM schema_migrations ORDER BY version')] == [1,2,3,602,604,605,606,607,608,609,610,611,612,613]
+        assert [r[0] for r in store.db.execute('SELECT version FROM schema_migrations ORDER BY version')] == [1,2,3,602,604,605,606,607,608,609,610,611,612,613,614]
         assert store.get(project.repository,1)['approved_version'] == 1
         api.pages.return_value = [dict(id=456,body=body)]
         TaskResultPublisher(execution,api).flush()

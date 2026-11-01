@@ -4,6 +4,7 @@ import sqlite3
 import time
 from dataclasses import replace
 from dispatcher import preparation_error
+from dispatcher.containers import ContainerService
 from dispatcher.detachment import StopController, StopWatcher, fence, live_processes
 from dispatcher.attachments import IssueAttachmentManager
 from dispatcher.codex import CodexExecutor
@@ -34,6 +35,7 @@ class Dispatcher:
         self.adapter = adapter or Adapter(config.github_executable)
         self.sync = SyncService(config, self.store, self.adapter)
         self.git = GitWorkspaceManager(config, lifecycle, self.execution)
+        self.containers = ContainerService(self.store, self.adapter, self.git)
         self.attachments = IssueAttachmentManager(config)
         self.executor = CodexExecutor(config, lifecycle)
         self.quota = CodexQuotaProvider(config, lifecycle, self.execution.quota)
@@ -100,7 +102,11 @@ class Dispatcher:
             candidates = [r for r in self.store.queue(project.repository) if r['state'] == 'pending'
                           and r['available'] and r['version'] == r['approved_version']]
             for candidate in candidates:
-                if self.lifecycle.stopping or not self.quota.check(fresh=True):
+                if self.lifecycle.stopping:
+                    return
+                if candidate['issue_type'] == 'issue' and not candidate['run_codex']:
+                    continue  # Manual execution belongs to stage 6.4.3.5.
+                if candidate['issue_type'] != 'container' and not self.quota.check(fresh=True):
                     return
                 try:
                     # Full authoritative snapshot also applies revocation/version changes
@@ -113,6 +119,11 @@ class Dispatcher:
                             or current['version'] != candidate['version']):
                         continue
                     current = dict(current, **self.store.branches(project.repository, candidate['number']))
+                    if current['issue_type'] == 'container':
+                        self.containers.prepare(project, current)
+                        continue
+                    if not current['run_codex']:
+                        continue
                     issue = json.loads(current['snapshot'])
                     try:
                         params = preparation_error.parameters(issue['body'])

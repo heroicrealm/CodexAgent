@@ -181,6 +181,51 @@ class Adapter:
                 return result
         raise GitHubError('Pagination limit exceeded')
 
+    def list_direct_children(self, project, parent):
+        """Two full identical enumerations; partial/unstable sets are unusable.
+
+        GitHub provides pagination, not an atomic collection snapshot. A second
+        read detects observed churn; it cannot prove absence of an ABA change.
+        """
+        from dispatcher.storage.transitions import rest_id
+        endpoint = f'repos/{project.repository}/issues/{parent["number"]}'
+        repo_url = f'https://api.github.com/repos/{project.repository}'.casefold()
+        def read():
+            root = self.request(endpoint)
+            if (not isinstance(root, dict) or root.get('id') != parent['issue_id']
+                    or root.get('number') != parent['number']
+                    or root.get('repository_url', '').casefold() != repo_url):
+                raise GitHubError(kind='invalid_response')
+            children = self.pages(endpoint + '/sub_issues')
+            summary = root.get('sub_issues_summary')
+            if summary is not None and (not isinstance(summary, dict)
+                    or type(summary.get('total')) is not int or summary['total'] != len(children)):
+                raise GitHubError('Incomplete sub-issue collection', kind='invalid_response')
+            ids, numbers = set(), set()
+            for child in children:
+                if (not isinstance(child, dict) or not rest_id(child.get('id'))
+                        or not rest_id(child.get('number')) or child['id'] in ids
+                        or child['number'] in numbers or child['id'] == parent['issue_id']
+                        or child.get('repository_url', '').casefold() != repo_url
+                        or child.get('url', '').casefold() != repo_url + '/issues/' + str(child['number'])
+                        or 'pull_request' in child or not isinstance(child.get('labels'), list)
+                        or any(not isinstance(label, dict) or not isinstance(label.get('name'), str)
+                               for label in child['labels'])
+                        or not isinstance(child.get('title'), str)
+                        or not isinstance(child.get('user'), dict)
+                        or not isinstance(child['user'].get('login'), str)
+                        or child.get('state') not in ('open', 'closed')
+                        or not isinstance(child.get('updated_at'), str)
+                        or child.get('body') is not None and not isinstance(child['body'], str)):
+                    raise GitHubError(kind='invalid_response')
+                ids.add(child['id'])
+                numbers.add(child['number'])
+            return sorted(children, key=lambda c: c['id'])
+        first, second = read(), read()
+        if first != second:
+            raise GitHubError('Sub-issue collection changed', kind='invalid_response')
+        return second
+
     def label_page(self, endpoint):
         data = self.pages(endpoint)
         if any(not isinstance(v, dict) or not isinstance(v.get('name'), str) for v in data):

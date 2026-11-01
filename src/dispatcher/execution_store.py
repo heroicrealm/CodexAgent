@@ -16,7 +16,7 @@ class ExecutionStore:
     def _reserve(self, row, branch, maximum, observation, *, event_key=None, actor='scheduler', evidence=None):
         """Admission implementation; caller owns the SQLite transaction."""
         guard = self.store.guard(row['repository'], row['number'])
-        if self.store.stop_requested(row):
+        if row['issue_type'] != 'issue' or not row['run_codex'] or self.store.stop_requested(row):
             return None
         if not guard or guard['observation_token'] != observation:
             return None

@@ -15,6 +15,7 @@ COLORS = dict(zip(
 
 COLORS['review_on_error'] = 'D93F0B'
 COLORS['emergency_stop'] = 'B60205'
+COLORS['awaiting_children'] = 'FBCA04'
 COLORS['detached'] = 'C2E0C6'
 
 

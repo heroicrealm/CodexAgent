@@ -57,6 +57,7 @@ class Evidence:
     merged_at: str | None = None
     # Verified Issue identity/ownership proof, not branch-name inference.
     linked_issue_id: int | None = None
+    container_operation: str | None = None
 
 
 @dataclass(frozen=True)
@@ -100,7 +101,7 @@ def transition(store, *, repository, number, expected_state, version, iteration_
             return Outcome.STALE_VERSION
         if store.stop_requested(row):
             return Outcome.CONFLICT
-        edges = {('discovered', 'pending'), ('discovered', 'rejected'), ('pending', 'running'),
+        edges = {('pending', 'awaiting_children'), ('discovered', 'pending'), ('discovered', 'rejected'), ('pending', 'running'),
                  ('running', 'review'), ('review', 'done'), ('review', 'rejected'),
                  ('rejected', 'pending'), ('rejected', 'cancelled')}
         if row['state'] != expected_state or (expected_state, target) not in edges:
@@ -141,6 +142,27 @@ def transition(store, *, repository, number, expected_state, version, iteration_
                 return Outcome.MISSING_EVIDENCE
         if target in ('pending', 'running') and (not row['available'] or store.configuration_blocked(row)):
             return Outcome.MISSING_EVIDENCE
+        if target == 'awaiting_children':
+            operation = db.execute('SELECT * FROM container_operations WHERE operation_key=?',
+                                   (evidence.container_operation,)).fetchone()
+            if (row['issue_type'] != 'container' or row['approved_version'] != version
+                    or not row['available'] or store.configuration_blocked(row)
+                    or not operation or operation['container_issue_id'] != row['issue_id']
+                    or operation['iteration_id'] != iteration_id or operation['kind'] != 'prepare'
+                    or operation['phase'] != 'confirmed' or operation['outcome'] != 'success'
+                    or db.execute('SELECT 1 FROM container_blockers WHERE container_issue_id=? AND active=1',
+                                  (row['issue_id'],)).fetchone()):
+                return Outcome.MISSING_EVIDENCE
+            branch_operation = db.execute("SELECT * FROM container_operations WHERE container_issue_id=? AND iteration_id=? AND kind='branch' AND phase='confirmed' AND outcome='success'",
+                                          (row['issue_id'], iteration_id)).fetchone()
+            if not branch_operation:
+                return Outcome.MISSING_EVIDENCE
+            payload = json.loads(branch_operation['payload'])
+            if (payload.get('branch') != row['work_branch'] or payload.get('base') != row['base_branch']
+                    or not payload.get('sha') or payload.get('sha') != branch_operation['remote_identity']
+                    or db.execute('SELECT 1 FROM tasks WHERE repository=? AND work_branch=? AND issue_id!=?',
+                                  (repository.casefold(), row['work_branch'], row['issue_id'])).fetchone()):
+                return Outcome.CONFLICT
         if target == 'running':
             from dispatcher.execution_store import ExecutionStore
             from dispatcher.github import valid_branch

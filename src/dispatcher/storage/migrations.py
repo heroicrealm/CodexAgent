@@ -445,3 +445,39 @@ def upgrade613(db):
         if name not in columns:
             db.execute(f'ALTER TABLE attempts ADD COLUMN {name} {kind}')
     db.execute('INSERT OR IGNORE INTO schema_migrations VALUES(613)')
+
+
+def upgrade614(db):
+    """Add container preparation journals; caller owns the atomic transaction."""
+    columns = {r[1] for r in db.execute('PRAGMA table_info(tasks)')}
+    for name, definition in (
+            ('issue_type', "TEXT NOT NULL DEFAULT 'issue' CHECK(issue_type IN ('issue','container'))"),
+            ('run_codex', 'INTEGER NOT NULL DEFAULT 1 CHECK(run_codex IN (0,1))')):
+        if name not in columns:
+            db.execute(f'ALTER TABLE tasks ADD COLUMN {name} {definition}')
+    db.execute('''CREATE TABLE IF NOT EXISTS sub_issue_relations(
+        parent_issue_id INTEGER NOT NULL REFERENCES tasks(issue_id),
+        child_issue_id INTEGER NOT NULL REFERENCES tasks(issue_id),
+        observed_at TEXT NOT NULL, participation TEXT NOT NULL
+          CHECK(participation IN ('included','ignored','detached','blocked')),
+        conflict_code TEXT, PRIMARY KEY(parent_issue_id,child_issue_id),
+        CHECK(parent_issue_id!=child_issue_id))''')
+    db.execute('CREATE INDEX IF NOT EXISTS sub_issue_relations_child ON sub_issue_relations(child_issue_id)')
+    db.execute('''CREATE TABLE IF NOT EXISTS container_operations(
+        operation_key TEXT PRIMARY KEY,
+        container_issue_id INTEGER NOT NULL REFERENCES tasks(issue_id),
+        iteration_id INTEGER REFERENCES task_iterations(iteration_id),
+        kind TEXT NOT NULL, target_issue_id INTEGER REFERENCES tasks(issue_id),
+        payload_hash TEXT NOT NULL, payload TEXT NOT NULL,
+        phase TEXT NOT NULL CHECK(phase IN ('intent','observed','confirmed')),
+        outcome TEXT NOT NULL, retry_count INTEGER NOT NULL DEFAULT 0,
+        remote_identity TEXT, updated_at TEXT NOT NULL)''')
+    db.execute('CREATE INDEX IF NOT EXISTS container_operations_pending ON container_operations(phase,outcome)')
+    db.execute('''CREATE TABLE IF NOT EXISTS container_blockers(
+        container_issue_id INTEGER NOT NULL REFERENCES tasks(issue_id),
+        blocker_key TEXT NOT NULL, child_issue_id INTEGER REFERENCES tasks(issue_id),
+        code TEXT NOT NULL, details TEXT NOT NULL,
+        active INTEGER NOT NULL CHECK(active IN (0,1)), updated_at TEXT NOT NULL,
+        PRIMARY KEY(container_issue_id,blocker_key))''')
+    validate(db)
+    db.execute('INSERT OR IGNORE INTO schema_migrations VALUES(614)')
