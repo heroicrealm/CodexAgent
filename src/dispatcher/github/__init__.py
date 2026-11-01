@@ -226,6 +226,18 @@ class Adapter:
             raise GitHubError('Sub-issue collection changed', kind='invalid_response')
         return second
 
+    def can_update_issue(self, project, number, issue_id):
+        """Check the authenticated actor's permission on this specific Issue."""
+        owner, repository = project.repository.split('/')
+        query = ('query($owner:String!,$repo:String!,$number:Int!){repository(owner:$owner,name:$repo)'
+                 '{issue(number:$number){databaseId viewerCanUpdate}}}')
+        result = self.write('graphql', 'POST', dict(query=query, variables=dict(owner=owner, repo=repository, number=number)))
+        try:
+            issue = result['data']['repository']['issue']
+            return not result.get('errors') and issue['databaseId'] == issue_id and issue['viewerCanUpdate'] is True
+        except (KeyError, TypeError):
+            raise GitHubError(kind='invalid_response') from None
+
     def label_page(self, endpoint):
         data = self.pages(endpoint)
         if any(not isinstance(v, dict) or not isinstance(v.get('name'), str) for v in data):

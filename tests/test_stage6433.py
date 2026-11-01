@@ -104,7 +104,7 @@ def test_child_prepared_or_fail_closed(env, configured):
     assert store.get(project.repository, 2)['state'] == 'discovered'
     assert store.get(project.repository, 2)['approved_version'] is None
     if not configured:
-        assert store.db.execute('SELECT code FROM container_blockers').fetchone()[0] == 'child_body_cas_unavailable'
+        assert store.db.execute('SELECT code FROM container_blockers').fetchone()[0] == 'child_body_conflict'
     assert all(call.args[0].endswith('/git/refs') for call in adapter.write.call_args_list)
     store.close()
 
@@ -343,3 +343,262 @@ def test_missing_nested_base_does_not_publish(env):
 def test_proposal_retains_unrelated_invalid_yaml():
     body = 'Example:\n```yaml\nother: [\n```\n'
     assert with_base_branch(body, 'feature/container').startswith(body)
+
+
+def controlled_setup(env, bodies=('Child\n',)):
+    import copy
+    _, project, *_ = env
+    children = [issue(project, id=n, number=n, body=body) for n, body in enumerate(bodies, 2)]
+    store, parent, adapter, service = setup(env, children)
+    remote = {c['number']: raw(project, c) for c in [parent, *children]}
+    adapter.request.side_effect = lambda endpoint: copy.deepcopy(remote[int(endpoint.split('/')[-1])])
+    adapter.list_direct_children.side_effect = lambda *_: copy.deepcopy([remote[n] for n in remote if n != 1])
+    adapter.can_update_issue.return_value = True
+    create_ref = adapter.write.side_effect
+    patches = []
+    def write(endpoint, method, payload):
+        if method != 'PATCH':
+            return create_ref(endpoint, method, payload)
+        number = int(endpoint.split('/')[-1])
+        patches.append(number)
+        remote[number].update(body=payload['body'], updated_at='2026-10-25T01:00:00Z')
+        return dict(remote[number])
+    adapter.write.side_effect = write
+    return store, adapter, service, remote, patches
+
+
+@pytest.mark.parametrize('body', ['Юникод\n```text\nexample\n```\n',
+    '```yaml\ndispatcher: {}\n```\n', '```yaml\ndispatcher:\n  base_branch: old # сохранить\n```\n'])
+def test_controlled_child_update(env, body):
+    _, project, *_ = env
+    store, adapter, service, remote, patches = controlled_setup(env, [body])
+    assert store.confirm(project.repository, 2, 1)
+    service.prepare(project, store.get(project.repository, 1))
+    assert patches == [2]
+    child = store.get(project.repository, 2)
+    assert child['state'] == 'pending' and child['approved_version'] == child['version'] == 1
+    assert json.loads(child['snapshot'])['body'] == with_base_branch(body, 'feature/container')
+    assert store.get(project.repository, 1)['state'] == 'awaiting_children'
+    service.prepare(project, store.get(project.repository, 1))
+    assert patches == [2]
+    edited = json.loads(child['snapshot'])
+    edited['body'] += '\nHuman edit'
+    store.apply(project, [edited], partial=True)
+    assert store.get(project.repository, 2)['approved_version'] is None
+    assert store.get(project.repository, 2)['version'] == 2
+    store.close()
+
+
+@pytest.mark.parametrize('change', ['body', 'updated_at', 'labels', 'user', 'state', 'parent', 'local', 'permission'])
+def test_controlled_conflict_before_patch(env, change):
+    _, project, *_ = env
+    store, adapter, service, remote, patches = controlled_setup(env)
+    read = adapter.request.side_effect
+    count = 0
+    def request(endpoint):
+        nonlocal count
+        if endpoint.endswith('/2'):
+            count += 1
+            if count == 2:
+                if change == 'parent':
+                    adapter.list_direct_children.side_effect = lambda *_: []
+                    raise GitHubError()
+                elif change == 'local':
+                    with store.db:
+                        store.db.execute('UPDATE tasks SET version=version+1 WHERE number=2')
+                elif change != 'permission':
+                    remote[2][change] = dict(body='human', updated_at='later', labels=[], user={'login':'intruder'}, state='closed')[change]
+        return read(endpoint)
+    adapter.request.side_effect = request
+    adapter.can_update_issue.return_value = change != 'permission'
+    service.prepare(project, store.get(project.repository, 1))
+    assert patches == []
+    assert store.get(project.repository, 1)['state'] == 'pending'
+    store.close()
+
+
+@pytest.mark.parametrize('mode', ['timeout', 'crash', 'false_success', 'verify_failure'])
+def test_controlled_recovery(env, mode):
+    _, project, *_ = env
+    store, adapter, service, remote, patches = controlled_setup(env)
+    assert store.confirm(project.repository, 2, 1)
+    write = adapter.write.side_effect
+    def uncertain(endpoint, method, payload):
+        if method != 'PATCH':
+            return write(endpoint, method, payload)
+        if mode == 'false_success':
+            return {}
+        result = write(endpoint, method, payload)
+        if mode == 'crash':
+            raise RuntimeError('process terminated')
+        if mode == 'verify_failure':
+            adapter.request.side_effect = GitHubError()
+        if mode == 'timeout':
+            raise GitHubError(kind='timeout')
+        return result
+    adapter.write.side_effect = uncertain
+    if mode == 'crash':
+        with pytest.raises(RuntimeError):
+            service.prepare(project, store.get(project.repository, 1))
+    else:
+        service.prepare(project, store.get(project.repository, 1))
+    if mode == 'false_success':
+        assert store.get(project.repository, 1)['state'] == 'pending'
+        assert not store.db.execute("SELECT 1 FROM container_operations WHERE kind='child:2' AND phase='confirmed'").fetchone()
+    else:
+        # Restart and poll before recovery must not invalidate legitimate approval.
+        path = store.path if hasattr(store, 'path') else env[0].workspace / '.runtime' / 'containers.sqlite3'
+        store.close()
+        store = Store(path)
+        item = json.loads(store.get(project.repository, 2)['snapshot'])
+        item.update(body=remote[2]['body'], updated_at=remote[2]['updated_at'])
+        store.apply(project, [item], partial=True)
+        import copy
+        adapter.request.side_effect = lambda endpoint: copy.deepcopy(remote[int(endpoint.split('/')[-1])])
+        adapter.write.side_effect = write
+        service = ContainerService(store, adapter, GitWorkspaceManager(env[0]))
+        service.prepare(project, store.get(project.repository, 1))
+        assert store.get(project.repository, 1)['state'] == 'awaiting_children'
+        assert store.get(project.repository, 2)['approved_version'] == 1
+        assert patches == [2]
+    store.close()
+
+
+def test_controlled_two_ready_and_never_ready(env):
+    _, project, *_ = env
+    store, adapter, service, remote, patches = controlled_setup(env, ['First', 'Second'])
+    remote[4] = raw(project, issue(project, id=4, number=4, labels=[], body='untouched'))
+    service.prepare(project, store.get(project.repository, 1))
+    assert patches == [2, 3]
+    assert remote[4]['body'] == 'untouched'
+    assert store.get(project.repository, 1)['state'] == 'awaiting_children'
+    assert not store.db.execute('SELECT 1 FROM attempts').fetchone()
+    assert not store.db.execute('SELECT 1 FROM task_pull_requests').fetchone()
+    store.close()
+
+
+def test_documented_residual_get_patch_window(env):
+    _, project, *_ = env
+    store, adapter, service, remote, patches = controlled_setup(env)
+    write = adapter.write.side_effect
+    lost = []
+    def race(endpoint, method, payload):
+        if method == 'PATCH':
+            remote[2]['body'] = 'Human text after final GET'
+            lost.append(remote[2]['body'])
+        return write(endpoint, method, payload)
+    adapter.write.side_effect = race
+    service.prepare(project, store.get(project.repository, 1))
+    assert lost == ['Human text after final GET']
+    assert lost[0] not in remote[2]['body']
+    # Successful read-back cannot detect this loss; this is deliberately NOT CAS.
+    assert store.get(project.repository, 1)['state'] == 'awaiting_children'
+    store.close()
+
+
+def test_false_success_allows_controlled_retry(env):
+    _, project, *_ = env
+    store, adapter, service, remote, patches = controlled_setup(env)
+    write = adapter.write.side_effect
+    adapter.write.side_effect = lambda endpoint, method, payload: {} if method == 'PATCH' else write(endpoint, method, payload)
+    service.prepare(project, store.get(project.repository, 1))
+    adapter.write.side_effect = write
+    service.prepare(project, store.get(project.repository, 1))
+    assert patches == [2]
+    assert store.get(project.repository, 1)['state'] == 'awaiting_children'
+    store.close()
+
+
+def test_recovery_never_overwrites_third_party(env):
+    _, project, *_ = env
+    store, adapter, service, remote, patches = controlled_setup(env)
+    write = adapter.write.side_effect
+    def crash(endpoint, method, payload):
+        result = write(endpoint, method, payload)
+        if method == 'PATCH':
+            raise RuntimeError()
+        return result
+    adapter.write.side_effect = crash
+    with pytest.raises(RuntimeError):
+        service.prepare(project, store.get(project.repository, 1))
+    remote[2]['body'] = 'Human edit after crash'
+    adapter.write.side_effect = write
+    service.prepare(project, store.get(project.repository, 1))
+    assert patches == [2]
+    assert remote[2]['body'] == 'Human edit after crash'
+    assert store.get(project.repository, 1)['state'] == 'pending'
+    store.close()
+
+
+@pytest.mark.parametrize('allowed,identity,errors', [(True,2,False), (False,2,False), (True,3,False), (True,2,True)])
+def test_issue_specific_permission(env, allowed, identity, errors):
+    _, project, *_ = env
+    adapter = Adapter()
+    adapter.write = Mock(return_value=dict(data=dict(repository=dict(issue=dict(databaseId=identity, viewerCanUpdate=allowed))), errors=['denied'] if errors else []))
+    assert bool(adapter.can_update_issue(project, 2, 2)) == (allowed and identity == 2 and not errors)
+
+
+def test_upgrade_proposal_only_intent(env):
+    import hashlib
+    _, project, *_ = env
+    store, adapter, service, remote, patches = controlled_setup(env)
+    parent = store.get(project.repository, 1)
+    service.operation(parent, 'child:2', dict(child_id=2, body_hash=hashlib.sha256(remote[2]['body'].encode()).hexdigest(),
+                                            proposed_hash='legacy', base_branch='feature/container'))
+    service.block(parent, 'child_body_cas_unavailable', 2)
+    service.prepare(project, parent)
+    assert patches == [2]
+    assert store.get(project.repository, 1)['state'] == 'awaiting_children'
+    assert not store.db.execute('SELECT 1 FROM container_blockers WHERE active=1').fetchone()
+    store.close()
+
+
+def test_unverified_service_body_cannot_authorize_execution(env):
+    from dispatcher.execution_store import ExecutionStore
+    _, project, *_ = env
+    store, adapter, service, remote, patches = controlled_setup(env)
+    assert store.confirm(project.repository, 2, 1)
+    write = adapter.write.side_effect
+    def crash(endpoint, method, payload):
+        result = write(endpoint, method, payload)
+        if method == 'PATCH':
+            raise RuntimeError()
+        return result
+    adapter.write.side_effect = crash
+    with pytest.raises(RuntimeError):
+        service.prepare(project, store.get(project.repository, 1))
+    child = store.get(project.repository, 2)
+    assert store.child_update_pending(child)
+    assert ExecutionStore(store).reserve(child, 'feature/child', 1, store.guard(project.repository, 2)['observation_token']) is None
+    adapter.write.side_effect = write
+    service.prepare(project, store.get(project.repository, 1))
+    assert not store.child_update_pending(store.get(project.repository, 2))
+    store.close()
+
+
+def test_null_remote_body_is_empty_markdown(env):
+    _, project, *_ = env
+    store, adapter, service, remote, patches = controlled_setup(env, [''])
+    remote[2]['body'] = None
+    service.prepare(project, store.get(project.repository, 1))
+    assert patches == [2]
+    assert store.get(project.repository, 1)['state'] == 'awaiting_children'
+    store.close()
+
+
+def test_historical_intent_cannot_exempt_user_edits(env):
+    _, project, *_ = env
+    store, adapter, service, remote, patches = controlled_setup(env)
+    assert store.confirm(project.repository, 2, 1)
+    service.prepare(project, store.get(project.repository, 1))
+    child = json.loads(store.get(project.repository, 2)['snapshot'])
+    target = child['body']
+    child['body'] = 'Child\n'
+    store.apply(project, [child], partial=True)
+    assert store.get(project.repository, 2)['version'] == 2
+    assert store.confirm(project.repository, 2, 2)
+    child['body'] = target
+    store.apply(project, [child], partial=True)
+    assert store.get(project.repository, 2)['version'] == 3
+    assert store.get(project.repository, 2)['approved_version'] is None
+    store.close()

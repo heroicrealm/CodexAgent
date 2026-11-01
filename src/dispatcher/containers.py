@@ -1,8 +1,7 @@
 """Initial container preparation, without execution or PR publication.
 
-Issue PATCH has no documented compare-and-swap. Required body changes are
-therefore diagnosed, never sent speculatively. Preconfigured children can be
-confirmed safely. Network work is serialized by a crash-released project lock.
+Issue PATCH is not atomic CAS. Durable intents detect observed conflicts but
+cannot exclude a lost human edit in the final GET -> PATCH window.
 """
 import fcntl
 import hashlib
@@ -67,6 +66,96 @@ class ContainerService:
                  hashlib.sha256(encoded.encode()).hexdigest(), encoded, phase,
                  'success' if phase == 'confirmed' else 'pending', remote, now()))
         return key
+
+    def update_child(self, project, row, managed, child, branch):
+        """Reconcile a durable intent before attempting a single PATCH."""
+        digest = lambda body: hashlib.sha256(body.encode()).hexdigest()
+        kind = 'child:' + str(child['id'])
+        key = f'container:{row["issue_id"]}:{row["current_iteration_id"]}:{kind}'
+        previous = self.store.db.execute('SELECT * FROM container_operations WHERE operation_key=?', (key,)).fetchone()
+        # Upgrade proposal-only intents from the previous fail-closed release.
+        if previous:
+            legacy = json.loads(previous['payload'])
+            if ('original' not in legacy and previous['phase'] == 'intent'
+                    and legacy.get('body_hash') == digest(child.get('body') or '')
+                    and legacy.get('base_branch') == branch):
+                previous = None
+        observation = dict(self.store.guard(project.repository, child['number']))
+        accepted = json.loads(managed['snapshot'])
+        if not previous and (accepted['body'] != (child.get('body') or '')
+                             or any(accepted.get(k) != child.get(k) for k in ('title', 'updated_at'))):
+            raise TaskError('child_snapshot_stale')
+        if accepted['author'].casefold() != child['user']['login'].casefold():
+            raise TaskError('child_snapshot_stale')
+        proof = json.loads(previous['payload']) if previous else dict(
+            child_id=child['id'], iteration_id=row['current_iteration_id'],
+            version=managed['version'], observation=observation, local=dict(managed), original=dict(child),
+            source_hash=digest(child.get('body') or ''),
+            target_hash=digest(with_base_branch(child.get('body') or '', branch)), base_branch=branch)
+        if proof.get('base_branch') != branch or 'original' not in proof:
+            raise TaskError('child_body_conflict')
+
+        def local_guard():
+            current = self.store.get(project.repository, child['number'])
+            if (dict(self.store.guard(project.repository, child['number'])) != observation
+                    or not current['available']
+                    or any(current[k] != proof['local'][k] for k in proof['local']
+                           if k not in ('synced_at', 'observed'))
+                    or self.store.stop_requested(current)
+                    or current['work_branch'] or current['state'] not in ('discovered', 'pending')
+                    or self.store.db.execute('SELECT 1 FROM task_pull_requests WHERE issue_id=?', (child['id'],)).fetchone()):
+                raise TaskError('child_body_conflict')
+
+        def read():
+            members = self.adapter.list_direct_children(project, row)
+            if not any(c['id'] == child['id'] for c in members):
+                raise TaskError('child_relation_conflict')
+            fresh = self.adapter.request(f'repos/{project.repository}/issues/{child["number"]}')
+            original = proof['original']
+            if (not isinstance(fresh, dict) or any(fresh.get(k) != original.get(k)
+                    for k in ('id', 'repository_url', 'number', 'state', 'user', 'title', 'labels'))
+                    or fresh.get('state') != 'open'
+                    or fresh['user']['login'].casefold() not in {a.casefold() for a in project.allowed_authors}
+                    or project.task_label.casefold() not in {v['name'].casefold() for v in fresh['labels']}
+                    or project.label('emergency_stop').name.casefold() in {v['name'].casefold() for v in fresh['labels']}):
+                raise TaskError('child_body_conflict')
+            parse(fresh.get('body') or '')
+            return fresh
+
+        self.guard(project, row)
+        fresh = read()
+        body = fresh.get('body') or ''
+        if digest(body) != proof['target_hash']:
+            local_guard()
+            if (digest(body) != proof['source_hash']
+                    or fresh.get('updated_at') != proof['original'].get('updated_at')
+                    or previous and previous['phase'] == 'confirmed'):
+                raise TaskError('child_body_conflict')
+            if not self.adapter.can_update_issue(project, child['number'], child['id']):
+                raise TaskError('child_update_forbidden')
+            self.operation(row, kind, proof)
+            self.guard(project, row)
+            fresh = read()
+            if fresh != proof['original']:
+                raise TaskError('child_body_conflict')
+            local_guard()
+            target = with_base_branch(fresh.get('body') or '', branch)
+            try:
+                self.adapter.write(f'repos/{project.repository}/issues/{child["number"]}', 'PATCH', dict(body=target))
+            except GitHubError:
+                pass  # Only independent read-back can resolve an unknown outcome.
+            fresh = read()
+            body = fresh.get('body') or ''
+        if digest(body) != proof['target_hash'] or parse(body)[0].get('base_branch') != branch:
+            raise TaskError('child_body_unconfirmed')
+        current = self.store.get(project.repository, child['number'])
+        if json.loads(current['snapshot'])['body'] != body:
+            local_guard()
+        self.operation(row, kind, proof, 'confirmed', proof['target_hash'])
+        accepted = json.loads(current['snapshot'])
+        accepted.update(body=body, updated_at=fresh['updated_at'], server_observed_at=self.adapter.response_date)
+        self.store.apply(project, [accepted], partial=True, controlled_operation=key)
+        return fresh
 
     def prepare(self, project, row):
         root = self.git.config.workspace
@@ -181,34 +270,34 @@ class ContainerService:
             if not ready:
                 participation = 'detached'
                 code = 'child_ready_removed'
+            elif child['state'] != 'open':
+                code = 'child_state_conflict'
             elif self.store.stop_requested(managed):
                 code = 'child_stopped'
             elif child['user']['login'].casefold() not in {a.casefold() for a in project.allowed_authors}:
                 code = 'child_untrusted'
             else:
                 accepted = json.loads(managed['snapshot'])
-                if (accepted['body'] != (child.get('body') or '') or accepted['title'] != child.get('title')):
+                if accepted['title'] != child.get('title'):
                     raise TaskError('child_snapshot_stale')
                 child_params, _ = parse(child.get('body') or '')
                 if (managed['work_branch'] or managed['state'] not in ('discovered', 'pending')
                         or self.store.db.execute('SELECT 1 FROM task_pull_requests WHERE issue_id=?', (child['id'],)).fetchone()):
                     if managed['base_branch'] != branch or child_params.get('base_branch') != branch:
                         code = 'child_active_base_conflict'
-                elif child_params.get('base_branch') != branch:
-                    # REST update Issue documents no expected body/version or
-                    # If-Match guarantee. Never overwrite a user's concurrent edit.
-                    proposal = with_base_branch(child.get('body') or '', branch)
-                    self.operation(row, 'child:' + str(child['id']),
-                                   dict(child_id=child['id'], body_hash=hashlib.sha256((child.get('body') or '').encode()).hexdigest(),
-                                        proposed_hash=hashlib.sha256(proposal.encode()).hexdigest(), base_branch=branch))
-                    code = 'child_body_cas_unavailable'
+                elif (child_params.get('base_branch') != branch or accepted['body'] != (child.get('body') or '')):
+                    try:
+                        fresh = self.update_child(project, row, managed, child, branch)
+                        children[children.index(child)] = fresh
+                    except (TaskError, GitHubError) as exc:
+                        code = exc.code if isinstance(exc, TaskError) else 'child_body_unconfirmed'
             if code:
                 participation = 'blocked'
                 self.block(row, code, child['id'])
                 blocked = True
             with self.store.db as db:
                 if not code:
-                    db.execute("UPDATE container_blockers SET active=0 WHERE container_issue_id=? AND blocker_key=? AND code='child_body_cas_unavailable'",
+                    db.execute("UPDATE container_blockers SET active=0 WHERE container_issue_id=? AND blocker_key=? AND code IN ('child_body_cas_unavailable','child_body_unconfirmed')",
                                (row['issue_id'], str(child['id'])))
                 db.execute('''INSERT INTO sub_issue_relations VALUES(?,?,?,?,?)
                     ON CONFLICT(parent_issue_id,child_issue_id) DO UPDATE SET

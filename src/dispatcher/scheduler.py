@@ -124,6 +124,8 @@ class Dispatcher:
                         continue
                     if not current['run_codex']:
                         continue
+                    if self.store.child_update_pending(current):
+                        continue
                     issue = json.loads(current['snapshot'])
                     try:
                         params = preparation_error.parameters(issue['body'])

@@ -201,7 +201,18 @@ class Store:
             self.db.execute('DELETE FROM command_quarantine WHERE repository=? AND number=? AND action=?',
                             (repository.casefold(), number, action))
 
-    def apply(self, project, issues, *, observation=None):
+    def child_update_pending(self, row):
+        """An intent's source snapshot cannot authorize execution during recovery."""
+        source = hashlib.sha256(json.loads(row['snapshot'])['body'].encode()).hexdigest()
+        for operation in self.db.execute('SELECT payload FROM container_operations WHERE kind=?',
+                                         ('child:' + str(row['issue_id']),)):
+            proof = json.loads(operation['payload'])
+            if (proof.get('version') == row['version'] and proof.get('source_hash') == source
+                    and proof.get('target_hash') != source):
+                return True
+        return False
+
+    def apply(self, project, issues, *, observation=None, partial=False, controlled_operation=None):
         counts = dict(discovered=0, updated=0, unchanged=0, revoked=0, skipped_untrusted=0)
         repository, stamp = project.repository.casefold(), now()
         seen = set()
@@ -270,11 +281,45 @@ class Store:
                         raise sqlite3.IntegrityError('GitHub repository identity conflict')
                     self.db.execute('UPDATE tasks SET repository_id=? WHERE repository=? AND number=?',
                                     (repository_id, repository, number))
+                # A known service target remains unaccepted until ContainerService
+                # independently verifies identity, relationship and ready on recovery.
+                if not controlled_operation:
+                    intents = self.db.execute("SELECT payload FROM container_operations WHERE kind=? AND phase IN ('intent','confirmed')",
+                                              ('child:' + str(row['issue_id']),)).fetchall()
+                    deferred = any(json.loads(op['payload']).get('version') == row['version']
+                                   and json.loads(op['payload']).get('target_hash') == hashlib.sha256(issue['body'].encode()).hexdigest()
+                                   and json.loads(op['payload']).get('source_hash') == hashlib.sha256(json.loads(row['snapshot'])['body'].encode()).hexdigest()
+                                   and all(json.loads(row['snapshot'])[k] == issue[k]
+                                           for k in ('id', 'title', 'author', 'target_branch'))
+                                   for op in intents)
+                    if deferred:
+                        self.db.execute('UPDATE tasks SET observed=?,synced_at=? WHERE issue_id=?',
+                                        (snapshot, stamp, row['issue_id']))
+                        counts['unchanged'] += 1
+                        continue
                 changed = row['content_hash'] != digest
+                service_edit = False
+                if controlled_operation:
+                    operation = self.db.execute("SELECT * FROM container_operations WHERE operation_key=? AND phase='confirmed'",
+                                                (controlled_operation,)).fetchone()
+                    if operation:
+                        proof = json.loads(operation['payload'])
+                        from dispatcher.issue_parameters import with_base_branch
+                        previous = json.loads(row['snapshot'])
+                        service_edit = (proof.get('child_id') == row['issue_id']
+                            and proof.get('version') == row['version']
+                            and proof.get('source_hash') == hashlib.sha256(previous['body'].encode()).hexdigest()
+                            and proof.get('target_hash') == hashlib.sha256(issue['body'].encode()).hexdigest()
+                            and issue['body'] == with_base_branch(previous['body'], proof['base_branch'])
+                            and all(previous[k] == issue[k] for k in ('id', 'title', 'author', 'target_branch')))
+
+                if controlled_operation and changed and not service_edit:
+                    from dispatcher.workspace import TaskError
+                    raise TaskError('child_snapshot_conflict')
                 if row['state'] in (*MUTABLE, 'rejected'):
-                    version = row['version'] + int(changed)
+                    version = row['version'] + int(changed and not service_edit)
                     state = ('rejected' if row['state'] == 'rejected' else
-                             'discovered' if changed or not row['available'] or row['state'] == 'revoked' else row['state'])
+                             'discovered' if (changed and not service_edit) or not row['available'] or row['state'] == 'revoked' else row['state'])
                     approved = row['approved_version'] if state == 'pending' else None
                     self.db.execute('''UPDATE tasks SET snapshot=?,observed=?,content_hash=?,version=?,
                         state=?,available=1,approved_version=?,synced_at=? WHERE repository=? AND number=?''',
@@ -289,7 +334,7 @@ class Store:
                                     (snapshot, stamp, repository, number))
                     counts['updated' if changed else 'unchanged'] += 1
             for row in self.db.execute('SELECT * FROM tasks WHERE repository=?', (repository,)).fetchall():
-                if row['number'] not in seen:
+                if not partial and row['number'] not in seen:
                     self._revoke(row, stamp, row['observed'], counts)
             # Execution metadata follows only the accepted snapshot, never an
             # unapproved edit of an already active task.
