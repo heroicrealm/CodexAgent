@@ -5,6 +5,7 @@ bound observed churn; GitHub does not provide an atomic multi-resource snapshot.
 """
 import fcntl
 import json
+import logging
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote, urlencode
@@ -13,8 +14,14 @@ from dispatcher import container_diagnostic
 from dispatcher.github import GitHubError
 from dispatcher.containers import child_snapshot
 from dispatcher.pr_monitor import utc
-from dispatcher.storage import now
+from dispatcher.storage import now, content_hash
 from dispatcher.workspace import TaskError
+
+class SnapshotMismatch(TaskError):
+    def __init__(self, source):
+        super().__init__('child_snapshot_stale')
+        self.source = source
+
 
 class ContainerMonitor:
     def __init__(self, store, adapter):
@@ -33,7 +40,9 @@ class ContainerMonitor:
                     continue
                 try:
                     self.observe(project, row)
-                except (GitHubError, TaskError, KeyError, ValueError, TypeError, AttributeError):
+                except (GitHubError, TaskError, KeyError, ValueError, TypeError, AttributeError) as exc:
+                    logging.getLogger(__name__).warning('container_monitor snapshot rejected: source=%s issue_id=%s',
+                        getattr(exc, 'source', 'remote_read'), row['issue_id'])
                     self.invalidate(row, 'child_snapshot_stale')
                 container_diagnostic.reconcile(self.store, self.adapter, row)
 
@@ -49,6 +58,8 @@ class ContainerMonitor:
         db = self.store.db
         return json.dumps({table: [dict(r) for r in db.execute(query, args)] for table, query, args in (
             ('tasks', 'SELECT * FROM tasks WHERE repository=? ORDER BY issue_id', (row['repository'],)),
+            ('guards', 'SELECT * FROM command_guards ORDER BY repository,number', ()),
+            ('iterations', 'SELECT * FROM task_iterations ORDER BY iteration_id', ()),
             ('prs', 'SELECT * FROM task_pull_requests WHERE repository_id=? ORDER BY pr_id', (row['repository_id'],)),
             ('operations', 'SELECT * FROM publication_operations ORDER BY operation_key', ()),
             ('containers', 'SELECT * FROM container_operations ORDER BY operation_key', ()),
@@ -106,18 +117,33 @@ class ContainerMonitor:
                 merged=pr['merged'], merged_at=pr.get('merged_at'), merge_sha=pr.get('merge_commit_sha')))
         return evidence, canonical
 
+    def parent_guard(self, project, row, parent):
+        accepted = json.loads(row['snapshot'])
+        names = {label['name'].casefold() for label in parent['labels']}
+        # The accepted target branch is derived from the body at admission.
+        # Hashing the freshly read body also fences any branch/YAML edit.
+        semantic = dict(id=parent['id'], title=parent['title'], body=parent.get('body') or '',
+                        author=parent['user']['login'],
+                        target_branch=accepted['target_branch'])
+        commands = {project.label(k).name.casefold() for k in ('approve', 'reject')}
+        guard = self.store.guard(row['repository'], row['number'])
+        if (parent['id'] != row['issue_id'] or parent['number'] != row['number']
+                or parent['repository_url'].casefold() != f'https://api.github.com/repos/{project.repository}'.casefold()
+                or parent['state'] != 'open' or content_hash(semantic) != row['content_hash']
+                or project.task_label.casefold() not in names
+                or project.label('emergency_stop').name.casefold() in names
+                or names & commands
+                or semantic['author'].casefold() not in {a.casefold() for a in project.allowed_authors}
+                or row['approved_version'] != row['version'] or not row['available']
+                or row['state'] != 'awaiting_children' or row['issue_type'] != 'container'
+                or not row['current_iteration_id'] or not row['work_branch']
+                or self.store.stop_requested(row)
+                or not guard or not guard['available'] or guard['version'] != row['version'] or guard['content_hash'] != row['content_hash']):
+            raise SnapshotMismatch('parent_mismatch')
+
     def collect(self, project, row):
         parent = self.adapter.request(f'repos/{project.repository}/issues/{row["number"]}')
-        accepted = json.loads(row['snapshot'])
-        if (parent['id'] != row['issue_id'] or parent['state'] != 'open'
-                or project.task_label.casefold() not in {l['name'].casefold() for l in parent['labels']}
-                or parent.get('body', '') != accepted['body']
-                or parent['title'] != accepted['title']
-                or parent['user']['login'].casefold() != accepted['author'].casefold()
-                or parent['updated_at'] != accepted['updated_at']
-                or project.label('emergency_stop').name.casefold() in {l['name'].casefold() for l in parent['labels']}
-                or row['approved_version'] != row['version'] or not row['available']):
-            raise TaskError('child_snapshot_stale')
+        self.parent_guard(project, row, parent)
         children = self.adapter.list_direct_children(project, row)
         relations = self.store.db.execute('SELECT * FROM sub_issue_relations WHERE parent_issue_id=?', (row['issue_id'],)).fetchall()
         historical = {r['child_issue_id'] for r in relations if r['participation'] != 'ignored'}
@@ -133,11 +159,11 @@ class ContainerMonitor:
             code, evidence = None, []
             if not child or child['issue_id'] != raw['id'] or child['repository_id'] != row['repository_id']:
                 # A missing local FK cannot be recorded as a relation.
-                raise TaskError('child_snapshot_stale')
+                raise SnapshotMismatch('child_mismatch')
             accepted_child = json.loads(child['snapshot'])
             if (raw['title'] != accepted_child['title'] or (raw.get('body') or '') != accepted_child['body']
                     or raw['user']['login'].casefold() != accepted_child['author'].casefold()):
-                raise TaskError('child_snapshot_stale')
+                raise SnapshotMismatch('child_mismatch')
             try:
                 evidence, canonical = self.prs(project, child)
                 open_pr = any(p['state'] == 'open' for p in evidence)
@@ -172,15 +198,18 @@ class ContainerMonitor:
                 body=raw.get('body'), participating=ready or bool(code), conflict=code))
         head = self.adapter.request(f'repos/{project.repository}/git/ref/heads/' + quote(row['work_branch'], safe=''))
         if head['ref'] != 'refs/heads/' + row['work_branch'] or head['object']['type'] != 'commit' or not head['object']['sha']:
-            raise TaskError('child_snapshot_stale')
-        return dict(collection=[child_snapshot(c) for c in children], children=result, blockers=blockers, parent_head=head['object']['sha'], iteration=row['current_iteration_id'])
+            raise SnapshotMismatch('parent_mismatch')
+        return dict(parent=parent, collection=[child_snapshot(c) for c in children], children=result, blockers=blockers, parent_head=head['object']['sha'], iteration=row['current_iteration_id'])
 
     def observe(self, project, row):
         before = self.local(row)
         first = self.collect(project, row)
         second = self.collect(project, row)
+        parent = second.pop('parent')
+        first.pop('parent')
         if first != second:
-            raise TaskError('child_snapshot_stale')
+            source = 'parent_mismatch' if first['parent_head'] != second['parent_head'] else 'child_mismatch'
+            raise SnapshotMismatch(source)
         del second['collection']  # Never-managed, non-ready children leave no durable evidence.
         encoded = json.dumps(second, sort_keys=True)
         children = [c for c in second['children'] if c['participating']]
@@ -191,7 +220,8 @@ class ContainerMonitor:
             db.execute('BEGIN IMMEDIATE')
             current = self.store.get(project.repository, row['number'])
             if self.local(row) != before or current['state'] != 'awaiting_children' or self.store.stop_requested(current):
-                raise TaskError('child_snapshot_stale')
+                raise SnapshotMismatch('local_race')
+            self.parent_guard(project, current, parent)
             # Resolve only monitor-owned blockers, after two complete observations.
             db.execute("UPDATE container_blockers SET active=0 WHERE container_issue_id=? AND blocker_key LIKE 'monitor:%'", (row['issue_id'],))
             for child_id, code in second['blockers'].items():

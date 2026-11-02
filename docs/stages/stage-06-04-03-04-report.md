@@ -99,3 +99,50 @@ GitHub не предоставляет атомарный снимок неск�
 Существующие preparation blockers автоматически не сбрасываются монитором.
 
 PR и документ приёмки не создавались; приёмка пользователем не заявляется.
+
+## Исправление семантической свежести снимка
+
+Фактическая причина ложного `child_snapshot_stale` в коде — обязательное
+равенство GitHub `parent.updated_at` времени принятого снимка. Timestamp может
+меняться по разным причинам; связь конкретного изменения #104 с Sub-issues,
+метками или комментариями остаётся гипотезой до непосредственного сравнения
+GitHub evidence. Тесты моделируют эти изменения, а не доказывают поведение
+каждого события в живом GitHub.
+
+Монитор теперь использует существующий `storage.content_hash` для свежих
+id/title/body/author и принятого target_branch (изменение branch/YAML защищено
+хешем тела). Проверяет номер и repository identity, open, ready, emergency stop,
+allowlist автора, отсутствие команд approve/reject, available, approved version,
+container state/type, iteration и выбранную canonical work branch. Присутствующая
+команда требует завершения штатной обработки команд до подтверждения монитором.
+Сервисные state labels и посторонние labels/цвет/описание, комментарии и timestamp
+родителя не входят в критерий свежести. Два чтения parent проходят один guard;
+перед SQLite commit он повторяется по последнему удалённому наблюдению и текущей
+локальной строке. Fingerprint дополнен command_guards и task_iterations, поэтому
+локальная смена guard, iteration или branch не проходит writer transaction.
+Сети внутри writer lock нет; ограничение неатомарности GitHub сохраняется.
+
+В логах без содержимого Issue различаются `parent_mismatch`, `child_mismatch`,
+`remote_read`, `local_race`. После двух успешных наблюдений старый durable
+`monitor:parent / child_snapshot_stale` снимается штатно. Повторный poll/restart
+не создаёт комментарий или поколение при неизменных подтверждённых данных.
+
+Добавлены тесты transport churn между чтениями, recovery durable blocker/restart,
+body/title/author/identity/state/ready/emergency/command changes и локальных гонок
+iteration/branch/guard. Два закрытых ребёнка и третий non-ready не дают готовности
+без доказанного merge canonical PR. Существующая отдельная регрессия
+`test_stage6433.py` с изменением `updated_at` между чтениями child body сохранена;
+GET/PATCH safeguards и `child_snapshot` не менялись.
+
+Ручной poll #104 не выполнен: в этом checkout отсутствует рабочая
+`config/config.yaml`, присутствует только пример. Внешние Issue и SQLite
+пользователя не изменялись. PR не создавался; приёмка не заявляется.
+
+Проверки исправления: `PATH="$PWD/.venv/bin:$PATH" bash scripts/test.sh` —
+**890 passed, 30 subtests passed за 155.08 s**, exit code 0, включая compileall.
+Целевой набор monitor + child preparation/CAS — **132 passed за 13.54 s**.
+После добавления отдельной регрессии уже доставленного stale blocker и его
+recovery через restart итоговый целевой monitor-набор — **53 passed за 7.71 s**.
+`git diff --check` и `git diff --cached --check` — без замечаний.
+Системный python3 не содержит pytest, поэтому проверки выполнены в существующей
+`.venv`; зависимости проекта не изменялись.

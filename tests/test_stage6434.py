@@ -374,3 +374,136 @@ def test_project_fetch_failure_invalidates_ready(env, monkeypatch):
     assert not status(store)['ready_for_integration']
     assert 'child_snapshot_stale' in codes(store)
     store.close()
+
+
+@pytest.mark.parametrize('change', ['timestamp', 'label', 'comment'])
+def test_parent_transport_churn_recovers_durable_blocker(env, change):
+    store, api, monitor, row, *rest = monitor_setup(env)
+    comments = rest[-1]
+    monitor.invalidate(row, 'child_snapshot_stale')
+    request = api.request.side_effect
+    ticks = 0
+    def changed(endpoint):
+        nonlocal ticks
+        value = request(endpoint)
+        if '/issues/' in endpoint:
+            ticks += 1
+            value['updated_at'] = f'transport-{ticks}'
+            if change == 'label':
+                value['labels'].append(dict(name='unrelated', color=str(ticks), description='metadata'))
+            if change == 'comment':
+                value['comments'] = ticks
+        return value
+    api.request.side_effect = changed
+    monitor.poll(env[1])
+    assert not codes(store)
+    assert status(store)['generation'] == 1
+    path = store.db.execute('PRAGMA database_list').fetchone()[2]
+    store.close()
+    store = Store(path)
+    ContainerMonitor(store, api).poll(env[1])
+    assert status(store)['generation'] == 1
+    assert not codes(store) and not comments
+    store.close()
+
+
+@pytest.mark.parametrize('change', ['body', 'title', 'author', 'id', 'number', 'repository', 'closed', 'ready', 'emergency', 'reject'])
+def test_parent_semantic_changes_fail_closed(env, change, caplog):
+    store, api, monitor, row, *_ = monitor_setup(env)
+    request = api.request.side_effect
+    def changed(endpoint):
+        value = request(endpoint)
+        if '/issues/' in endpoint:
+            if change in ('body', 'title'):
+                value[change] += 'changed'
+            elif change == 'author':
+                value['user']['login'] = 'intruder'
+            elif change in ('id', 'number'):
+                value[change] += 1
+            elif change == 'repository':
+                value['repository_url'] += 'other'
+            elif change == 'closed':
+                value['state'] = 'closed'
+            elif change == 'ready':
+                value['labels'] = []
+            else:
+                value['labels'].append(dict(name=env[1].label('emergency_stop' if change == 'emergency' else 'reject').name))
+        return value
+    api.request.side_effect = changed
+    monitor.poll(env[1])
+    assert codes(store) == ['child_snapshot_stale']
+    assert 'parent_mismatch' in caplog.text
+    store.close()
+
+
+@pytest.mark.parametrize('change', ['iteration', 'branch', 'guard'])
+def test_parent_local_race_before_commit(env, change, caplog):
+    store, api, monitor, row, *_ = monitor_setup(env)
+    collect = monitor.collect
+    def racing(project, current):
+        result = collect(project, current)
+        with store.db as db:
+            if change == 'iteration':
+                db.execute('UPDATE tasks SET current_iteration_id=NULL WHERE issue_id=1')
+            elif change == 'branch':
+                db.execute("UPDATE tasks SET work_branch='other' WHERE issue_id=1")
+            else:
+                db.execute("UPDATE command_guards SET observation_token='raced' WHERE number=1")
+        return result
+    monitor.collect = racing
+    monitor.poll(env[1])
+    assert codes(store) == ['child_snapshot_stale']
+    assert 'local_race' in caplog.text
+    store.close()
+
+
+def test_two_closed_children_and_third_non_ready(env):
+    store, api, monitor, row, pr, head, comments = monitor_setup(env, with_pr=False)
+    second = issue(env[1], id=3, number=3, body='```yaml\ndispatcher: {base_branch: feature/container}\n```')
+    ignored = dict(raw(env[1], issue(env[1], id=4, number=4)), labels=[])
+    store.apply(env[1], [second], partial=True)
+    with store.db as db:
+        db.execute("UPDATE tasks SET state='done' WHERE issue_id=3")
+    api.list_direct_children.return_value[0]['state'] = 'closed'
+    api.list_direct_children.return_value.extend([dict(raw(env[1], second), state='closed'), ignored])
+    request = api.request.side_effect
+    def changed(endpoint):
+        value = request(endpoint)
+        if '/issues/' in endpoint:
+            value['updated_at'] = 'later'
+        return value
+    api.request.side_effect = changed
+    monitor.poll(env[1])
+    assert status(store)['children_count'] == 2
+    assert codes(store) == ['child_merge_unverified', 'child_merge_unverified']
+    assert not status(store)['ready_for_integration']
+    monitor.poll(env[1])
+    assert len(comments) == 1 and status(store)['generation'] == 0
+    store.close()
+
+
+def test_delivered_stale_parent_blocker_restart_recovery(env):
+    store, api, monitor, row, *rest = monitor_setup(env)
+    comments = rest[-1]
+    request = api.request.side_effect
+    def stale(endpoint):
+        value = request(endpoint)
+        if '/issues/' in endpoint:
+            value['title'] += 'unapproved'
+        return value
+    api.request.side_effect = stale
+    monitor.poll(env[1])
+    assert codes(store) == ['child_snapshot_stale'] and len(comments) == 1
+    path = store.db.execute('PRAGMA database_list').fetchone()[2]
+    store.close()
+    store = Store(path)
+    monitor = ContainerMonitor(store, api)
+    monitor.poll(env[1])
+    assert len(comments) == 1
+    api.request.side_effect = request
+    monitor.poll(env[1])
+    assert not codes(store) and status(store)['generation'] == 1
+    delivered = len(comments)
+    monitor.poll(env[1])
+    assert len(comments) == delivered and status(store)['generation'] == 1
+    store.close()
