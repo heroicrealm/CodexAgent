@@ -22,6 +22,7 @@ class PullRequestMonitor:
 
     def poll(self, project):
         db = self.store.db
+        discovery_errors = self.discover_manual(project)
         rows = db.execute('''SELECT DISTINCT p.*,h.iteration_id,t.number,t.repository,t.state AS task_state
             FROM task_pull_requests p JOIN iteration_pr_history h USING(pr_id)
             JOIN tasks t ON t.issue_id=p.issue_id
@@ -35,7 +36,7 @@ class PullRequestMonitor:
             ((t.state='review' AND t.current_iteration_id=h.iteration_id)
              OR (r.pr_id IS NOT NULL AND (o.outcome IS NULL OR o.outcome!='completed')))''',
             (project.repository.casefold(),)).fetchall()
-        errors = []
+        errors = discovery_errors
         for linked in rows:
             database = db.execute('PRAGMA database_list').fetchone()[2]
             with (Path(database).parent / f'pr-resolution-{linked["pr_id"]}.lock').open('a') as lock:
@@ -58,6 +59,51 @@ class PullRequestMonitor:
                         db.execute('UPDATE pr_resolutions SET error=? WHERE pr_id=? AND iteration_id=?',
                                    ('github_or_storage_unavailable', linked['pr_id'], linked['iteration_id']))
                     errors.append(linked['number'])
+        return errors
+
+    def discover_manual(self, project):
+        """Bind human PRs before normal resolution, including already merged PRs."""
+        from dispatcher.container_monitor import ContainerMonitor
+        from dispatcher.workspace import TaskError
+        errors = []
+        rows = self.store.db.execute("""SELECT * FROM tasks t WHERE repository=? AND state='review'
+            AND issue_type='issue' AND run_codex=0 AND NOT EXISTS
+            (SELECT 1 FROM task_pull_requests p WHERE p.issue_id=t.issue_id)""", (project.repository.casefold(),)).fetchall()
+        for row in rows:
+            try:
+                if self.store.stop_requested(row):
+                    continue
+                claim = self.store.db.execute("SELECT payload FROM container_operations WHERE container_issue_id=? AND iteration_id=? AND kind='branch' AND phase='confirmed' AND outcome='success'",
+                    (row['issue_id'], row['current_iteration_id'])).fetchone()
+                if not claim or json.loads(claim['payload']).get('branch') != row['work_branch']:
+                    raise TaskError('pr_identity_conflict')
+                evidence, _ = ContainerMonitor(self.store, self.adapter).prs(project, row)
+                if not evidence:
+                    continue
+                pr = evidence[0]
+                import re
+                if not rest_id(pr['id']) or not rest_id(pr['number']) or not re.fullmatch(r'[0-9a-f]{40,64}', pr['head_sha']):
+                    raise TaskError('pr_identity_conflict')
+                if pr['base'] != row['base_branch'] and not pr['merged']:
+                    raise TaskError('pr_identity_conflict')
+                with self.store.db as db:
+                    db.execute('BEGIN IMMEDIATE')
+                    current = self.store.get(project.repository, row['number'])
+                    if (current['state'] != 'review' or current['current_iteration_id'] != row['current_iteration_id']
+                            or self.store.stop_requested(current)):
+                        continue
+                    foreign = db.execute('SELECT * FROM task_pull_requests WHERE pr_id=? OR (repository_id=? AND pr_number=?) OR issue_id=?',
+                        (pr['id'], row['repository_id'], pr['number'], row['issue_id'])).fetchall()
+                    if foreign:
+                        raise TaskError('pr_identity_conflict')
+                    db.execute('INSERT INTO task_pull_requests VALUES(?,?,?,?,?,?,?,?,?)',
+                        (pr['id'], row['issue_id'], row['repository_id'], pr['number'], pr['head'],
+                         row['base_branch'], pr['head_sha'], pr['state'], pr['merged_at']))
+                    from dispatcher.storage import now
+                    db.execute('INSERT INTO iteration_pr_history(iteration_id,pr_id,head_sha,created_at) VALUES(?,?,?,?)',
+                        (row['current_iteration_id'], pr['id'], pr['head_sha'], now()))
+            except (GitHubError, TaskError, ValueError, TypeError, KeyError, AttributeError, sqlite3.Error):
+                errors.append(row['number'])
         return errors
 
     def resolve(self, project, linked, key):

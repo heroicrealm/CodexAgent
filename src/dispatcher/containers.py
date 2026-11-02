@@ -44,7 +44,7 @@ class ContainerService:
     def guard(self, project, expected, state='pending'):
         current = self.store.get(project.repository, expected['number'])
         if (not current or self.store.stop_requested(current)
-                or current['issue_type'] != 'container' or current['current_iteration_id'] is None
+                or current['current_iteration_id'] is None
                 or not current['available'] or current['state'] != state
                 or current['version'] != expected['version']
                 or current['approved_version'] != expected['version']
@@ -62,10 +62,9 @@ class ContainerService:
                 or raw.get('repository_url', '').casefold() != f'https://api.github.com/repos/{project.repository}'.casefold()
                 or raw.get('state') != 'open' or raw.get('body', '') != issue['body']
                 or raw.get('title') != issue['title']
-                or raw.get('updated_at') != issue.get('updated_at')
                 or raw.get('user', {}).get('login', '').casefold() != issue['author'].casefold()
                 or project.task_label.casefold() not in names
-                or project.label('emergency_stop').name.casefold() in names
+                or any(project.label(k).name.casefold() in names for k in ('emergency_stop', 'approve', 'reject'))
                 or issue['author'].casefold() not in {a.casefold() for a in project.allowed_authors}):
             raise TaskError('container_stale')
         return raw
@@ -227,7 +226,7 @@ class ContainerService:
         with self.store.db as db:
             db.execute("UPDATE container_blockers SET active=0 WHERE container_issue_id=? AND code IN ('container_stale','container_github_unavailable','fetch_failed','clone_url_unavailable','git_command_failed','git_unavailable')", (row['issue_id'],))
         params, _ = parse(json.loads(row['snapshot'])['body'])
-        if params.get('issue_type') != 'container':
+        if row['issue_type'] != 'container' and row['run_codex']:
             raise TaskError('container_stale')
         issue = json.loads(row['snapshot'])
         branch = self.git.branch(project, issue)
@@ -298,6 +297,17 @@ class ContainerService:
         self.operation(row, 'branch', payload, 'confirmed', payload['sha'])
         with self.store.db as db:
             db.execute("UPDATE container_blockers SET active=0 WHERE container_issue_id=? AND blocker_key='parent'", (row['issue_id'],))
+        if row['issue_type'] == 'issue':
+            self.guard(project, row)
+            stamp = self.adapter.response_date
+            guard = self.store.guard(project.repository, row['number'])
+            return self.store.transition(repository=project.repository, number=row['number'],
+                expected_state='pending', version=row['version'], iteration_id=row['current_iteration_id'],
+                target='review', event_key=key + ':review',
+                authority=Authority('branch-publisher', ('branch-publisher',), role='observer'),
+                evidence=Evidence(row['repository_id'], row['issue_id'], row['number'], stamp, stamp,
+                    guard['server_at'], row['content_hash'], row['current_iteration_id'], 'pending',
+                    container_operation=key))
         children = self.adapter.list_direct_children(project, row)
         seen, blocked = set(), False
         for child in children:

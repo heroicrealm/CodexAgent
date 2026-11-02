@@ -21,7 +21,7 @@ from dispatcher.runtime import identity
 from dispatcher.storage import Store, now
 from dispatcher.workspace import GitWorkspaceManager, TaskError
 
-SAFE_CODES = frozenset('''attachment_download_failed git_unavailable git_operation_failed
+SAFE_CODES = frozenset('''child_snapshot_stale attachment_download_failed git_unavailable git_operation_failed
     branch_ownership_conflict retry_identity_conflict remote_branch_missing fetch_failed remote_head_changed reopen_failed pr_merged pr_identity_conflict retry_sha_unavailable retry_workspace_conflict no_diff non_fast_forward publication_conflict publication_unavailable origin_changed default_branch_unavailable invalid_branch default_branch_protected worktree_already_exists clone_url_unavailable
     unexpected_branch dirty_worktree no_commit rewritten_history unsupported_codex_cli
     codex_failed codex_timeout force_stop stop_requested quota_exhausted crash_recovery internal_error unsafe_path'''.split())
@@ -59,7 +59,10 @@ class Dispatcher:
                 continue
             if row['pid'] and row['exit_code'] is None:
                 self.execution.update(row['attempt_id'], recovery_diagnostic='process_completion_unconfirmed')
-            if row['exit_code'] == 0 and row['codex_started'] and not self.pr_publisher.pending(row['attempt_id']):
+            recovering_task = self.store.get(row['repository'], row['number'])
+            manual_integration = (recovering_task['issue_type'] == 'container' and not recovering_task['run_codex']
+                                  and row['initial_sha'] and row['worktree'])
+            if ((row['exit_code'] == 0 and row['codex_started']) or manual_integration) and not self.pr_publisher.pending(row['attempt_id']):
                 self.pr_publisher.intent(row['attempt_id'])
             if self.pr_publisher.pending(row["attempt_id"]):
                 continue
@@ -99,14 +102,21 @@ class Dispatcher:
         for project in order:
             if self.lifecycle.stopping or len(self.active) >= self.config.max_parallel_tasks:
                 return
-            candidates = [r for r in self.store.queue(project.repository) if r['state'] == 'pending'
+            candidates = [r for r in self.store.queue(project.repository) if r['state'] in ('pending', 'awaiting_children')
                           and r['available'] and r['version'] == r['approved_version']]
             for candidate in candidates:
+                if candidate['state'] == 'awaiting_children':
+                    # Pending publication is resumed by the publisher, never by
+                    # admission. In particular a manual container stays here.
+                    if self.store.db.execute('SELECT 1 FROM attempts WHERE iteration_id=?', (candidate['current_iteration_id'],)).fetchone():
+                        continue
+                    ready = self.store.db.execute('SELECT ready_for_integration FROM container_readiness WHERE container_issue_id=?', (candidate['issue_id'],)).fetchone()
+                    no_diff = not candidate['run_codex'] and self.store.db.execute("SELECT 1 FROM container_blockers WHERE container_issue_id=? AND active=1 AND code='no_diff'", (candidate['issue_id'],)).fetchone()
+                    if not (ready and ready[0]) and not no_diff:
+                        continue
                 if self.lifecycle.stopping:
                     return
-                if candidate['issue_type'] == 'issue' and not candidate['run_codex']:
-                    continue  # Manual execution belongs to stage 6.4.3.5.
-                if candidate['issue_type'] != 'container' and not self.quota.check(fresh=True):
+                if candidate['issue_type'] != 'container' and candidate['run_codex'] and not self.quota.check(fresh=True):
                     return
                 try:
                     # Full authoritative snapshot also applies revocation/version changes
@@ -115,18 +125,29 @@ class Dispatcher:
                     observation = {}
                     self.store.apply(project, items, observation=observation)
                     current = observation.get(candidate['number'])
-                    if (not current or current['state'] != 'pending' or not current['available']
+                    if (not current or current['state'] != candidate['state'] or not current['available']
                             or current['version'] != candidate['version']):
                         continue
                     current = dict(current, **self.store.branches(project.repository, candidate['number']))
-                    if current['issue_type'] == 'container':
+                    integration = None
+                    if current['state'] == 'pending' and (current['issue_type'] == 'container' or not current['run_codex']):
                         self.containers.prepare(project, current)
                         continue
-                    if not current['run_codex']:
-                        continue
+                    if current['issue_type'] == 'container':
+                        from dispatcher.integration import readiness, manual_diff
+                        if not current['run_codex'] and not manual_diff(self.store, self.adapter, self.git, project, current):
+                            continue
+                        integration = readiness(self.store, self.adapter, project, current)
+                        from dispatcher.integration import branch_guard
+                        branch_guard(self.store, self.git, project, current, integration['snapshot'])
+                        if current['run_codex'] and not self.quota.check(fresh=True):
+                            return
                     if self.store.child_update_pending(current):
                         continue
                     issue = json.loads(current['snapshot'])
+                    if integration:
+                        issue['integration'] = integration['snapshot']
+                        issue['integration_head'] = integration['snapshot']['parent_head']
                     try:
                         params = preparation_error.parameters(issue['body'])
                         preparation_project = replace(project, base_branch=current['base_branch'] or params.get('base_branch', project.base_branch))
@@ -208,7 +229,7 @@ class Dispatcher:
                     if self.lifecycle.stopping:
                         return
                     attempt = self.execution.reserve(current, branch, self.config.max_parallel_tasks,
-                                                     current['observation_token'])
+                                                     current['observation_token'], integration=integration)
                     if not attempt:
                         collision = self.store.db.execute("""SELECT 1 FROM tasks t
                             LEFT JOIN attempts a ON a.repository=t.repository AND a.number=t.number
@@ -242,6 +263,13 @@ class Dispatcher:
                         origin = self.git.git(worktree, 'remote', 'get-url', 'origin').stdout.strip()
                         self.execution.update(attempt, origin_url=origin)
                         fence(self.store, self.adapter, project, self.execution.get(attempt))
+                        if integration:
+                            from dispatcher.integration import verified
+                            verified(self.store, self.adapter, project, self.store.get(project.repository, issue['number']), integration['snapshot'])
+                        if not current['run_codex']:
+                            self.pr_publisher.intent(attempt)
+                            self.pr_publisher.publish(preparation_project, self.execution.get(attempt))
+                            continue
                         self.attachments.operation_guard = local_guard
                         paths = self.attachments.prepare(issue['body'], task)
                         self.attachments.operation_guard = None
@@ -290,6 +318,10 @@ class Dispatcher:
                           project=project.id, task=candidate['number'], reason='branch_ownership_conflict')
                     continue
                 except (GitHubError, TaskError) as exc:
+                    if candidate['state'] == 'awaiting_children':
+                        from dispatcher.container_monitor import ContainerMonitor
+                        ContainerMonitor(self.store, self.adapter).invalidate(candidate, 'child_snapshot_stale')
+                        container_diagnostic.reconcile(self.store, self.adapter, candidate)
                     if isinstance(exc, TaskError) and exc.code in preparation_error.CODES:
                         preparation_error.record(self.store, current, exc.code)
                         continue

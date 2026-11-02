@@ -135,7 +135,7 @@ class ContainerMonitor:
                 or names & commands
                 or semantic['author'].casefold() not in {a.casefold() for a in project.allowed_authors}
                 or row['approved_version'] != row['version'] or not row['available']
-                or row['state'] != 'awaiting_children' or row['issue_type'] != 'container'
+                or row['state'] not in ('awaiting_children', 'running') or row['issue_type'] != 'container'
                 or not row['current_iteration_id'] or not row['work_branch']
                 or self.store.stop_requested(row)
                 or not guard or not guard['available'] or guard['version'] != row['version'] or guard['content_hash'] != row['content_hash']):
@@ -206,11 +206,14 @@ class ContainerMonitor:
                     code = 'child_relation_removed'
             except TaskError as exc:
                 code = exc.code
+            if any(project.label(k).name.casefold() in {label['name'].casefold() for label in raw['labels']}
+                   for k in ('approve', 'reject', 'emergency_stop')):
+                code = 'child_snapshot_stale'
             if code:
                 blockers[child['issue_id']] = code
             result.append(dict(issue_id=child['issue_id'], repository_id=child['repository_id'],
                 number=child['number'], state=child['state'], ready=ready, prs=evidence,
-                updated_at=raw['updated_at'], labels=sorted(l['name'] for l in raw['labels']),
+                title=raw['title'], url=f'https://github.com/{project.repository}/issues/{child["number"]}',
                 body=raw.get('body'), participating=ready or bool(code), conflict=code))
         head = self.adapter.request(f'repos/{project.repository}/git/ref/heads/' + quote(row['work_branch'], safe=''))
         if head['ref'] != 'refs/heads/' + row['work_branch'] or head['object']['type'] != 'commit' or not head['object']['sha']:

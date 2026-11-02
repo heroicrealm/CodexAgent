@@ -114,6 +114,7 @@ def test_show_json_populated_sections(unicode_task, capsys):
         store.db.execute("INSERT INTO result_outbox(attempt_id,body,published,comment_id) VALUES('a1','private',1,'c1')")
         store.db.execute("INSERT INTO quota_observation VALUES(1,'available','now','ok')")
     expected = dict(store.get('owner/repo', 1))
+    expected['execution_mode'] = 'codex'
     expected['decisions'] = [dict(r) for r in store.db.execute('SELECT * FROM decisions')]
     expected['command_diagnostics'] = [dict(r) for r in store.db.execute('SELECT action,event_id,reason FROM command_quarantine')]
     expected['attempts'] = [dict(r) for r in store.db.execute('SELECT * FROM attempts')]

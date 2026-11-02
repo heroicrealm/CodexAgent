@@ -77,12 +77,22 @@ class PullRequestPublisher:
                 terminal.drain(project, attempt)
                 return
             fence(self.store, self.adapter, project, attempt)
+            # A committed review is immutable even if children change later.
+            # Resume only delivery after a crash between CAS, finish and labels.
+            reviewed = self.store.db.execute("SELECT 1 FROM task_transitions WHERE event_key=? AND issue_id=? AND iteration_id=? AND to_state='review'",
+                (key, task['issue_id'], iteration)).fetchone()
+            if task['state'] == 'review' and task['current_iteration_id'] == iteration and reviewed:
+                self.execution.finish(attempt['attempt_id'], 'review', category='CODEX' if task['run_codex'] else 'DISPATCHER')
+                self.adapter.reconcile(project, task, store=self.store)
+                progress('label', 'completed')
+                return
             # Persist once, including fallback, before any Git/HTTP publication.
             # The operation flock serializes selection across publisher processes.
             saved = self.store.db.execute(
                 'SELECT body FROM attempt_summaries WHERE attempt_id=?', (attempt['attempt_id'],)).fetchone()
             if saved is None:
-                summary = f'implementation for Issue #{attempt["number"]}.'
+                summary = (f'Integration of the prepared branch for Issue #{attempt["number"]}; Codex was not run.'
+                           if task['issue_type'] == 'container' and not task['run_codex'] else f'implementation for Issue #{attempt["number"]}.')
                 if attempt['exit_code'] == 0 and attempt['codex_started'] and attempt['worktree']:
                     summary = final_summary(Path(attempt['worktree']).parent /
                         (attempt['attempt_id'] + '.codex.log'), summary)
@@ -110,7 +120,7 @@ class PullRequestPublisher:
                 repeated = prior is not None
             if repeated and prior is None:
                 raise TaskError('pr_identity_conflict', 'GITHUB')
-            if task['state'] not in ('running', 'review'):
+            if task['state'] not in ('running', 'review', 'awaiting_children'):
                 raise TaskError('publication_conflict', 'GITHUB')
             if repeated:
                 observed = self.adapter.request(f'repos/{project.repository}/pulls/{prior["pr_number"]}')
@@ -120,12 +130,13 @@ class PullRequestPublisher:
                     return
             worktree = Path(attempt['worktree'])
             fence(self.store, self.adapter, project, attempt)
+            commit_options = {'allow_commit': False} if task['issue_type'] == 'container' and not task['run_codex'] else {}
             sha = self.git.publication_commit(worktree, attempt['branch'], attempt['initial_sha'], project.base_branch,
-                before_commit=lambda: fence(self.store, self.adapter, project, attempt))
+                before_commit=lambda: fence(self.store, self.adapter, project, attempt), **commit_options)
             self.execution.update(attempt['attempt_id'], result_sha=sha)
             phase = 'push'
             progress(phase)
-            if repeated:
+            if repeated or task['issue_type'] == 'container':
                 remote_before = self.git.git(worktree, 'ls-remote', 'origin',
                                             'refs/heads/' + attempt['branch']).stdout.split()
                 # A lost push response may already have installed our persisted result.
@@ -141,13 +152,16 @@ class PullRequestPublisher:
             if not remote or remote[0] != sha:
                 raise GitHubError(kind='invalid_response')
             self.execution.update(attempt['attempt_id'], pushed=1, remote_sha=sha)
+            if task['issue_type'] == 'container':
+                from dispatcher.integration import publication_guard
+                publication_guard(self.store, self.adapter, project, task)
             phase = 'pr'
             progress(phase)
             repo = project.repository
             marker = f'<!-- codex-pr:{task["repository_id"]}:{task["issue_id"]}:{iteration} -->'
             def find():
                 candidates = self.adapter.pages(f'repos/{repo}/pulls?' + urlencode(dict(
-                    state='all', head=repo.split('/')[0] + ':' + attempt['branch'], base=project.base_branch)))
+                    state='all', head=repo.split('/')[0] + ':' + attempt['branch'])))
                 if not isinstance(candidates, list) or any(not isinstance(p, dict) for p in candidates):
                     raise GitHubError(kind='invalid_response')
                 if len(candidates) > 1:
@@ -229,20 +243,24 @@ class PullRequestPublisher:
                 raise TaskError('publication_conflict', 'GITHUB')
             if reuse_key:
                 self.store.publication(reuse_key, iteration, 'confirmed', 'completed')
+            if task['issue_type'] == 'container':
+                from dispatcher.integration import publication_guard
+                publication_guard(self.store, self.adapter, project, task)
             guard = self.store.guard(project.repository, task['number'])
             server_fence = guard['server_at'] or json.loads(task['snapshot']).get('server_observed_at')
+            expected_state = 'awaiting_children' if task['issue_type'] == 'container' and not task['run_codex'] else 'running'
             proof = Evidence(task['repository_id'], task['issue_id'], task['number'], stamp, stamp,
-                server_fence, task['content_hash'], iteration, 'running', available=bool(task['available']), pr_id=pr['id'], pr_number=pr['number'],
+                server_fence, task['content_hash'], iteration, expected_state, available=bool(task['available']), pr_id=pr['id'], pr_number=pr['number'],
                 head=attempt['branch'], base=project.base_branch, head_sha=sha, pr_state='open',
                 merged=False, linked_issue_id=task['issue_id'])
             result = self.store.transition(repository=project.repository, number=task['number'],
-                expected_state='running', version=attempt['version'], iteration_id=iteration,
+                expected_state=expected_state, version=attempt['version'], iteration_id=iteration,
                 target='review', event_key=key, authority=Authority('publisher', ('publisher',), role='observer'), evidence=proof)
             if result in ('missing_evidence', 'identity_unresolved'):
                 raise GitHubError(kind='invalid_response')
             if result not in ('applied', 'already_applied'):
                 raise TaskError('publication_conflict', 'GITHUB')
-            self.execution.finish(attempt['attempt_id'], 'review')
+            self.execution.finish(attempt['attempt_id'], 'review', category='CODEX' if task['run_codex'] else 'DISPATCHER')
             phase = 'label'
             progress(phase)
             self.adapter.reconcile(project, self.store.get(project.repository, task['number']), store=self.store)
@@ -257,6 +275,14 @@ class PullRequestPublisher:
             if reuse_key:
                 self.store.publication(reuse_key, iteration, exc.code, 'failed', retry=True)
             self.execution.update(attempt['attempt_id'], recovery_diagnostic=exc.code)
+            if task['issue_type'] == 'container' and exc.code in ('no_diff', 'child_snapshot_stale'):
+                from dispatcher.containers import ContainerService
+                from dispatcher import container_diagnostic
+                ContainerService(self.store, self.adapter, self.git).block(task, exc.code)
+                container_diagnostic.reconcile(self.store, self.adapter, task)
+                self.execution.finish(attempt['attempt_id'], 'failed', exc.code, exc.category)
+                progress('terminal', 'failed')
+                return
             if exc.code == 'no_diff' or (exc.code == 'publication_conflict' and not repeated):
                 self.execution.finish(attempt['attempt_id'], 'failed', exc.code, exc.category)
                 progress('terminal', 'failed')

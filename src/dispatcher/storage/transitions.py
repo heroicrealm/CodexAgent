@@ -103,9 +103,13 @@ def transition(store, *, repository, number, expected_state, version, iteration_
         if store.stop_requested(row):
             return Outcome.CONFLICT
         edges = {('pending', 'awaiting_children'), ('discovered', 'pending'), ('discovered', 'rejected'), ('pending', 'running'),
-                 ('running', 'review'), ('review', 'done'), ('review', 'rejected'),
+                 ('running', 'review'), ('pending', 'review'), ('awaiting_children', 'review'), ('review', 'done'), ('review', 'rejected'),
                  ('rejected', 'pending'), ('rejected', 'cancelled')}
         if row['state'] != expected_state or (expected_state, target) not in edges:
+            return Outcome.INVALID_TRANSITION
+        if expected_state == 'pending' and target == 'review' and (row['issue_type'] != 'issue' or row['run_codex']):
+            return Outcome.INVALID_TRANSITION
+        if expected_state == 'awaiting_children' and target == 'review' and (row['issue_type'] != 'container' or row['run_codex']):
             return Outcome.INVALID_TRANSITION
         if not isinstance(evidence, Evidence) or not evidence.available:
             return Outcome.MISSING_EVIDENCE
@@ -174,7 +178,16 @@ def transition(store, *, repository, number, expected_state, version, iteration_
                 reservation.observation, event_key=event_key, actor=authority.actor,
                 evidence=dict(asdict(evidence), expected_iteration_id=request_iteration))
             return Outcome.APPLIED if attempt else Outcome.CONFLICT
-        if target in ('review', 'done') or (expected_state == 'review' and target == 'rejected'):
+        manual_branch = target == 'review' and expected_state == 'pending' and row['issue_type'] == 'issue' and not row['run_codex']
+        if manual_branch:
+            operation = db.execute("SELECT * FROM container_operations WHERE operation_key=? AND container_issue_id=? AND iteration_id=? AND kind='branch' AND phase='confirmed' AND outcome='success'",
+                (evidence.container_operation, row['issue_id'], iteration_id)).fetchone()
+            if not operation or row['approved_version'] != version or not row['available']:
+                return Outcome.MISSING_EVIDENCE
+            payload = json.loads(operation['payload'])
+            if payload.get('branch') != row['work_branch'] or payload.get('base') != row['base_branch'] or not payload.get('sha') or payload['sha'] != operation['remote_identity']:
+                return Outcome.CONFLICT
+        if not manual_branch and (target in ('review', 'done') or (expected_state == 'review' and target == 'rejected')):
             if not rest_id(iteration_id):
                 return Outcome.MISSING_EVIDENCE
             if (not rest_id(evidence.pr_id) or not rest_id(evidence.pr_number)

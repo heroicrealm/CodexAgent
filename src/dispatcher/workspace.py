@@ -271,6 +271,9 @@ class GitWorkspaceManager:
                 return worktree, self.git(worktree, 'rev-parse', 'HEAD').stdout.strip()
         if not exists and self.git(repo, 'show-ref', '--verify', f'refs/remotes/origin/{project.base_branch}', check=False).returncode:
             raise TaskError('base_branch_missing', 'GIT')
+        if issue.get('integration_head'):
+            if not exists or self.git(repo, 'rev-parse', remote).stdout.strip() != issue['integration_head']:
+                raise TaskError('remote_head_changed', 'GIT')
         base = issue.get('retry_sha') or (remote if exists else f'refs/remotes/origin/{project.base_branch}')
         if self.git(repo, 'show-ref', '--verify', 'refs/heads/' + branch, check=False).returncode == 0:
             raise TaskError('branch_ownership_conflict', 'GIT')
@@ -358,11 +361,13 @@ class GitWorkspaceManager:
             raise TaskError('rewritten_history', 'GIT')
         return sha
 
-    def publication_commit(self, worktree, branch, initial_sha, base, *, salvage=False, before_commit=None):
+    def publication_commit(self, worktree, branch, initial_sha, base, *, salvage=False, before_commit=None, allow_commit=True):
         safe_path(self.config.workspace, worktree)
         if self.git(worktree, 'symbolic-ref', '--short', 'HEAD').stdout.strip() != branch:
             raise TaskError('unexpected_branch', 'GIT')
         if self.git(worktree, 'status', '--porcelain').stdout.strip():
+            if not allow_commit:
+                raise TaskError('dirty_worktree', 'GIT')
             self.git(worktree, 'add', '--all')
             if before_commit:
                 before_commit()

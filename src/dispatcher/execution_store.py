@@ -8,15 +8,16 @@ class ExecutionStore:
     def __init__(self, store):
         self.store, self.db = store, store.db
 
-    def reserve(self, row, branch, maximum, observation):
+    def reserve(self, row, branch, maximum, observation, integration=None):
         with self.db:
             self.db.execute('BEGIN IMMEDIATE')
-            return self._reserve(row, branch, maximum, observation)
+            return self._reserve(row, branch, maximum, observation, integration=integration)
 
-    def _reserve(self, row, branch, maximum, observation, *, event_key=None, actor='scheduler', evidence=None):
+    def _reserve(self, row, branch, maximum, observation, *, event_key=None, actor='scheduler', evidence=None, integration=None):
         """Admission implementation; caller owns the SQLite transaction."""
         guard = self.store.guard(row['repository'], row['number'])
-        if (row['issue_type'] != 'issue' or not row['run_codex']
+        container = row['issue_type'] == 'container' and integration is not None
+        if ((not container and (row['issue_type'] != 'issue' or not row['run_codex']))
                 or self.store.stop_requested(row) or self.store.child_update_pending(row)):
             return None
         if not guard or guard['observation_token'] != observation:
@@ -40,11 +41,28 @@ class ExecutionStore:
             return None
         current = self.store.get(row['repository'], row['number'])
         if (not current or (current['work_branch'] is not None and current['work_branch'] != branch)
-                or current['state'] != 'pending' or not current['available']
+                or current['state'] != ('awaiting_children' if container else 'pending') or not current['available']
                 or current['approved_version'] != current['version'] or current['content_hash'] != row['content_hash']
                 or current['version'] != row['version'] or current['current_iteration_id'] != row['current_iteration_id']):
             return None
-        if not self.store._set_state(current, 'running', current['approved_version']):
+        if container:
+            ready = self.db.execute('SELECT * FROM container_readiness WHERE container_issue_id=?', (row['issue_id'],)).fetchone()
+            if (not ready or not ready['ready_for_integration'] or ready['generation'] != integration['generation']
+                    or self.db.execute('SELECT 1 FROM container_blockers WHERE container_issue_id=? AND active=1', (row['issue_id'],)).fetchone()
+                    or self.db.execute('SELECT 1 FROM attempts WHERE iteration_id=?', (row['current_iteration_id'],)).fetchone()):
+                return None
+            import hashlib, json
+            from dispatcher.integration import semantic
+            pinned = self.db.execute('SELECT snapshot FROM container_integration_snapshots WHERE container_issue_id=? AND generation=?',
+                (row['issue_id'], integration['generation'])).fetchone()
+            if not pinned or semantic(json.loads(pinned['snapshot'])) != semantic(integration['snapshot']):
+                return None
+            payload = json.dumps(integration, sort_keys=True)
+            kind = 'integration:' + str(integration['generation'])
+            key = f'container:{row["issue_id"]}:{row["current_iteration_id"]}:{kind}'
+            self.db.execute("INSERT INTO container_operations VALUES(?,?,?,?,NULL,?,?,'confirmed','success',0,NULL,?)",
+                (key, row['issue_id'], row['current_iteration_id'], kind, hashlib.sha256(payload.encode()).hexdigest(), payload, now()))
+        if (not container or row['run_codex']) and not self.store._set_state(current, 'running', current['approved_version']):
             return None
         current = self.store.get(row['repository'], row['number'])
         if current['current_iteration_id'] is None:
@@ -55,8 +73,8 @@ class ExecutionStore:
         self.db.execute('''INSERT INTO attempts(attempt_id,repository,number,version,branch,state,started_at,iteration_id,attempt_number)
             VALUES(?,?,?,?,?,'running',?,?,1)''',
             (attempt, row['repository'], row['number'], row['version'], branch, now(), self.store.get(row['repository'], row['number'])['current_iteration_id']))
-        self.store._record_transition(row, 'running', event_key or 'reserve:' + attempt, actor, evidence, iteration_id=current['current_iteration_id'])
-        self.store._history(row['repository'], row['number'], row['version'], 'running', row['snapshot'], now())
+        self.store._record_transition(row, current['state'], event_key or 'reserve:' + attempt, actor, evidence, iteration_id=current['current_iteration_id'])
+        self.store._history(row['repository'], row['number'], row['version'], current['state'], row['snapshot'], now())
         return attempt
 
     def update(self, attempt, **values):

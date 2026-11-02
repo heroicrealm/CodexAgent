@@ -11,6 +11,7 @@ from dispatcher.github import GitHubError
 TRANSIENT = frozenset(('container_github_unavailable', 'fetch_failed', 'clone_url_unavailable',
                        'git_command_failed', 'git_unavailable', 'child_body_unconfirmed'))
 GUIDANCE = {
+    'no_diff': 'Ветка контейнера не отличается от закреплённой base. Добавьте реальные изменения; искусственный коммит не создаётся.',
     'branch_ownership_conflict': 'Ветка уже существует или закреплена за другой задачей. Изменение branch в этой Issue может быть отклонено: прежнее имя уже сохранено. Пока нет безопасного подтверждённого reset-claim, создайте новую Issue с новым именем.',
     'container_branch_conflict': 'Canonical branch этой Issue уже закреплена. Не меняйте YAML branch повторно; создайте новую Issue с новым именем. Поддерживаемого reset-claim пока нет.',
     'child_body_conflict': 'Автоматическое обновление дочерней Issue остановлено. Проверьте её изменения и параметры base_branch; не перезаписывайте body без проверки.',

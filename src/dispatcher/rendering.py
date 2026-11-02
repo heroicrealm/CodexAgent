@@ -20,6 +20,8 @@ def display_task(row):
             value[key] = json.dumps(json.loads(value[key]), ensure_ascii=False)
         except (KeyError, ValueError, TypeError):
             pass
+    if 'run_codex' in value:
+        value['execution_mode'] = 'codex' if value['run_codex'] else 'manual'
     return value
 
 
@@ -128,6 +130,8 @@ def render_queue(rows, projects, format='table', stream=None):
         print(framed_row(rendered), file=stream)
     print(border(widths, '└', '┴', '┘'), file=stream)
     for row in rows:
+        if 'issue_type' in row:
+            print(f"Issue {row['number']}: issue_type={row['issue_type']} execution_mode={row.get('execution_mode', 'codex' if row.get('run_codex', True) else 'manual')}", file=stream)
         if 'generation' in row:
             render_frame([[f"Container #{row['number']}: generation={row['generation']} ready={row['ready_for_integration']}",
                            f"children={row['children_count']} done={row['completed_count']} waiting={row['waiting_count']} conflicts={row['conflict_count']}"]], stream)
@@ -170,7 +174,7 @@ def render_show(value, format='table', stream=None):
                              ('Children', value, 'children_count'), ('Completed children', value, 'completed_count'),
                              ('Waiting children', value, 'waiting_count'), ('Conflicting children', value, 'conflict_count'),
                              ('Integration generation', value, 'generation'), ('Ready for integration', value, 'ready_for_integration'),
-                             ('Issue type', value, 'issue_type'), ('Run Codex', value, 'run_codex'),
+                             ('Issue type', value, 'issue_type'), ('Execution mode', value, 'execution_mode'), ('Run Codex', value, 'run_codex'),
                              ('Version', value, 'version'), ('Current iteration', value, 'current_iteration_id'), ('Approved version', value, 'approved_version'),
                              ('Available', value, 'available'), ('Created', value, 'created_at'),
                              ('Synced', value, 'synced_at')]:
