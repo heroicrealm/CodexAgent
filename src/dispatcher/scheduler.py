@@ -3,7 +3,7 @@ import json
 import sqlite3
 import time
 from dataclasses import replace
-from dispatcher import preparation_error
+from dispatcher import preparation_error, container_diagnostic
 from dispatcher.containers import ContainerService
 from dispatcher.detachment import StopController, StopWatcher, fence, live_processes
 from dispatcher.attachments import IssueAttachmentManager
@@ -377,6 +377,8 @@ class Dispatcher:
                 self.admit()
             if time.monotonic() >= self.next_publish:
                 preparation_error.flush(self.store, self.adapter, self.config.projects)
+                self.containers.recover_diagnostics(self.config.projects)
+                container_diagnostic.flush(self.store, self.adapter, self.config.projects)
                 self.pr_publisher.flush(self.config.projects)
                 self.publisher.flush()
                 self.stops.diagnostics()

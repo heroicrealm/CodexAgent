@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 from dispatcher.github import GitHubError
+from dispatcher import container_diagnostic
 from dispatcher.issue_parameters import parse, with_base_branch
 from dispatcher.storage import now
 from dispatcher.storage.transitions import Authority, Evidence
@@ -40,11 +41,11 @@ class ContainerService:
                 code=excluded.code,active=1,updated_at=excluded.updated_at''',
                 (row['issue_id'], str(child or 'parent'), child, code, code, now()))
 
-    def guard(self, project, expected):
+    def guard(self, project, expected, state='pending'):
         current = self.store.get(project.repository, expected['number'])
         if (not current or self.store.stop_requested(current)
                 or current['issue_type'] != 'container' or current['current_iteration_id'] is None
-                or not current['available'] or current['state'] != 'pending'
+                or not current['available'] or current['state'] != state
                 or current['version'] != expected['version']
                 or current['approved_version'] != expected['version']
                 or current['current_iteration_id'] != expected['current_iteration_id']):
@@ -184,14 +185,57 @@ class ContainerService:
             except BlockingIOError:
                 return
             try:
-                return self._prepare(project, row)
+                result = self._prepare(project, row)
             except (TaskError, GitHubError) as exc:
+                if row['state'] != 'pending':
+                    return  # Recovery needs fresh external evidence before announcing success.
                 self.block(row, exc.code if isinstance(exc, TaskError) else 'container_github_unavailable')
+                result = None
+            container_diagnostic.reconcile(self.store, self.adapter, row)
+            return result
         finally:
             self.git.operation_guard = None
             os.close(fd)
 
+    def recover_diagnostics(self, projects):
+        # A crash can occur after the transition but before recording recovery.
+        rows = self.store.db.execute("""SELECT t.* FROM tasks t
+            JOIN container_diagnostic_state d ON d.issue_id=t.issue_id
+            WHERE t.state='awaiting_children' AND (d.signature!='recovered'
+            OR EXISTS(SELECT 1 FROM container_diagnostic_outbox o
+                      WHERE o.issue_id=t.issue_id AND o.delivered=0))""").fetchall()
+        for row in rows:
+            project = next((p for p in projects if p.repository.casefold() == row['repository'].casefold()), None)
+            if project:
+                self.prepare(project, row)
+
     def _prepare(self, project, row):
+        if row['state'] == 'awaiting_children':
+            self.guard(project, row, state='awaiting_children')
+            key = f'container:{row["issue_id"]}:{row["current_iteration_id"]}:prepare'
+            operation = self.store.db.execute(
+                "SELECT payload FROM container_operations WHERE operation_key=? AND phase='confirmed'", (key,)).fetchone()
+            if not operation:
+                raise TaskError('container_stale')
+            proof = json.loads(operation['payload'])
+            branch_key = f'container:{row["issue_id"]}:{row["current_iteration_id"]}:branch'
+            branch = self.store.db.execute(
+                "SELECT payload FROM container_operations WHERE operation_key=? AND phase='confirmed'", (branch_key,)).fetchone()
+            if not branch:
+                raise TaskError('container_stale')
+            sha = json.loads(branch['payload'])['sha']
+            repo, _, _ = self.git.paths(project, row['number'])
+            ref = 'refs/heads/' + proof['branch']
+            if self.git.git(repo, 'ls-remote', 'origin', ref).stdout.split() != [sha, ref]:
+                raise TaskError('remote_head_changed')
+            children = self.adapter.list_direct_children(project, row)
+            if sorted(c['id'] for c in children) != proof['children']:
+                raise TaskError('child_collection_changed')
+            for child in children:
+                managed = self.store.get(project.repository, child['number'])
+                if managed and parse(child.get('body') or '')[0].get('base_branch') != proof['branch']:
+                    raise TaskError('child_body_conflict')
+            return
         if row['state'] != 'pending':
             return
         root = self.git.config.workspace
@@ -268,6 +312,8 @@ class ContainerService:
         if self.git.git(repo, 'ls-remote', 'origin', ref).stdout.split() != [payload['sha'], ref]:
             raise TaskError('remote_head_changed')
         self.operation(row, 'branch', payload, 'confirmed', payload['sha'])
+        with self.store.db as db:
+            db.execute("UPDATE container_blockers SET active=0 WHERE container_issue_id=? AND blocker_key='parent'", (row['issue_id'],))
         children = self.adapter.list_direct_children(project, row)
         seen, blocked = set(), False
         for child in children:

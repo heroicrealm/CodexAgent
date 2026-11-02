@@ -479,5 +479,13 @@ def upgrade614(db):
         code TEXT NOT NULL, details TEXT NOT NULL,
         active INTEGER NOT NULL CHECK(active IN (0,1)), updated_at TEXT NOT NULL,
         PRIMARY KEY(container_issue_id,blocker_key))''')
+    db.execute('''CREATE TABLE IF NOT EXISTS container_diagnostic_state(
+        issue_id INTEGER PRIMARY KEY REFERENCES tasks(issue_id),
+        signature TEXT NOT NULL, observations INTEGER NOT NULL)''')
+    db.execute('''CREATE TABLE IF NOT EXISTS container_diagnostic_outbox(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        issue_id INTEGER NOT NULL REFERENCES tasks(issue_id),
+        signature TEXT NOT NULL, body TEXT NOT NULL,
+        delivered INTEGER NOT NULL DEFAULT 0, comment_id INTEGER)''')
     validate(db)
     db.execute('INSERT OR IGNORE INTO schema_migrations VALUES(614)')
