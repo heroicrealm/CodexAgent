@@ -489,3 +489,22 @@ def upgrade614(db):
         delivered INTEGER NOT NULL DEFAULT 0, comment_id INTEGER)''')
     validate(db)
     db.execute('INSERT OR IGNORE INTO schema_migrations VALUES(614)')
+
+
+def upgrade615(db):
+    """Immutable readiness evidence; canonical PRs remain in task_pull_requests."""
+    db.execute('''CREATE TABLE IF NOT EXISTS container_integration_snapshots(
+        container_issue_id INTEGER NOT NULL REFERENCES tasks(issue_id),
+        generation INTEGER NOT NULL, snapshot TEXT NOT NULL,
+        observed_at TEXT NOT NULL, created_at TEXT NOT NULL,
+        PRIMARY KEY(container_issue_id,generation))''')
+    db.execute('''CREATE TABLE IF NOT EXISTS container_readiness(
+        container_issue_id INTEGER PRIMARY KEY REFERENCES tasks(issue_id),
+        generation INTEGER NOT NULL, ready_for_integration INTEGER NOT NULL CHECK(ready_for_integration IN (0,1)),
+        observation TEXT NOT NULL, children_count INTEGER NOT NULL,
+        completed_count INTEGER NOT NULL, waiting_count INTEGER NOT NULL, conflict_count INTEGER NOT NULL)''')
+    for action in ('UPDATE', 'DELETE'):
+        db.execute(f'''CREATE TRIGGER IF NOT EXISTS immutable_integration_snapshot_{action.lower()}
+            BEFORE {action} ON container_integration_snapshots BEGIN
+            SELECT RAISE(ABORT,'immutable integration snapshot'); END''')
+    db.execute('INSERT OR IGNORE INTO schema_migrations VALUES(615)')

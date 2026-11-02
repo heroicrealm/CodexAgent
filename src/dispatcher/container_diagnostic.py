@@ -22,6 +22,8 @@ SAFE_CODES = frozenset(('container_stale', 'origin_changed', 'remote_head_change
     'child_ready_removed', 'child_state_conflict', 'child_stopped', 'child_untrusted',
     'child_active_base_conflict', 'child_snapshot_stale', 'child_relation_conflict',
     'child_update_forbidden', 'child_relation_removed', 'child_collection_changed',
+    'child_detached_with_open_pr', 'child_merge_unverified', 'child_merge_wrong_base',
+    'child_pr_identity_conflict', 'child_cancelled_with_open_pr',
     'child_body_cas_unavailable', 'base_branch_missing', 'invalid_issue_parameters')) | TRANSIENT | GUIDANCE.keys()
 
 
@@ -31,8 +33,8 @@ def reconcile(store, adapter, row):
     if not current or store.stop_requested(current) or current['current_iteration_id'] != row['current_iteration_id'] or current['version'] != row['version']:
         return
     blockers = db.execute('SELECT * FROM container_blockers WHERE container_issue_id=? AND active=1 ORDER BY blocker_key', (row['issue_id'],)).fetchall()
-    recovered = current['state'] == 'awaiting_children'
-    if not recovered and current['state'] != 'pending':
+    recovered = current['state'] == 'awaiting_children' and not blockers
+    if current['state'] not in ('pending', 'awaiting_children'):
         return
     signature = json.dumps([(b['blocker_key'], b['code']) for b in blockers]) if not recovered else 'recovered'
     previous = db.execute('SELECT * FROM container_diagnostic_state WHERE issue_id=?', (row['issue_id'],)).fetchone()
@@ -49,13 +51,16 @@ def reconcile(store, adapter, row):
             if recovered:
                 body = 'Блокировка подготовки устранена: внешние ресурсы проверены. Подготовка возобновлена, статус awaiting_children.'
             else:
-                lines = ['Подготовка контейнера заблокирована. Статус: pending.']
+                lines = [f'Проверка контейнера заблокирована. Статус: {current["state"]}.']
                 for b in blockers:
                     code = b['code']
                     safe_code = code if code in SAFE_CODES else 'container_preparation_blocked'
                     stage = 'подготовка дочерних Issue' if b['child_issue_id'] else 'проверка контейнера и ветки'
                     child = db.execute('SELECT number FROM tasks WHERE issue_id=?', (b['child_issue_id'],)).fetchone()
                     context = f' Дочерняя Issue #{child[0]}.' if child else ''
+                    pr = db.execute('SELECT pr_number FROM task_pull_requests WHERE issue_id=?', (b['child_issue_id'],)).fetchone()
+                    if pr:
+                        context += f' PR: https://github.com/{row["repository"]}/pull/{pr[0]}.'
                     action = GUIDANCE.get(code, 'Временная недоступность внешнего сервиса; повтор будет выполнен автоматически.' if code in TRANSIENT else 'Проверьте локальную диагностику через show и устраните конфликт перед повторной подготовкой.')
                     lines.append(f'Код: {safe_code}. Этап: {stage}.{context} {action}')
                 body = '\n\n'.join(lines)

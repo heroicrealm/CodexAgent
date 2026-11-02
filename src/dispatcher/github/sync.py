@@ -63,6 +63,8 @@ class SyncService:
                 for number in PullRequestMonitor(self.store, self.adapter).poll(project):
                     result['errors'].append(dict(project=project.id, issue=number, error='PR sync failed; will retry'))
                     self.log('pr_sync_failed', project, task=number)
+                from dispatcher.container_monitor import ContainerMonitor
+                ContainerMonitor(self.store, self.adapter).poll(project)
                 for number in CancellationDelivery(self.config, self.store, self.adapter).poll(project):
                     result['errors'].append(dict(project=project.id, issue=number, error='Cancellation delivery failed; will retry'))
                     self.log('cancellation_delivery_failed', project, task=number)
@@ -76,6 +78,13 @@ class SyncService:
             except (GitHubError, sqlite3.Error):
                 result['errors'].append(dict(project=project.id, error='GitHub polling or storage failure'))
                 self.log('poll_failed', project)
+                # A failed project fetch must not leave an old ready fact live.
+                # Targeted monitoring still attempts fresh fail-closed evidence.
+                from dispatcher.container_monitor import ContainerMonitor
+                try:
+                    ContainerMonitor(self.store, self.adapter).poll(project)
+                except sqlite3.Error:
+                    self.log('container_monitor_storage_failed', project)
         from dispatcher import preparation_error
         preparation_error.flush(self.store, self.adapter, self.config.projects)
         from dispatcher.detachment import StopController

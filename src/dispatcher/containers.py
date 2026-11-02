@@ -211,30 +211,14 @@ class ContainerService:
 
     def _prepare(self, project, row):
         if row['state'] == 'awaiting_children':
+            # Recheck publication before recovering a preparation diagnostic.
+            # The initial SHA may advance as children merge.
             self.guard(project, row, state='awaiting_children')
-            key = f'container:{row["issue_id"]}:{row["current_iteration_id"]}:prepare'
-            operation = self.store.db.execute(
-                "SELECT payload FROM container_operations WHERE operation_key=? AND phase='confirmed'", (key,)).fetchone()
-            if not operation:
-                raise TaskError('container_stale')
-            proof = json.loads(operation['payload'])
-            branch_key = f'container:{row["issue_id"]}:{row["current_iteration_id"]}:branch'
-            branch = self.store.db.execute(
-                "SELECT payload FROM container_operations WHERE operation_key=? AND phase='confirmed'", (branch_key,)).fetchone()
-            if not branch:
-                raise TaskError('container_stale')
-            sha = json.loads(branch['payload'])['sha']
             repo, _, _ = self.git.paths(project, row['number'])
-            ref = 'refs/heads/' + proof['branch']
-            if self.git.git(repo, 'ls-remote', 'origin', ref).stdout.split() != [sha, ref]:
+            ref = 'refs/heads/' + row['work_branch']
+            remote = self.git.git(repo, 'ls-remote', 'origin', ref).stdout.split()
+            if len(remote) != 2 or remote[1] != ref:
                 raise TaskError('remote_head_changed')
-            children = self.adapter.list_direct_children(project, row)
-            if sorted(c['id'] for c in children) != proof['children']:
-                raise TaskError('child_collection_changed')
-            for child in children:
-                managed = self.store.get(project.repository, child['number'])
-                if managed and parse(child.get('body') or '')[0].get('base_branch') != proof['branch']:
-                    raise TaskError('child_body_conflict')
             return
         if row['state'] != 'pending':
             return

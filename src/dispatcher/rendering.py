@@ -127,6 +127,10 @@ def render_queue(rows, projects, format='table', stream=None):
             rendered.append(padded)
         print(framed_row(rendered), file=stream)
     print(border(widths, '└', '┴', '┘'), file=stream)
+    for row in rows:
+        if 'generation' in row:
+            render_frame([[f"Container #{row['number']}: generation={row['generation']} ready={row['ready_for_integration']}",
+                           f"children={row['children_count']} done={row['completed_count']} waiting={row['waiting_count']} conflicts={row['conflict_count']}"]], stream)
 
 
 # Explicit fields avoid dumping internal snapshots, remote credentials or process data.
@@ -163,6 +167,9 @@ def render_show(value, format='table', stream=None):
     lines = [f'Issue: #{value.get("number", "(unavailable)")}']
     for label, data, key in [('Title', issue, 'title'), ('Status', value, 'state'),
                              ('Branch', dict(issue, target_branch=value.get('work_branch') or issue.get('target_branch')), 'target_branch'), ('Author', issue, 'author'),
+                             ('Children', value, 'children_count'), ('Completed children', value, 'completed_count'),
+                             ('Waiting children', value, 'waiting_count'), ('Conflicting children', value, 'conflict_count'),
+                             ('Integration generation', value, 'generation'), ('Ready for integration', value, 'ready_for_integration'),
                              ('Issue type', value, 'issue_type'), ('Run Codex', value, 'run_codex'),
                              ('Version', value, 'version'), ('Current iteration', value, 'current_iteration_id'), ('Approved version', value, 'approved_version'),
                              ('Available', value, 'available'), ('Created', value, 'created_at'),

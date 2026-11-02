@@ -76,7 +76,7 @@ def main(argv=None):
             try:
                 if args.command == 'queue':
                     projects = {p.repository.casefold(): p.id for p in config.projects if ready(p)}
-                    render_queue([_display_task(r) for r in store.queue() if r['repository'] in projects],
+                    render_queue([_container_display(store, r) for r in store.queue() if r['repository'] in projects],
                                  projects, args.format)
                 elif args.command == 'cleanup-retry':
                     from dispatcher.cleanup import CleanupService
@@ -87,7 +87,7 @@ def main(argv=None):
                     row = store.get(project.repository, args.issue)
                     if row is None:
                         raise RuntimeError('Unknown issue')
-                    value = _display_task(row)
+                    value = _container_display(store, row)
                     if row['issue_type'] == 'container':
                         value['container_blockers'] = [dict(r) for r in store.db.execute(
                             'SELECT * FROM container_blockers WHERE container_issue_id=?', (row['issue_id'],))]
@@ -216,3 +216,12 @@ def main(argv=None):
     except (ConfigError, OSError, RuntimeError) as exc:
         print(f'FAIL: {exc}', file=sys.stderr)
         return 1
+
+
+def _container_display(store, row):
+    value = _display_task(row)
+    if row['issue_type'] == 'container':
+        status = store.db.execute('SELECT * FROM container_readiness WHERE container_issue_id=?', (row['issue_id'],)).fetchone()
+        if status:
+            value.update({k: status[k] for k in status.keys() if k not in ('container_issue_id', 'observation')})
+    return value
