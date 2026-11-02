@@ -102,8 +102,8 @@ class ContainerMonitor:
                     or pr['head']['repo']['id'] != child['repository_id']
                     or pr['base']['repo']['id'] != child['repository_id']
                     or pr['head']['ref'] != child['work_branch']
-                    or canonical and (pr['head']['ref'] != canonical['head']
-                        or pr['base']['ref'] != canonical['base'])
+                    or canonical and pr['head']['ref'] != canonical['head']
+                    or not isinstance(pr['base']['ref'], str) or not pr['base']['ref']
                     or type(pr['merged']) is not bool
                     or pr['state'] not in ('open', 'closed')
                     or not isinstance(pr['head']['sha'], str) or not pr['head']['sha']):
@@ -149,7 +149,20 @@ class ContainerMonitor:
         historical = {r['child_issue_id'] for r in relations if r['participation'] != 'ignored'}
         result, blockers = [], {}
         seen = {c['id'] for c in children}
+        removed = []
+        previous = self.store.db.execute('SELECT observation FROM container_readiness WHERE container_issue_id=?', (row['issue_id'],)).fetchone()
+        prior_children = {c['issue_id']: c for c in json.loads(previous['observation'])['children']} if previous else {}
         for child_id in historical - seen:
+            prior = prior_children.get(child_id)
+            child = self.store.db.execute('SELECT * FROM tasks WHERE issue_id=?', (child_id,)).fetchone()
+            # Only a previously observed wrong-base merge can authorize removal.
+            # Read the canonical PR again; disappearance/changed evidence fails closed.
+            if prior and prior['conflict'] == 'child_merge_wrong_base' and child and child['state'] == 'done' and not self.unfinished(child):
+                evidence, canonical = self.prs(project, child)
+                other = self.store.db.execute("SELECT 1 FROM sub_issue_relations WHERE child_issue_id=? AND parent_issue_id!=? AND participation!='ignored'", (child_id, row['issue_id'])).fetchone()
+                if canonical and not other and evidence == prior['prs'] and len(evidence) == 1 and evidence[0]['merged'] and evidence[0]['base'] != row['work_branch']:
+                    removed.append(child_id)
+                    continue
             blockers[child_id] = 'child_relation_removed'
         for raw in children:
             child = self.store.get(project.repository, raw['number'])
@@ -185,6 +198,9 @@ class ContainerMonitor:
                         code = 'child_merge_wrong_base'
                 elif child['work_branch'] and child['base_branch'] != row['work_branch']:
                     code = 'child_merge_wrong_base'
+                if (not ready and child['state'] == 'done' and canonical and evidence
+                        and evidence[0]['merged'] and evidence[0]['base'] != row['work_branch']):
+                    code = 'child_merge_wrong_base'
                 other = self.store.db.execute("SELECT 1 FROM sub_issue_relations WHERE child_issue_id=? AND parent_issue_id!=? AND participation!='ignored'", (child['issue_id'], row['issue_id'])).fetchone()
                 if other and child['work_branch']:
                     code = 'child_relation_removed'
@@ -199,7 +215,7 @@ class ContainerMonitor:
         head = self.adapter.request(f'repos/{project.repository}/git/ref/heads/' + quote(row['work_branch'], safe=''))
         if head['ref'] != 'refs/heads/' + row['work_branch'] or head['object']['type'] != 'commit' or not head['object']['sha']:
             raise SnapshotMismatch('parent_mismatch')
-        return dict(parent=parent, collection=[child_snapshot(c) for c in children], children=result, blockers=blockers, parent_head=head['object']['sha'], iteration=row['current_iteration_id'])
+        return dict(parent=parent, collection=[child_snapshot(c) for c in children], children=result, blockers=blockers, removed=removed, parent_head=head['object']['sha'], iteration=row['current_iteration_id'])
 
     def observe(self, project, row):
         before = self.local(row)
@@ -211,6 +227,7 @@ class ContainerMonitor:
             source = 'parent_mismatch' if first['parent_head'] != second['parent_head'] else 'child_mismatch'
             raise SnapshotMismatch(source)
         del second['collection']  # Never-managed, non-ready children leave no durable evidence.
+        removed = second.pop('removed')
         encoded = json.dumps(second, sort_keys=True)
         children = [c for c in second['children'] if c['participating']]
         completed = sum(c['state'] in ('done', 'cancelled') and not c['conflict'] for c in children)
@@ -226,8 +243,11 @@ class ContainerMonitor:
             db.execute("UPDATE container_blockers SET active=0 WHERE container_issue_id=? AND blocker_key LIKE 'monitor:%'", (row['issue_id'],))
             for child_id, code in second['blockers'].items():
                 db.execute('''INSERT INTO container_blockers VALUES(?,?,?,?,?,1,?) ON CONFLICT(container_issue_id,blocker_key)
-                    DO UPDATE SET code=excluded.code,active=1,updated_at=excluded.updated_at''',
-                    (row['issue_id'], 'monitor:' + str(child_id), child_id, code, code, now()))
+                    DO UPDATE SET code=excluded.code,details=excluded.details,active=1,updated_at=excluded.updated_at''',
+                    (row['issue_id'], 'monitor:' + str(child_id), child_id, code,
+                     next((f"Ожидаемая base: {row['work_branch']}; фактическая base: {c['prs'][0]['base']}. Исключите ребёнка из прямых Sub-issues контейнера." for c in second['children'] if c['issue_id'] == child_id and c['prs'] and code == 'child_merge_wrong_base'), code), now()))
+            for child_id in removed:
+                db.execute("UPDATE sub_issue_relations SET participation='ignored',conflict_code='child_merge_wrong_base',observed_at=? WHERE parent_issue_id=? AND child_issue_id=?", (now(), row['issue_id'], child_id))
             for child in second['children']:
                 db.execute('''INSERT INTO sub_issue_relations VALUES(?,?,?,?,?) ON CONFLICT(parent_issue_id,child_issue_id)
                     DO UPDATE SET observed_at=excluded.observed_at,participation=excluded.participation,conflict_code=excluded.conflict_code''',

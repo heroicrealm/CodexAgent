@@ -62,6 +62,8 @@ def reconcile(store, adapter, row):
                     if pr:
                         context += f' PR: https://github.com/{row["repository"]}/pull/{pr[0]}.'
                     action = GUIDANCE.get(code, 'Временная недоступность внешнего сервиса; повтор будет выполнен автоматически.' if code in TRANSIENT else 'Проверьте локальную диагностику через show и устраните конфликт перед повторной подготовкой.')
+                    if code == 'child_merge_wrong_base' and b['details'] != code:
+                        action = b['details'].replace('`', '').replace('\n', ' ')
                     lines.append(f'Код: {safe_code}. Этап: {stage}.{context} {action}')
                 body = '\n\n'.join(lines)
             db.execute('INSERT INTO container_diagnostic_outbox(issue_id,signature,body) VALUES(?,?,?)', (row['issue_id'], signature, body))

@@ -72,7 +72,8 @@ class PullRequestMonitor:
             if (pr['id'] != linked['pr_id'] or pr['number'] != linked['pr_number']
                     or pr['head']['repo']['id'] != linked['repository_id']
                     or pr['base']['repo']['id'] != linked['repository_id']
-                    or pr['head']['ref'] != linked['head'] or pr['base']['ref'] != linked['base']
+                    or pr['head']['ref'] != linked['head']
+                    or not isinstance(pr['base']['ref'], str) or not pr['base']['ref']
                     or type(pr['merged']) is not bool):
                 raise GitHubError(kind='invalid_response')
             if pr['state'] == 'open' and pr['merged'] is False:
@@ -83,7 +84,10 @@ class PullRequestMonitor:
             target = 'done' if pr['merged'] else 'rejected'
             actor = None
             if target == 'done':
-                utc(pr['merged_at'])
+                merged_at = utc(pr['merged_at'])
+                if (datetime.fromisoformat(merged_at.replace('Z', '+00:00')) > datetime.fromisoformat(closed.replace('Z', '+00:00'))
+                        or not isinstance(pr.get('merge_commit_sha'), str) or not pr['merge_commit_sha']):
+                    raise GitHubError(kind='invalid_response')
                 actor = (pr.get('merged_by') or {}).get('login')
             else:
                 try:
@@ -93,7 +97,9 @@ class PullRequestMonitor:
                         actor = (matches[-1].get('actor') or {}).get('login')
                 except GitHubError:
                     pass  # Actor is optional; never substitute the PR author.
-            metadata = dict(pr_url=f'https://github.com/{project.repository}/pull/{linked["pr_number"]}',
+            metadata = dict(expected_base=linked['base'],
+                            merged_base=pr['base']['ref'] if target == 'done' else None,
+                            pr_url=f'https://github.com/{project.repository}/pull/{linked["pr_number"]}',
                             pr_number=linked['pr_number'], actor=actor or 'Не удалось определить',
                             closed_at=closed, merged_at=pr.get('merged_at'),
                             merge_commit_sha=pr.get('merge_commit_sha'), head_sha=pr['head']['sha'],
@@ -112,7 +118,8 @@ class PullRequestMonitor:
                 fence, task['content_hash'], linked['iteration_id'], 'review', available=True,
                 pr_id=linked['pr_id'], pr_number=linked['pr_number'], head=linked['head'], base=linked['base'],
                 head_sha=pr['head']['sha'], pr_state='closed', merged=pr['merged'],
-                merged_at=pr.get('merged_at'), linked_issue_id=task['issue_id'])
+                merged_at=pr.get('merged_at'), linked_issue_id=task['issue_id'],
+                merged_base=pr['base']['ref'] if target == 'done' else None)
             # Intent precedes the decision; a crash on either side remains selectable.
             self.store.publication(key, linked['iteration_id'])
             with db:
@@ -157,6 +164,7 @@ class PullRequestMonitor:
                 body = (f'PR #{metadata["pr_number"]}: {metadata["pr_url"]}\nStatus: {saved["target"]}\n'
                         f'{"merged_by" if saved["target"] == "done" else "closed_by"}: {metadata["actor"]}\nclosed_at: {metadata["closed_at"]}\n')
                 if saved['target'] == 'done':
+                    body += f'expected_base: {metadata.get("expected_base", linked["base"])}\nmerged_base: {metadata.get("merged_base", linked["base"])}\n'
                     body += f'merged_at: {metadata["merged_at"]}\nIssue closed_at: {issue_closed_at}\n'
                 body += marker
                 if self.store.stop_requested(self.store.get(project.repository, linked['number'])):

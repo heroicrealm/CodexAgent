@@ -58,6 +58,7 @@ class Evidence:
     # Verified Issue identity/ownership proof, not branch-name inference.
     linked_issue_id: int | None = None
     container_operation: str | None = None
+    merged_base: str | None = None
 
 
 @dataclass(frozen=True)

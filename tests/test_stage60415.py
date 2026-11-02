@@ -130,7 +130,7 @@ def test_complete_cycle(monitored):
         observed_at='2026-10-24T00:30:00Z', event_at='2026-10-24T00:30:00Z',
         state_observed_at='2026-10-24T00:20:00Z'), pr_id=302, pr_number=3, head='feature-2')) == 'applied'
     execution.finish(attempt, 'review')
-    pull.update(id=302, number=3, merged=True, merged_at='2026-10-24T00:35:00Z', closed_at='2026-10-24T00:35:00Z',
+    pull.update(id=302, number=3, merge_commit_sha='c'*40, merged=True, merged_at='2026-10-24T00:35:00Z', closed_at='2026-10-24T00:35:00Z',
                 merged_by=dict(login='merger'))
     pull['head']['ref'] = 'feature-2'
     api.response_date = '2026-10-24T00:40:00Z'

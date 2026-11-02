@@ -146,3 +146,72 @@ recovery через restart итоговый целевой monitor-набор �
 `git diff --check` и `git diff --cached --check` — без замечаний.
 Системный python3 не содержит pytest, поэтому проверки выполнены в существующей
 `.venv`; зависимости проекта не изменялись.
+
+## Исправление обработки смены base канонического PR
+
+Смена только base больше не считается подменой PR. `PullRequestMonitor`
+сохраняет исходную `task_pull_requests.base`, а фактическую `merged_base` пишет
+в metadata существующего `pr_resolutions` и evidence перехода. В комментарии
+завершения указаны обе ветки. PR ID/number, repository head/base, head ref,
+валидность head SHA, iteration, guard, closed/merged timestamps и обычные
+процедуры доставки сохранены. Дополнительно merge требует непустого merge SHA
+и merged_at не позднее closed_at. Open остаётся review, closed unmerged
+переходит в rejected. Старый resolution retry повторно наблюдает PR и доходит
+до штатного completed; существующий marker предотвращает дубли комментариев.
+
+`ContainerMonitor` читает фактическую base канонического PR непосредственно
+из GitHub; расхождение с work_branch родителя даёт child_merge_wrong_base.
+Диагностика содержит ожидаемую/фактическую ветки и указание исключить ребёнка
+из прямых Sub-issues. Снятие ready label у done ребёнка с wrong-base merge
+не заменяет исключение связи. Retarget/повторный merge не выполняются.
+
+Разрешённое исключение требует ранее сохранённого наблюдения именно
+child_merge_wrong_base, локального done без незавершённых операций, отсутствия
+другого участвующего родителя и повторного чтения того же канонического
+merged PR с полностью совпадающими PR evidence. Две полные согласованные
+выборки должны подтвердить отсутствие ребёнка в прямых Sub-issues. В общей
+SQLite транзакции связь сохраняется с participation=ignored и
+conflict_code=child_merge_wrong_base, monitor blocker снимается, readiness
+пересчитывается по остальным детям. После restart исключённая связь не
+возвращает child_relation_removed. Прочие исчезновения/подмены, detached/open
+PR и немониторные blockers сохраняют прежнюю защитную семантику.
+
+Миграция не нужна: используются существующие JSON evidence/metadata,
+container_readiness и допустимое значение ignored в sub_issue_relations.
+Старые resolutions без новых полей остаются доставляемыми. Старые ожидаемые
+base не переписываются. Изменены pr_monitor.py, container_monitor.py,
+container_diagnostic.py, storage/transitions.py, tests/test_stage604.py;
+добавлен tests/test_pr_base_change.py, обновлён этот отчёт. В старых тестах
+изоляции проектов и полного цикла (tests/test_stage60415.py) merged fixtures
+дополнены обязательным merge_commit_sha.
+
+Ограничения: GitHub не даёт атомарного снимка нескольких ресурсов. Если связь
+исчезла до подтверждённого наблюдения wrong-base merge либо evidence
+неоднозначно, монитор сохраняет блокировку; автоматического предположения о
+намерении пользователя нет. Внешняя приёмка не выполнена, #114/#115, родитель
+и пользовательская SQLite вручную не изменялись. Приёмка этапа не заявляется.
+
+Ручная проверка после обновления установленного dispatcher:
+
+1. Выполнить `codex-dispatcher poll` с рабочей конфигурацией; проверить
+   `codex-dispatcher show CodexAgentPlayground 114 --format json`: done,
+   PR #115 closed/merged, resolution completed, обычное закрытие Issue и один
+   комментарий исполнения. Ожидаемая base должна остаться ContainerBranchwrongpr,
+   фактическая — соответствовать GitHub PR #115.
+2. Проверить родителя через show: awaiting_children, ready_for_integration=0,
+   child_merge_wrong_base и диагностика обеих веток, пока #114 входит в Sub-issues.
+3. Пользователь вручную удаляет #114 из прямых Sub-issues родителя в GitHub.
+4. Снова выполнить poll и show родителя: blocker снят, readiness зависит от
+   оставшихся детей; #114 остаётся done. Повторить poll и перезапустить dispatcher:
+   конфликт и повторные комментарии не должны возвращаться.
+
+Проверки исправления base-change:
+
+- Целевой набор PR/container/base-change: 99 passed за 11.49 s;
+  отдельный новый набор: 15 passed за 1.13 s.
+- Первый полный прогон: 903 passed, 1 failed, 30 subtests passed за 156.27 s;
+  выявлен старый merged fixture полного цикла без merge_commit_sha, исправлен.
+- Итоговый `PATH="$PWD/.venv/bin:$PATH" bash scripts/test.sh`:
+  **906 passed, 30 subtests passed за 155.42 s**, exit code 0;
+  включённый compileall завершён успешно.
+- `git diff --check` и `git diff --cached --check`: без замечаний.

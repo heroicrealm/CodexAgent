@@ -405,7 +405,7 @@ def test_two_projects_same_issue_and_pr_numbers(monitored):
         authority=Authority('observer', ('observer',), role='observer'), evidence=proof) == 'applied'
     execution.finish(second_attempt, 'review')
     second_pr = deepcopy(pull)
-    second_pr.update(id=302, merged=True, merged_at=pull['closed_at'], merged_by=dict(login='other-merger'))
+    second_pr.update(id=302, merge_commit_sha='c'*40, merged=True, merged_at=pull['closed_at'], merged_by=dict(login='other-merger'))
     second_pr['head']['repo']['id'] = second_pr['base']['repo']['id'] = 12
     request, pages, write = api.request.side_effect, api.pages.side_effect, api.write.side_effect
     other_comments = []
