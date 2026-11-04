@@ -1,4 +1,5 @@
 """Single daemon loop combining polling, fair admission, execution and delivery."""
+from dispatcher.timing import measured
 import json
 import sqlite3
 import time
@@ -38,6 +39,8 @@ class Dispatcher:
         self.containers = ContainerService(self.store, self.adapter, self.git)
         self.attachments = IssueAttachmentManager(config)
         self.executor = CodexExecutor(config, lifecycle)
+        self.git.timing = self.store.timing
+        self.executor.timing = self.store.timing
         self.quota = CodexQuotaProvider(config, lifecycle, self.execution.quota)
         self.publisher = TaskResultPublisher(self.execution, self.adapter, config.projects)
         self.pr_publisher = PullRequestPublisher(self.execution, self.adapter, self.git)
@@ -97,6 +100,7 @@ class Dispatcher:
             pass
         self.execution.update(row['attempt_id'], recovery_diagnostic=diagnostic)
 
+    @measured('task_selection')
     def admit(self):
         order = self.projects[self.cursor:] + self.projects[:self.cursor]
         for project in order:
@@ -403,7 +407,9 @@ class Dispatcher:
             self.collect()
             if not self.lifecycle.stopping:
                 if time.monotonic() >= self.next_poll:
+                    self.store.timing.emit('poll_delay', queue_wait_ms=max(0, (time.monotonic()-self.next_poll)*1000) if self.next_poll else 0)
                     self.sync.poll()
+                    self.store.timing.emit('poll_wait_scheduled', queue_wait_ms=self.config.poll_interval_seconds*1000)
                     self.next_poll = time.monotonic() + self.config.poll_interval_seconds
                 self.quota.check()
                 self.admit()

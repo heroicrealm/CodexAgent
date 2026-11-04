@@ -3,6 +3,7 @@
 No remote calls occur in the SQLite publication transaction. Two observations
 bound observed churn; GitHub does not provide an atomic multi-resource snapshot.
 """
+from dispatcher.timing import measured
 import fcntl
 import json
 import logging
@@ -27,6 +28,7 @@ class ContainerMonitor:
     def __init__(self, store, adapter):
         self.store, self.adapter = store, adapter
 
+    @measured('child_monitor')
     def poll(self, project):
         rows = self.store.db.execute("SELECT * FROM tasks WHERE repository=? AND issue_type='container' AND state='awaiting_children'", (project.repository.casefold(),)).fetchall()
         for row in rows:
@@ -174,8 +176,13 @@ class ContainerMonitor:
                 # A missing local FK cannot be recorded as a relation.
                 raise SnapshotMismatch('child_mismatch')
             accepted_child = json.loads(child['snapshot'])
-            if (raw['title'] != accepted_child['title'] or (raw.get('body') or '') != accepted_child['body']
-                    or raw['user']['login'].casefold() != accepted_child['author'].casefold()):
+            draft = (child['state'] == 'discovered' and child['approved_version'] is None
+                     and not child['work_branch'] and not self.store.db.execute(
+                         'SELECT 1 FROM task_pull_requests WHERE issue_id=?', (child['issue_id'],)).fetchone())
+            if (not draft and (raw['title'] != accepted_child['title'] or (raw.get('body') or '') != accepted_child['body']
+                    or raw['user']['login'].casefold() != accepted_child['author'].casefold())):
+                raise SnapshotMismatch('child_mismatch')
+            if raw['user']['login'].casefold() != accepted_child['author'].casefold():
                 raise SnapshotMismatch('child_mismatch')
             try:
                 evidence, canonical = self.prs(project, child)
@@ -207,7 +214,10 @@ class ContainerMonitor:
             except TaskError as exc:
                 code = exc.code
             if any(project.label(k).name.casefold() in {label['name'].casefold() for label in raw['labels']}
-                   for k in ('approve', 'reject', 'emergency_stop')):
+                   for k in ('reject', 'emergency_stop')):
+                code = 'child_snapshot_stale'
+            if (child['state'] in ('done', 'cancelled') and project.label('approve').name.casefold()
+                    in {label['name'].casefold() for label in raw['labels']}):
                 code = 'child_snapshot_stale'
             if code:
                 blockers[child['issue_id']] = code
@@ -220,6 +230,7 @@ class ContainerMonitor:
             raise SnapshotMismatch('parent_mismatch')
         return dict(parent=parent, collection=[child_snapshot(c) for c in children], children=result, blockers=blockers, removed=removed, parent_head=head['object']['sha'], iteration=row['current_iteration_id'])
 
+    @measured('child_readiness')
     def observe(self, project, row):
         before = self.local(row)
         first = self.collect(project, row)

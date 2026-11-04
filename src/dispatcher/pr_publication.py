@@ -1,4 +1,5 @@
 """Restartable PR publication. Network calls never hold a SQLite transaction."""
+from dispatcher.timing import measured
 import fcntl
 import hashlib
 import json
@@ -29,6 +30,7 @@ class PullRequestPublisher:
         return self.store.db.execute('SELECT 1 FROM publication_operations WHERE operation_key=?',
                                      ('pr:' + attempt,)).fetchone() is not None
 
+    @measured('pr_publication')
     def flush(self, projects):
         rows = self.store.db.execute("""SELECT a.* FROM attempts a JOIN publication_operations p
             ON p.operation_key='pr:'||a.attempt_id WHERE p.phase!='terminal'
@@ -40,6 +42,7 @@ class PullRequestPublisher:
             if project is not None:
                 self.publish(project, row)
 
+    @measured('outbox_dispatch')
     def publish(self, project, attempt):
         # A separate advisory lock serializes publishers across connections and
         # processes without holding SQLite's writer lock during network calls.
@@ -52,6 +55,12 @@ class PullRequestPublisher:
                 return
             operation = self.store.db.execute('SELECT * FROM publication_operations WHERE operation_key=?',
                                              ('pr:' + attempt['attempt_id'],)).fetchone()
+            trace = getattr(self.store, 'timing', None)
+            if trace is not None and trace.enabled and operation:
+                from datetime import datetime, timezone
+                trace.emit('outbox_dispatch', operation_id=operation['operation_key'],
+                    queue_wait_ms=max(0, (datetime.now(timezone.utc)-datetime.fromisoformat(operation['updated_at'])).total_seconds()*1000),
+                    retry=operation['retry_count'] > 0)
             terminal = TerminalError(self).saved(attempt)
             if operation and not terminal and (operation['outcome'] == 'completed' or operation['phase'] == 'terminal'):
                 return

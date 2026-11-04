@@ -1,4 +1,5 @@
 """Durable final comments with retry reconciliation after uncertain delivery."""
+from dispatcher.timing import measured
 import re
 from datetime import datetime, timezone
 from dispatcher.github import GitHubError
@@ -48,6 +49,7 @@ class TaskResultPublisher:
         self.execution, self.adapter = execution, adapter
         self.projects = projects
 
+    @measured('outbox_delivery')
     def flush(self):
         import fcntl
         from pathlib import Path
@@ -64,6 +66,11 @@ class TaskResultPublisher:
                 if out['published']:
                     continue
                 row = self.execution.get(out['attempt_id'])
+                trace = getattr(self.adapter, 'timing', None)
+                if trace is not None and trace.enabled:
+                    trace.emit('outbox_dispatch', operation_id=operation_key,
+                        project_id=row['project_id'] if 'project_id' in row.keys() else None,
+                        repository=row['repository'], issue_number=row['number'])
                 def guard():
                     task = self.execution.store.get(row['repository'], row['number'])
                     if (self.execution.store.stop_requested(task) or
@@ -93,7 +100,11 @@ class TaskResultPublisher:
                                    (str(found['id']), out['attempt_id']))
                         db.execute("UPDATE publication_operations SET phase='comment',outcome='completed',updated_at=? WHERE operation_key=?",
                                    (now(), operation_key))
+                    if trace is not None:
+                        trace.emit('outbox_acknowledged', 'success', operation_id=operation_key, repository=row['repository'], issue_number=row['number'])
                 except (GitHubError, TaskError):
+                    if trace is not None:
+                        trace.emit('outbox_retry', 'failure', operation_id=operation_key, repository=row['repository'], issue_number=row['number'])
                     with db:
                         db.execute("UPDATE publication_operations SET phase='comment',outcome='failed',updated_at=? WHERE operation_key=? AND outcome!='completed'",
                                    (now(), operation_key))

@@ -1,5 +1,6 @@
 """Bounded GitHub adapter. No issue text is ever used as a command."""
 import json
+from dispatcher.timing import measured
 import re
 import subprocess
 from dispatcher.process_wait import run as natural_run
@@ -37,12 +38,48 @@ class Adapter:
         self.executable, self.run, self.sleep, self.attempts = executable, run, sleep, attempts
         self.response_date = None
 
+    def _send(self, argv, **kwargs):
+        trace = getattr(self, 'timing', None)
+        if trace is None or not trace.enabled:
+            return self.run(argv, **kwargs)
+        import uuid
+        request_id = uuid.uuid4().hex
+        endpoint = next((v for v in argv if v.startswith('repos/')), '').split('?', 1)[0]
+        parts = endpoint.split('/')
+        method = argv[argv.index('--method') + 1] if '--method' in argv else 'GET'
+        # Route shape only; refs, queries and resource text are never recorded.
+        route = '/'.join(v if v in {'repos','issues','labels','comments','pulls','git','refs','ref','heads','sub_issues','events'} else ':id' for v in parts)
+        fields = dict(request_id=request_id, method=method, endpoint=route)
+        if len(parts) >= 3:
+            fields['repository'] = '/'.join(parts[1:3]).casefold()
+            project = getattr(self, 'timing_projects', {}).get(fields['repository'])
+            if project:
+                fields['project_id'] = project
+        if len(parts) >= 5 and parts[3] == 'issues' and parts[4].isdigit():
+            fields['issue_number'] = int(parts[4])
+        started = time.monotonic_ns()
+        trace.emit('github_request_start', 'start', **fields)
+        try:
+            result = self.run(argv, **kwargs)
+        except BaseException:
+            trace.emit('github_response_failure', 'failure', duration_ms=(time.monotonic_ns()-started)/1e6, **fields)
+            raise
+        try:
+            status = int((result.stdout or '').splitlines()[0].split()[1])
+        except (ValueError, IndexError):
+            status = None
+        success = not result.returncode and status is not None and 200 <= status < 300
+        trace.emit('github_response_success' if success else 'github_response_failure',
+                   'success' if success else 'failure', http_status=status,
+                   duration_ms=(time.monotonic_ns()-started)/1e6, **fields)
+        return result
+
     def request(self, endpoint):
         last_status, last_kind = None, "transport"
         for attempt in range(self.attempts):
             self.response_date = None
             try:
-                response = self.run([self.executable, 'api', '--method', 'GET', '--include', '-H', 'Cache-Control: no-cache', endpoint],
+                response = self._send([self.executable, 'api', '--method', 'GET', '--include', '-H', 'Cache-Control: no-cache', endpoint],
                                     capture_output=True, text=True, timeout=30, shell=False)
                 raw = response.stdout or ''
                 headers, separator, body = raw.replace('\r\n', '\n').partition('\n\n')
@@ -85,6 +122,9 @@ class Adapter:
             except (ValueError, IndexError):
                 raise GitHubError('Invalid GitHub headers', kind='invalid_response') from None
             if attempt + 1 < self.attempts:
+                trace = getattr(self, 'timing', None)
+                if trace is not None:
+                    trace.emit('github_retry', 'observed', queue_wait_ms=delay*1000)
                 self.sleep(delay)
         raise GitHubError('GitHub unavailable after bounded retries', status=last_status, kind=last_kind)
 
@@ -150,10 +190,11 @@ class Adapter:
                 return list(issues.values())
         raise GitHubError('Pagination limit exceeded')
 
+    @measured('github_write')
     def write(self, endpoint, method, payload):
         """Bounded write with safe HTTP metadata, never raw gh stderr/body."""
         try:
-            reply = self.run([self.executable, 'api', '--method', method, '--include', endpoint, '--input', '-'],
+            reply = self._send([self.executable, 'api', '--method', method, '--include', endpoint, '--input', '-'],
                              input=json.dumps(payload), capture_output=True, text=True, timeout=30, shell=False)
             headers, separator, body = (reply.stdout or '').replace('\r\n', '\n').partition('\n\n')
             if not separator or not headers.startswith('HTTP/'):
@@ -161,7 +202,38 @@ class Adapter:
             status = int(headers.splitlines()[0].split()[1])
             if reply.returncode or not 200 <= status < 300:
                 raise GitHubError(status=status)
-            return json.loads(body) if body.strip() else None
+            result = json.loads(body) if body.strip() else None
+            trace = getattr(self, 'timing', None)
+            saved_response_date = self.response_date
+            # One optional independent read; no loop and no readback when disabled.
+            if trace is not None and trace.enabled and method == 'PATCH' and re.fullmatch(r'repos/[^/]+/[^/]+/issues/[0-9]+', endpoint):
+                keys = set(payload) & {'body', 'title', 'state'}
+                if keys:
+                    try:
+                        observed = self.request(endpoint)
+                        if all(observed.get(k) == payload[k] for k in keys):
+                            trace.emit('github_readback_confirmed', 'observed',
+                                       project_id=getattr(self, 'timing_projects', {}).get('/'.join(endpoint.split('/')[1:3]).casefold()),
+                                       repository='/'.join(endpoint.split('/')[1:3]).casefold(),
+                                       issue_number=int(endpoint.rsplit('/', 1)[1]))
+                    except (GitHubError, AttributeError, TypeError):
+                        pass  # Diagnostic readback cannot change write outcome.
+            if (trace is not None and trace.enabled and method in ('POST', 'PUT')
+                    and re.fullmatch(r'repos/[^/]+/[^/]+/issues/[0-9]+/labels', endpoint)
+                    and isinstance(payload.get('labels'), list)):
+                try:
+                    observed = self.request(endpoint)
+                    actual = {label['name'].casefold() for label in observed}
+                    expected = {label.casefold() for label in payload['labels']}
+                    if expected <= actual and (method != 'PUT' or expected == actual):
+                        parts = endpoint.split('/')
+                        repository = '/'.join(parts[1:3]).casefold()
+                        trace.emit('github_readback_confirmed', repository=repository,
+                            project_id=getattr(self, 'timing_projects', {}).get(repository), issue_number=int(parts[4]))
+                except (GitHubError, KeyError, AttributeError, TypeError):
+                    pass
+            self.response_date = saved_response_date
+            return result
         except subprocess.TimeoutExpired:
             raise GitHubError(kind='timeout') from None
         except OSError:

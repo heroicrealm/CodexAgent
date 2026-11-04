@@ -3,6 +3,7 @@
 Issue PATCH is not atomic CAS. Durable intents detect observed conflicts but
 cannot exclude a lost human edit in the final GET -> PATCH window.
 """
+from dispatcher.timing import measured
 import fcntl
 import hashlib
 import json
@@ -69,6 +70,7 @@ class ContainerService:
             raise TaskError('container_stale')
         return raw
 
+    @measured('container_intent')
     def operation(self, row, kind, payload, phase='intent', remote=None):
         key = f'container:{row["issue_id"]}:{row["current_iteration_id"]}:{kind}'
         encoded = json.dumps(payload, sort_keys=True)
@@ -82,6 +84,7 @@ class ContainerService:
                  'success' if phase == 'confirmed' else 'pending', remote, now()))
         return key
 
+    @measured('child_base_branch')
     def update_child(self, project, row, managed, child, branch):
         """Reconcile a durable intent before attempting a single PATCH."""
         digest = lambda body: hashlib.sha256(body.encode()).hexdigest()
@@ -95,10 +98,14 @@ class ContainerService:
                     and legacy.get('body_hash') == digest(child.get('body') or '')
                     and legacy.get('base_branch') == branch):
                 previous = None
+        if previous and managed['state'] == 'discovered' and managed['approved_version'] is None:
+            old_proof = json.loads(previous['payload'])
+            if old_proof.get('version') != managed['version']:
+                previous = None  # New unapproved revision gets a fresh guarded intent.
         observation = dict(self.store.guard(project.repository, child['number']))
         accepted = json.loads(managed['snapshot'])
         if not previous and (accepted['body'] != (child.get('body') or '')
-                             or any(accepted.get(k) != child.get(k) for k in ('title', 'updated_at'))):
+                             or any(accepted.get(k) != child.get(k) for k in ('title',))):
             raise TaskError('child_snapshot_stale')
         if accepted['author'].casefold() != child['user']['login'].casefold():
             raise TaskError('child_snapshot_stale')
@@ -173,6 +180,7 @@ class ContainerService:
         self.store.apply(project, [accepted], partial=True, controlled_operation=key)
         return fresh
 
+    @measured('container_prepare')
     def prepare(self, project, row):
         root = self.git.config.workspace
         directory = private_dir(root, root / project.id)
@@ -334,6 +342,25 @@ class ContainerService:
             elif child['user']['login'].casefold() not in {a.casefold() for a in project.allowed_authors}:
                 code = 'child_untrusted'
             else:
+                if (managed['state'] == 'discovered' and managed['approved_version'] is None
+                        and not managed['work_branch'] and not self.store.db.execute(
+                            'SELECT 1 FROM task_pull_requests WHERE issue_id=?', (child['id'],)).fetchone()):
+                    unresolved = self.store.db.execute(
+                        "SELECT payload FROM container_operations WHERE container_issue_id=? AND kind=? AND phase='intent'",
+                        (row['issue_id'], 'child:' + str(child['id']))).fetchall()
+                    for intent in unresolved:
+                        proof = json.loads(intent['payload'])
+                        if (proof.get('version') == managed['version']
+                                and hashlib.sha256((child.get('body') or '').encode()).hexdigest() not in (proof.get('source_hash'), proof.get('target_hash'))):
+                            raise TaskError('child_body_conflict')
+                    latest = dict(json.loads(managed['snapshot']), title=child['title'],
+                        body=child.get('body') or '', updated_at=child['updated_at'],
+                        labels=[v['name'] for v in child['labels']],
+                        server_observed_at=self.adapter.response_date)
+                    params, _ = parse(latest['body'])
+                    latest['target_branch'] = params.get('branch_name', project.base_branch)
+                    self.store.apply(project, [latest], partial=True)
+                    managed = self.store.get(project.repository, child['number'])
                 accepted = json.loads(managed['snapshot'])
                 if accepted['title'] != child.get('title'):
                     raise TaskError('child_snapshot_stale')
@@ -358,7 +385,7 @@ class ContainerService:
                 blocked = True
             with self.store.db as db:
                 if not code:
-                    db.execute("UPDATE container_blockers SET active=0 WHERE container_issue_id=? AND blocker_key=? AND code IN ('child_body_cas_unavailable','child_body_unconfirmed')",
+                    db.execute("UPDATE container_blockers SET active=0 WHERE container_issue_id=? AND blocker_key=? AND code IN ('child_body_cas_unavailable','child_body_unconfirmed','child_snapshot_stale')",
                                (row['issue_id'], str(child['id'])))
                 if prepared:
                     db.execute("UPDATE container_blockers SET active=0 WHERE container_issue_id=? AND blocker_key=? AND code='child_body_conflict'",

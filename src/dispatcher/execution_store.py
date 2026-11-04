@@ -1,4 +1,5 @@
 """Stage 4 transactional admission, durable attempts and result outbox."""
+from dispatcher.timing import measured
 import uuid
 from datetime import datetime
 from dispatcher.storage import now
@@ -89,6 +90,7 @@ class ExecutionStore:
     def get(self, attempt):
         return self.db.execute('SELECT * FROM attempts WHERE attempt_id=?', (attempt,)).fetchone()
 
+    @measured('execution_finish')
     def finish(self, attempt, state, code=None, category='CODEX', duration=None):
         if state not in ('review', 'failed', 'interrupted'):
             raise ValueError('Invalid execution outcome')

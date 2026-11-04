@@ -1,6 +1,8 @@
 """Project-isolated polling and idempotent label reconciliation."""
+from dispatcher.timing import measured
 import sqlite3
 import sys
+import time
 
 from dispatcher.github import Adapter, GitHubError
 from dispatcher.pr_monitor import PullRequestMonitor
@@ -14,11 +16,14 @@ class SyncService:
     def __init__(self, config, store, adapter=None):
         self.config, self.store = config, store
         self.adapter = adapter or Adapter(config.github_executable)
+        from dispatcher.timing import attach
+        attach(store, config, self.adapter)
 
     def log(self, name, project, *, task=None, reason=None, action=None):
         self.config.logs.mkdir(parents=True, exist_ok=True)
         event(self.config.logs / 'dispatcher.jsonl', name, level='WARN', project=project.id, task=task, reason=reason, action=action)
 
+    @measured('poll')
     def poll(self):
         result = dict(discovered=0, updated=0, unchanged=0, revoked=0, skipped_untrusted=0, errors=[], skipped=[], commands=[])
         for project in self.config.projects:
@@ -31,7 +36,14 @@ class SyncService:
                 continue
             try:
                 before = {r['number']: dict(r) for r in self.store.queue(project.repository)}
+                self.store.timing.emit('project_poll', project_id=project.id, repository=project.repository.casefold())
                 items = self.adapter.fetch(project)
+                if self.store.timing.enabled:
+                    for item in items:
+                        names = {v.casefold() for v in item['labels']}
+                        for label in ('ready', 'approve', 'reject', 'emergency_stop'):
+                            if project.label(label).name.casefold() in names:
+                                self.store.timing.emit(label + '_observed', project_id=project.id, repository=project.repository.casefold(), issue_id=item['id'], issue_number=item['number'])
                 observation = {}
                 counts = self.store.apply(project, items, observation=observation)
                 for key, count in counts.items():
@@ -96,4 +108,7 @@ class SyncService:
     def run(self, stop):
         while not stop.is_set():
             self.poll()
+            start = time.monotonic_ns()
+            self.store.timing.emit('poll_wait', 'start')
             stop.wait(self.config.poll_interval_seconds)
+            self.store.timing.emit('poll_wait', 'success', duration_ms=(time.monotonic_ns()-start)/1e6)

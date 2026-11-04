@@ -1,4 +1,5 @@
 """Dispatcher-owned Git clones and conservative terminal cleanup."""
+from dispatcher.timing import measured
 from pathlib import Path
 import os
 import json
@@ -120,6 +121,7 @@ class GitWorkspaceManager:
             return subprocess.CompletedProcess(argv, child.returncode,
                 out.decode(errors='replace') if text else out, err.decode(errors='replace') if text else err)
 
+    @measured('git')
     def git(self, cwd, *args, check=True):
         if self.operation_guard:
             self.operation_guard()
@@ -196,6 +198,7 @@ class GitWorkspaceManager:
         if result.returncode:
             raise TaskError('invalid_branch', 'GIT')
 
+    @measured('worktree_prepare')
     def prepare(self, project, issue, branch):
         repo, task, worktree = self.paths(project, issue['number'])
         private_dir(self.config.workspace, task)
@@ -386,6 +389,7 @@ class GitWorkspaceManager:
             raise TaskError('git_operation_failed', 'GIT')
         return sha
 
+    @measured('git_push')
     def push(self, project, worktree, branch, expected_origin=None, *, before_push=None):
         safe_path(self.config.workspace, worktree)
         if expected_origin is not None and self.git(worktree, 'remote', 'get-url', 'origin').stdout.strip() != expected_origin:

@@ -23,6 +23,12 @@ def main(argv=None):
     queue = sub.add_parser('queue', help='Display local queue (table by default)')
     queue.add_argument('--format', choices=('table', 'json'), default='table',
                        help='Output format (default: table; json preserves the machine contract)')
+    timing = sub.add_parser('timing')
+    timing.add_argument('--project', required=True)
+    timing.add_argument('--issue', type=int)
+    timing.add_argument('--format', choices=('table', 'json', 'csv'), default='table')
+    timing.add_argument('--limit', type=int, default=100)
+    timing.add_argument('--clear', action='store_true', help='Delete timing records only for the selected project/issue')
     init = sub.add_parser('init')
     init.add_argument('--update', action='store_true')
     for command in ('show', 'approve', 'reject', 'cleanup-retry'):
@@ -58,6 +64,14 @@ def main(argv=None):
                 print(f'{level}: {message}')
             return int(any(level == 'FAIL' for level, _ in checks))
         root = prepare(config)
+        if args.command == 'timing':
+            if args.limit <= 0 or not any(p.id == args.project for p in config.projects):
+                raise RuntimeError('Unknown project or nonpositive limit')
+            from dispatcher.timing import export
+            with_store = Store(root / 'tasks.sqlite3')
+            with_store.close()
+            print(export(root / 'tasks.sqlite3', args.project, args.issue, args.limit, args.format, args.clear))
+            return 0
         if args.command in ('start', '_serve'):
             for project in config.projects:
                 if project.enabled and not ready(project):

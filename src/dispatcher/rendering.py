@@ -130,8 +130,6 @@ def render_queue(rows, projects, format='table', stream=None):
         print(framed_row(rendered), file=stream)
     print(border(widths, '└', '┴', '┘'), file=stream)
     for row in rows:
-        if 'issue_type' in row:
-            print(f"Issue {row['number']}: issue_type={row['issue_type']} execution_mode={row.get('execution_mode', 'codex' if row.get('run_codex', True) else 'manual')}", file=stream)
         if 'generation' in row:
             render_frame([[f"Container #{row['number']}: generation={row['generation']} ready={row['ready_for_integration']}",
                            f"children={row['children_count']} done={row['completed_count']} waiting={row['waiting_count']} conflicts={row['conflict_count']}"]], stream)

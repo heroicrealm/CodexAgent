@@ -1,4 +1,5 @@
 """Versioned SQLite snapshots. Transactions serialize polling and future approval."""
+from dispatcher.timing import measured
 import os
 import hashlib
 import json
@@ -48,6 +49,12 @@ class Store:
                 upgrade613(self.db)
                 upgrade614(self.db)
                 upgrade615(self.db)
+                from dispatcher.timing import bootstrap
+                try:
+                    bootstrap(self.db)
+                except sqlite3.Error:
+                    import logging
+                    logging.getLogger(__name__).warning('Timing schema unavailable; execution remains enabled')
         except Exception:
             self.db.close()
             raise
@@ -59,6 +66,7 @@ class Store:
         return self.db.execute('SELECT * FROM tasks WHERE repository=? AND number=?',
                                (repository.casefold(), number)).fetchone()
 
+    @measured('approval')
     def confirm(self, repository, number, expected_version):
         """Stage 3 contract: confirm only the available, current discovered version.
 
@@ -89,6 +97,7 @@ class Store:
                                    (repository.casefold(),)).fetchall()
         return self.db.execute('SELECT * FROM tasks ORDER BY repository,number').fetchall()
 
+    @measured('approval')
     def decide(self, repository, number, version, action, source='cli', event_id=None, valid=True, expected_synced_at=None, expected_observation=None, expected_state=None, evidence=None, actor=None):
         """First committed decision wins, including across independent connections."""
         if action not in ('approve', 'reject', 'cancel') or source not in ('cli', 'github'):
@@ -213,6 +222,7 @@ class Store:
                 return True
         return False
 
+    @measured('sqlite_sync')
     def apply(self, project, issues, *, observation=None, partial=False, controlled_operation=None):
         counts = dict(discovered=0, updated=0, unchanged=0, revoked=0, skipped_untrusted=0)
         repository, stamp = project.repository.casefold(), now()
@@ -390,6 +400,7 @@ class Store:
         self.db.execute('UPDATE tasks SET current_iteration_id=? WHERE issue_id=?', (cursor.lastrowid, row['issue_id']))
         return cursor.lastrowid
 
+    @measured('state_transition')
     def transition(self, **request):
         from .transitions import transition
         return transition(self, **request)
@@ -411,6 +422,7 @@ class Store:
                          iteration_id if iteration_id is not None else row['current_iteration_id'],
                          json.dumps(evidence or {}, sort_keys=True), now()))
 
+    @measured('outbox_enqueue')
     def publication(self, operation_key, iteration_id, phase='intent', outcome='pending', *, retry=False):
         """Persist publication progress without reserving or starting Codex."""
         with self.db:

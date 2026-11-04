@@ -65,6 +65,7 @@ class Config:
     attachment_max_bytes: int = 20971520
     attachment_timeout_seconds: int = 30
     emergency_poll_interval_seconds: int = 5
+    timing_enabled: bool = False
 
 
 def load(path: str | Path) -> Config:
@@ -121,6 +122,9 @@ def load(path: str | Path) -> Config:
         if type(value) is not int or value <= 0:
             raise ConfigError(f'{key} must be a positive integer')
         options[key] = value
+    options['timing_enabled'] = section('diagnostics').get('timing_enabled', False)
+    if type(options['timing_enabled']) is not bool:
+        raise ConfigError('diagnostics.timing_enabled must be boolean')
     options['execution_mode'] = codex.get('execution_mode', 'full-auto')
     if options['execution_mode'] != 'full-auto':
         raise ConfigError('codex.execution_mode must be full-auto')

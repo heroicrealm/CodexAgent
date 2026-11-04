@@ -1,4 +1,5 @@
 """Noninteractive executor. Lifecycle alone owns child polling and reaping."""
+from dispatcher.timing import measured
 import json
 import subprocess
 from dispatcher.process_wait import run as natural_run
@@ -23,6 +24,7 @@ class CodexExecutor:
             raise TaskError('unsupported_codex_cli', 'CODEX') from None
         self.checked = True
 
+    @measured('codex_start')
     def start(self, issue, branch, paths, worktree, task, attempt, before_exec=None):
         from dispatcher.issue_parameters import parse
         _, task_body = parse(issue["body"])
