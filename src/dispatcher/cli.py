@@ -151,7 +151,10 @@ def main(argv=None):
                     render_show(value, args.format)
                 else:
                     from dispatcher.queue import decide_cli
-                    result, synced = decide_cli(store, Adapter(config.github_executable), project, args.issue, args.command)
+                    adapter = Adapter(config.github_executable)
+                    from dispatcher.timing import attach
+                    attach(store, config, adapter)
+                    result, synced = decide_cli(store, adapter, project, args.issue, args.command)
                     print(result)
                     if not synced:
                         from dispatcher.logging import event

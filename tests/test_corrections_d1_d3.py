@@ -269,3 +269,24 @@ def test_timing_cli_and_strict_opt_in(env, capsys):
     config.source.write_text(yaml.safe_dump(data))
     with pytest.raises(ConfigError):
         load(config.source)
+
+
+def test_cli_approval_records_timing(env, monkeypatch, capsys):
+    import yaml
+    from dispatcher.cli import main
+    from test_stage04 import adapter
+    config, project, *_ = env
+    data = yaml.safe_load(config.source.read_text())
+    data['diagnostics'] = {'timing_enabled': True}
+    config.source.write_text(yaml.safe_dump(data))
+    item = issue(project)
+    path = config.workspace / '.runtime' / 'tasks.sqlite3'
+    store = Store(path)
+    store.apply(project, [item])
+    store.close()
+    api = adapter([item])
+    monkeypatch.setattr('dispatcher.github.Adapter', lambda *a: api)
+    assert main(['--config', str(config.source), 'approve', project.id, '1']) == 0
+    assert 'applied' in capsys.readouterr().out
+    events = json.loads(export(path, project.id, 1, format='json'))
+    assert any(e['event'] == 'state_changed' and json.loads(e['details'])['state'] == 'pending' for e in events)
