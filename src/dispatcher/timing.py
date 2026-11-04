@@ -7,6 +7,7 @@ import logging
 import sqlite3
 import time
 import uuid
+from contextlib import closing
 from contextvars import ContextVar
 from datetime import datetime, timezone
 
@@ -58,7 +59,7 @@ class Trace:
         record.update(timestamp_utc=datetime.now(timezone.utc).isoformat(timespec='microseconds'),
                       event=event, phase=phase, details=json.dumps(safe_details))
         try:
-            with sqlite3.connect(self.path, timeout=.01) as db:
+            with closing(sqlite3.connect(self.path, timeout=.01)) as db, db:
                 db.execute(f"INSERT INTO dispatcher_timing_events ({','.join(record)}) VALUES ({','.join('?' for _ in record)})", tuple(record.values()))
         except (sqlite3.Error, OSError):
             if not _warned:
@@ -146,7 +147,7 @@ def measured(event):
 
 
 def export(path, project, issue=None, limit=100, format='table', clear=False):
-    with sqlite3.connect(path) as db:
+    with closing(sqlite3.connect(path)) as db, db:
         db.row_factory = sqlite3.Row
         where, args = 'project_id=?', [project]
         if issue is not None:
