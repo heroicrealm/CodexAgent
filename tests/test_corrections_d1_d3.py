@@ -290,3 +290,17 @@ def test_cli_approval_records_timing(env, monkeypatch, capsys):
     assert 'applied' in capsys.readouterr().out
     events = json.loads(export(path, project.id, 1, format='json'))
     assert any(e['event'] == 'state_changed' and json.loads(e['details'])['state'] == 'pending' for e in events)
+
+
+def test_child_http_event_does_not_inherit_parent_identity(tmp_path):
+    from dispatcher.timing import _context
+    path = tmp_path / 'tasks.sqlite3'
+    store = Store(path)
+    token = _context.set(dict(project_id='a', repository='o/r', issue_id=100, issue_number=1))
+    try:
+        Trace(path, True).emit('github_request_start', issue_number=2)
+    finally:
+        _context.reset(token)
+    event = json.loads(export(path, 'a', 2, format='json'))[0]
+    assert event['issue_id'] is None and event['issue_number'] == 2
+    store.close()

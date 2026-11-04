@@ -39,6 +39,10 @@ class Trace:
             return
         # Only named numeric/identity fields; arbitrary payloads never enter traces.
         fields = dict(_context.get())
+        if ('issue_id' not in values and (
+                'issue_number' in values and values['issue_number'] != fields.get('issue_number')
+                or 'repository' in values and values['repository'] != fields.get('repository'))):
+            fields.pop('issue_id', None)
         fields.update(values)
         if not fields.get('project_id') and fields.get('repository'):
             fields['project_id'] = self.projects.get(fields['repository'])
