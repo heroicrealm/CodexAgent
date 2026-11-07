@@ -1,1 +1,1 @@
-"""Independent V2 foundation. Application orchestration is not implemented yet."""
+"""Codex Task Dispatcher V2: local coordination, SQLite and injectable adapters."""

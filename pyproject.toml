@@ -8,6 +8,10 @@ version = "2.3.0a0"
 requires-python = ">=3.11"
 dependencies = ["PyYAML>=6"]
 
+[project.scripts]
+codex-dispatcher = "dispatcher.__main__:main"
+worktree-cleanup = "dispatcher.tools.worktree_cleanup:main"
+
 [project.optional-dependencies]
 test = ["pytest>=8"]
 

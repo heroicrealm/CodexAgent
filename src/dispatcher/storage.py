@@ -4,7 +4,7 @@ from importlib.resources import files
 from pathlib import Path
 import sqlite3
 import yaml
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from .models import (ACTIVE, State, Execution, ExecutionStatus, IssueObservation,
                      ApprovedSnapshot, PRObservation, utc_now)
 
@@ -198,7 +198,9 @@ class Storage:
             return self._transition(db, issue_id, expected, target, reason)
 
     def commit_approval(self, issue_id: int, snapshot: ApprovedSnapshot,
-                        target: State) -> bool:
+                        target: State, *, correction_of: int | None = None,
+                        branches: tuple[str, str] | None = None,
+                        readiness: Callable[[sqlite3.Connection], bool] | None = None) -> bool:
         """Store a complete, already fetched approval in one transaction.
 
         StateService must first read all required data, extract YAML, validate its
@@ -228,9 +230,42 @@ class Storage:
             if not isinstance(parameters, dict):
                 raise ValueError("Approval YAML must contain a parameter mapping")
         with self.transaction() as db:
-            row = db.execute("SELECT approved_at FROM issues WHERE issue_id=?", (issue_id,)).fetchone()
+            row = db.execute("SELECT * FROM issues WHERE issue_id=?", (issue_id,)).fetchone()
             if not row or row['approved_at'] is not None:
                 return False
+            if row['is_virtual'] or row['state'] != State.DISCOVERED:
+                return False
+            if correction_of is not None:
+                source = db.execute("SELECT * FROM issues WHERE issue_id=?", (correction_of,)).fetchone()
+                if (not source or source['is_virtual'] or source['repository'] != row['repository']
+                        or source['issue_id'] == issue_id):
+                    raise ValueError("Invalid correction source")
+                root = db.execute("SELECT * FROM issues WHERE issue_id=?", (source['execution_group_id'],)).fetchone()
+                if (not root or root['is_virtual'] or root['execution_group_id'] != root['issue_id']
+                        or root['repository'] != row['repository'] or root['state'] in (State.DONE, State.CANCELLED)):
+                    raise ValueError("Correction group is completed or invalid")
+                members = db.execute("SELECT * FROM issues WHERE execution_group_id=?", (root['issue_id'],)).fetchall()
+                if any(member['state'] in ACTIVE for member in members):
+                    raise ValueError("Group already has an active issue")
+                if not any(member['state'] == State.NEED_FIX for member in members):
+                    raise ValueError("Group has no current need-fix permission")
+                if any(m['state'] in (State.ERROR, State.REJECTED) for m in members):
+                    raise ValueError("Latest failure still requires need-fix")
+                cursor, seen = source, {issue_id}
+                while cursor:
+                    if cursor['issue_id'] in seen:
+                        raise ValueError("Correction cycle")
+                    seen.add(cursor['issue_id'])
+                    cursor = db.execute("SELECT * FROM issues WHERE issue_id=?", (cursor['correction_of_issue_id'],)).fetchone()
+                if not root['base_branch'] or not root['work_branch']:
+                    raise ValueError("Correction group has no pinned branches")
+                db.execute("UPDATE issues SET execution_group_id=?,correction_of_issue_id=? WHERE issue_id=?",
+                           (root['issue_id'], correction_of, issue_id))
+            elif branches:
+                db.execute("UPDATE issues SET execution_group_id=issue_id,correction_of_issue_id=NULL,base_branch=?,work_branch=? WHERE issue_id=?",
+                           (*branches, issue_id))
+            if readiness is not None:
+                target = State.PENDING if readiness(db) else State.AWAITING_CHILDREN
             if not self._transition(db, issue_id, State.DISCOVERED, target, "approval"):
                 return False
             now = utc_now()
@@ -321,3 +356,23 @@ class Storage:
                 raise ValueError("Group branches are immutable")
             db.execute("UPDATE issues SET base_branch=?,work_branch=?,updated_at=? WHERE issue_id=?",
                        (base_branch, work_branch, utc_now(), root['issue_id']))
+
+    def rows(self, sql: str, args: tuple = ()) -> list[sqlite3.Row]:
+        with self.connection() as db:
+            return db.execute(sql, args).fetchall()
+
+    def execution(self, execution_id: int) -> sqlite3.Row:
+        rows = self.rows("SELECT * FROM executions WHERE execution_id=?", (execution_id,))
+        if not rows:
+            raise ValueError("Unknown execution")
+        return rows[0]
+
+    def update_execution(self, execution_id: int, **fields: object) -> None:
+        allowed = {"status", "branch_name", "worktree_path", "finished_at", "codex_finished_at",
+                   "exit_code", "error_code", "error_message", "initial_commit", "result_commit",
+                   "push_completed", "pr_published", "comment_published"}
+        if not fields or set(fields) - allowed:
+            raise ValueError("Unsupported execution fields")
+        with self.transaction() as db:
+            db.execute("UPDATE executions SET " + ",".join(f"{key}=?" for key in fields) +
+                       " WHERE execution_id=?", (*fields.values(), execution_id))

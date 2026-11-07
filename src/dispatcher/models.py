@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from datetime import datetime, timezone
 
@@ -74,6 +74,7 @@ class PRObservation:
     base_branch: str
     status: PRStatus
     merged_at: str | None = None
+    head_commit: str | None = None
 
 
 @dataclass(frozen=True)
@@ -127,3 +128,22 @@ class PublishResult:
     published: bool
     pr_id: int | None = None
     error_code: str | None = None
+
+
+@dataclass(frozen=True)
+class InputComment:
+    id: int
+    body: str
+
+
+@dataclass
+class ObservationBatch:
+    """Only constructed/applied after all required GitHub pages have succeeded."""
+    poll_id: str
+    issues: tuple[IssueObservation, ...]
+    parents: dict[int, IssueObservation | None] = field(default_factory=dict)
+    children: dict[int, tuple[IssueObservation, ...]] = field(default_factory=dict)
+    approvals: dict[int, tuple[IssueObservation, InputComment | None]] = field(default_factory=dict)
+    corrections: dict[int, IssueObservation] = field(default_factory=dict)
+    prs: tuple[PRObservation, ...] = ()
+    approval_errors: dict[int, str] = field(default_factory=dict)

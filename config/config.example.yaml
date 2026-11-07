@@ -4,6 +4,8 @@
 dispatcher:
   workspace: ../workspace-v2
   database: ../runtime-v2/dispatcher.sqlite3
+  poll_interval: 30
+  codex_command: ["codex", "exec", "--sandbox", "workspace-write", "-"]
   debug:
     mode: 'off'
     retention_days: 7
@@ -26,6 +28,8 @@ dispatcher:
 # projects:
 #   - id: test-project
 #     repository: owner/new-v2-test
+#     base_branch: main
+#     checkout: ../workspace-v2/repos/test-project # optional; otherwise cloned here
 #     labels:
 #       codex-ready: "custom-ready"
 #       review: "custom-review"
