@@ -328,3 +328,35 @@ def test_approval_original_stays_local(environment):
     row = store.rows("SELECT * FROM error_log WHERE error_stage='approval'")[0]
     assert SECRET in row['error_message'] and 'Traceback' in row['error_message']
     assert SECRET not in str(api.comments)
+
+
+@pytest.mark.parametrize('value', [
+    'codex/task-0013', 'manual/task-0013', 'codex/task-0001',
+    'codex/task-10000', 'codex/task-0012', 'feature/task-output',
+    'my-team/custom_branch.v2', 'fix/mask-rendering',
+])
+def test_public_branch_names(value):
+    assert public_field(value) == value
+
+
+@pytest.mark.parametrize('value', [
+    'sk-' + 'aB3' * 16,
+    'sk-proj-' + 'aB3_' * 30,
+    'sk-svcacct-' + 'aB3_' * 30,
+    'ghp_' + 'aB3' * 12,
+    'github_pat_' + 'aB3_' * 20,
+    'feature/sk-synthetic', 'feature_sk-synthetic', 'feature.sk-synthetic',
+    'feature-sk-synthetic-suffix',
+    'feature/ghp_' + 'aB3' * 12 + '/suffix',
+    'feature/sk-proj-' + 'aB3_' * 30 + '/suffix',
+    'Authorization-Bearer-value', 'password-value', 'secret-value',
+    'feature\x00hidden', 'feature\rhidden', '/tmp/private',
+])
+def test_structured_secrets_and_unsafe_fields(value):
+    assert public_field(value) == '[withheld]'
+    assert public_field(value, repository=True) == '[withheld]'
+
+
+@pytest.mark.parametrize('value', ['owner/task-tools', 'task-team/project'])
+def test_public_repository_names(value):
+    assert public_field(value, repository=True) == value

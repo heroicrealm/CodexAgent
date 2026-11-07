@@ -59,7 +59,10 @@ def public_field(value, *, repository=False):
     pattern = r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+' if repository else r'[A-Za-z0-9][A-Za-z0-9_./-]{0,199}'
     if not isinstance(value, str) or not re.fullmatch(pattern, value):
         return '[withheld]'
-    if re.search(r'(?i)(gh[pousr]_|github_pat_|sk-|token|password|secret|authorization)', value):
+    # OpenAI's short prefix must start a token, not end a word like "task-".
+    # Underscores and Git path separators are token boundaries too; do not use
+    # \b here, since it treats underscores as word characters.
+    if re.search(r'(?i)(gh[pousr]_|github_pat_|(?<![a-z0-9])sk-|token|password|secret|authorization)', value):
         return '[withheld]'
     if not repository:
         from .input import branch_name

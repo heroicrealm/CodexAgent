@@ -94,6 +94,7 @@ def test_manual_output(environment):
     executor.execute(eid)
     sha = store.execution(eid)['result_commit']
     assert f'/commit/{sha}' in store.issue(1)['output_body']
+    assert 'Group branch: `manual/task-0001`' in store.issue(1)['output_body']
     assert runner.calls == 0
 
 
@@ -126,3 +127,72 @@ def test_latest_successful_publication_and_failed_retry(environment, monkeypatch
     assert store.execution(eid)['result_commit'] == new_sha
     assert f'/commit/{new_sha}' in store.issue(1)['output_body']
     assert runner.calls == 1 and len(api.prs) == 1
+
+
+@pytest.mark.parametrize('number,branch,failed', [
+    (13, None, False), (12, None, True),
+    (13, 'feature/task-custom.v2', False),
+    (12, 'feature/task-custom.v2', True),
+])
+def test_branch_output_review_done_and_error(environment, number, branch, failed):
+    from dispatcher.execution import Executor
+    from dispatcher.services import Scheduler
+    from test_execution_cleanup import FakeRunner
+    from test_services import approve, issue
+
+    config, store, api, gh, git, groups, state, pub, poll = environment
+    api.issues = {number: {**issue(1), 'number': number}}
+    yaml = 'dispatcher: {}\n' if branch is None else f'dispatcher:\n  branch: {branch}\n'
+    approve(api, number=number, yaml=yaml)
+    poll.poll_project(config.projects[0])
+    eid = Scheduler(store, groups, state).reserve(1).execution_id
+    runner = FakeRunner(store, code=1 if failed else 0)
+    Executor(config, store, git, state, pub, runner).execute(eid)
+    branch = branch or f'codex/task-{number:04d}'
+    expected_state = 'error' if failed else 'review'
+    body = store.issue(1)['output_body']
+    assert f'State: `{expected_state}`. Group branch: `{branch}`.' in body
+    assert '[withheld]' not in body
+    assert store.execution(eid)['push_completed']
+    if not failed:
+        assert len(api.prs) == 1 and 'Result commit:' in body
+        pr = next(iter(api.prs.values()))
+        pr.update(merged_at='2026-11-08T10:00:00+00:00', state='closed')
+        poll.poll_project(config.projects[0])
+        body = store.issue(1)['output_body']
+        assert f'State: `done`. Group branch: `{branch}`.' in body
+        assert 'Result commit:' in body
+    else:
+        assert not api.prs and 'Agent final result' not in body
+    before = len(api.calls)
+    pub.phase_output(1)
+    pub.phase_output(1)
+    assert len(api.calls) == before and runner.calls == 1
+
+
+def test_manual_branch_output_review_and_done(environment):
+    config, store, api, gh, git, groups, state, pub, poll = environment
+    executor, eid, runner = start(environment, 'dispatcher:\n  run_codex: false\n')
+    executor.execute(eid)
+    branch = 'manual/task-0001'
+    api.prs[600] = dict(id=600, number=600, state='open', merged_at=None,
+                       head={'ref': branch, 'repo': {'full_name': 'owner/new'}},
+                       base={'ref': 'main'})
+    poll.poll_project(config.projects[0])
+    assert f'State: `review`. Group branch: `{branch}`.' in store.issue(1)['output_body']
+    api.prs[600].update(state='closed', merged_at='2026-11-08T10:00:00+00:00')
+    poll.poll_project(config.projects[0])
+    assert f'State: `done`. Group branch: `{branch}`.' in store.issue(1)['output_body']
+    before = len(api.calls)
+    pub.phase_output(1)
+    assert len(api.calls) == before and runner.calls == 0
+
+
+def test_secret_shaped_branch_remains_withheld_in_output(environment):
+    config, store, api, gh, git, groups, state, pub, poll = environment
+    branch = 'feature/sk-proj-' + 'aB3_' * 20
+    executor, eid, runner = start(environment, f'dispatcher:\n  branch: {branch}\n')
+    executor.execute(eid)
+    assert store.issue(1)['state'] == 'review'
+    assert 'Group branch: `[withheld]`' in store.issue(1)['output_body']
+    assert branch not in store.issue(1)['output_body']
