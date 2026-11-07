@@ -3,9 +3,10 @@ from contextlib import contextmanager
 from importlib.resources import files
 from pathlib import Path
 import sqlite3
+import yaml
 from collections.abc import Iterator
 from .models import (ACTIVE, State, Execution, ExecutionStatus, IssueObservation,
-                     PRObservation, utc_now)
+                     ApprovedSnapshot, PRObservation, utc_now)
 
 
 class SchemaError(RuntimeError):
@@ -195,6 +196,65 @@ class Storage:
         """CAS primitive. Caller StateService must validate business transition/approval."""
         with self.transaction() as db:
             return self._transition(db, issue_id, expected, target, reason)
+
+    def commit_approval(self, issue_id: int, snapshot: ApprovedSnapshot,
+                        target: State) -> bool:
+        """Store a complete, already fetched approval in one transaction.
+
+        StateService must first read all required data, extract YAML, validate its
+        parameter schema and decide readiness. This primitive performs no I/O and
+        never replaces a previously committed snapshot, including on repeated poll.
+        is_approved remains an observed GitHub flag, not an approval marker.
+        """
+        if target not in (State.PENDING, State.AWAITING_CHILDREN) or not isinstance(target, State):
+            raise ValueError("Approval target must be pending or awaiting-children")
+        if not all(isinstance(value, str) for value in (snapshot.title, snapshot.body, snapshot.approved_hash)):
+            raise ValueError("Complete title, body and hash are required")
+        if not snapshot.approved_hash:
+            raise ValueError("Approval hash is required")
+        if snapshot.input_comment_id is None:
+            if snapshot.approved_input is not None or snapshot.parameters_yaml is not None:
+                raise ValueError("Absent INPUT requires NULL INPUT text and YAML")
+        elif (type(snapshot.input_comment_id) is not int or snapshot.input_comment_id <= 0
+              or not isinstance(snapshot.approved_input, str)):
+            raise ValueError("INPUT requires a positive comment ID and complete text")
+        if snapshot.parameters_yaml is not None:
+            if not isinstance(snapshot.parameters_yaml, str):
+                raise ValueError("YAML must be original text")
+            try:
+                parameters = yaml.safe_load(snapshot.parameters_yaml)
+            except yaml.YAMLError as exc:
+                raise ValueError("Invalid approval YAML") from exc
+            if not isinstance(parameters, dict):
+                raise ValueError("Approval YAML must contain a parameter mapping")
+        with self.transaction() as db:
+            row = db.execute("SELECT approved_at FROM issues WHERE issue_id=?", (issue_id,)).fetchone()
+            if not row or row['approved_at'] is not None:
+                return False
+            if not self._transition(db, issue_id, State.DISCOVERED, target, "approval"):
+                return False
+            now = utc_now()
+            db.execute("UPDATE issues SET approved_title=?,approved_body=?,parameters_yaml=?,"
+                       "approved_hash=?,approved_at=?,input_comment_id=?,approved_input=?,updated_at=? "
+                       "WHERE issue_id=?",
+                       (snapshot.title, snapshot.body, snapshot.parameters_yaml, snapshot.approved_hash,
+                        now, snapshot.input_comment_id, snapshot.approved_input, now, issue_id))
+            return True
+
+    def record_confirmed_output(self, issue_id: int, comment_id: int, body: str) -> None:
+        """Persist an OUTPUT receipt only after GitHub confirms creation/update.
+
+        Publisher must not call this on a failed or uncertain publication. There
+        is intentionally no comment existence check or poll-side reconciliation.
+        """
+        if type(comment_id) is not int or comment_id <= 0 or not isinstance(body, str):
+            raise ValueError("OUTPUT requires a positive comment ID and complete text")
+        with self.transaction() as db:
+            changed = db.execute("UPDATE issues SET output_comment_id=?,output_body=?,updated_at=? "
+                                 "WHERE issue_id=? AND is_virtual=0",
+                                 (comment_id, body, utc_now(), issue_id)).rowcount
+            if not changed:
+                raise ValueError("OUTPUT requires a registered real issue")
 
     def reserve(self, issue_id: int) -> Execution | None:
         """Atomic storage reservation; application eligibility belongs to Scheduler."""

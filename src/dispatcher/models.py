@@ -82,6 +82,8 @@ class ApprovedSnapshot:
     body: str
     parameters_yaml: str | None
     approved_hash: str
+    input_comment_id: int | None = None
+    approved_input: str | None = None
 
 
 @dataclass(frozen=True)

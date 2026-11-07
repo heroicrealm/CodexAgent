@@ -23,6 +23,10 @@ CREATE TABLE issues (
     parameters_yaml TEXT,
     approved_hash TEXT,
     approved_at TEXT,
+    input_comment_id INTEGER,
+    approved_input TEXT,
+    output_comment_id INTEGER,
+    output_body TEXT,
 
     base_branch TEXT,
     work_branch TEXT,
