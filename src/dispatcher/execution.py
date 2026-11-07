@@ -14,6 +14,18 @@ from .output import confirmed_sha, public_result
 from .models import Execution, ExecutionStatus, ExecutionResult, PublishResult, State, utc_now
 
 
+FILE_WORK_INSTRUCTION = """Dispatcher instructions:
+Work directly in the provided project working directory. For repository implementation
+or code changes, create or edit the appropriate files; do not only print source code
+in your final message. Briefly describe what you changed. Explicit user instructions
+about the work take priority: do not invent an arbitrary filename or language when
+ambiguous, and do not create files for tasks explicitly requesting only explanation,
+analysis, or text output without changes. Repository changes imply editing real files
+without requiring the words 'into file'. Do not run git commit, push, branch operations,
+or create PRs; the dispatcher manages these operations.
+"""
+
+
 class ProcessRunner:
     def __init__(self, command, pass_fds=()):
         self.command, self.pass_fds = command, pass_fds
@@ -183,18 +195,30 @@ class Publisher:
             raise ValueError('Publication is not allowed in this state')
         base, branch = self.storage.group_branches(issue['issue_id'])
         self.storage.update_execution(execution_id, status='publishing')
+        has_diff = None
         if execution['worktree_path'] and Path(execution['worktree_path']).exists():
-            commit = self.git.commit_push(project, Path(execution['worktree_path']), branch)
-            self.storage.update_execution(execution_id, result_commit=commit, push_completed=1)
+            path = Path(execution['worktree_path'])
+            has_diff = self.git.has_diff(project, path, base)
+            if not has_diff and not confirmed_sha(execution):
+                raise OperationError(
+                    'Codex completed successfully but made no file changes. PR was not created.',
+                    code='no_changes_for_pr', operation='git.diff')
+            if has_diff:
+                commit = self.git.commit_push(project, path, branch)
+                self.storage.update_execution(execution_id, result_commit=commit, push_completed=1)
         elif not execution['push_completed']:
             raise RuntimeError('No published result or surviving worktree')
         # Always reconcile before POST, including retry after an uncertain response.
         pr = self.find_pr(issue)
         if not pr:
+            if has_diff is None:
+                raise RuntimeError('No surviving worktree to compare for a new PR')
+            if has_diff is False:
+                raise OperationError(
+                    'Codex completed successfully but made no file changes. PR was not created.',
+                    code='no_changes_for_pr', operation='git.diff')
             if not execution['codex_finished_at'] or execution['exit_code'] != 0:
                 raise RuntimeError('No completed successful Codex result for a new PR')
-            if not execution['worktree_path'] or not self.git.has_diff(project, Path(execution['worktree_path']), base):
-                raise RuntimeError('No changes available for PR')
             pr = self.github.create_pr(project, issue, branch, base)
         self.state.apply_pr(pr, recover=True)
         self.storage.update_execution(execution_id, pr_published=1, status='completed', finished_at=utc_now())
@@ -249,19 +273,22 @@ class Publisher:
         exc = exc or OperationError('Execution interrupted; original exception unavailable')
         diagnostic_code = getattr(exc, 'code', None) or code
         self.storage.record_error(issue['issue_id'], diagnostic_code, stage,
-            original(exc, getattr(exc, 'operation', None) or 'executor.' + stage), execution_id)
+            original(exc, getattr(exc, 'operation', None) or 'executor.' + stage,
+                     {'result_file': str(self.config.workspace / 'results' / f'{execution_id}.txt')}), execution_id)
         # Best effort to save dirty work, even when the main pipeline failed.
-        if execution['worktree_path'] and Path(execution['worktree_path']).exists():
+        if diagnostic_code != 'no_changes_for_pr' and execution['worktree_path'] and Path(execution['worktree_path']).exists():
             try:
-                commit = self.git.commit_push(self.project(issue), Path(execution['worktree_path']),
-                                              self.storage.group_branches(issue['issue_id'])[1])
-                self.storage.update_execution(execution_id, result_commit=commit, push_completed=1)
+                if self.git.has_unpublished_changes(Path(execution['worktree_path']),
+                        execution['result_commit'] if execution['push_completed'] else execution['initial_commit']):
+                    commit = self.git.commit_push(self.project(issue), Path(execution['worktree_path']),
+                                                  self.storage.group_branches(issue['issue_id'])[1])
+                    self.storage.update_execution(execution_id, result_commit=commit, push_completed=1)
             except Exception as secondary:
                 self.storage.record_error(issue['issue_id'], 'salvage_failed', 'salvage',
                     original(secondary, 'publisher.salvage'), execution_id)
-        self.storage.update_execution(execution_id, status='failed', error_code=code, finished_at=utc_now())
+        self.storage.update_execution(execution_id, status='failed', error_code=diagnostic_code, finished_at=utc_now())
         if issue['state'] in (State.PREPARING, State.RUNNING):
-            self.state.transition(issue['issue_id'], State(issue['state']), State.ERROR, code)
+            self.state.transition(issue['issue_id'], State(issue['state']), State.ERROR, diagnostic_code)
         try:
             self.phase_output(issue['issue_id'])
             self.send_final_error_report(issue['issue_id'])
@@ -335,7 +362,7 @@ class Executor:
         if not self.storage.mark_codex_started(execution_id):
             raise ValueError('Codex attempt already consumed')
         code, result = self.runner.run(Path(execution['worktree_path']),
-            issue['approved_title'] + '\n\n' + issue['approved_body'] + '\n\n' + (issue['approved_input'] or ''))
+            FILE_WORK_INSTRUCTION + '\n' + issue['approved_title'] + '\n\n' + issue['approved_body'] + '\n\n' + (issue['approved_input'] or ''))
         self.storage.update_execution(execution_id, codex_finished_at=utc_now(), exit_code=code)
         result_dir = self.config.workspace / 'results'
         private_directory(result_dir)

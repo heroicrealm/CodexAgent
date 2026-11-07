@@ -6,6 +6,8 @@ import re
 import traceback
 
 REASONS = {
+    'no_changes_for_pr': 'Codex completed successfully but made no file changes. PR was not created.',
+    'git_diff_failed': 'Git diff failed.',
     'base_branch_not_found': 'The remote base branch was not found.',
     'work_branch_exists': 'The work branch already exists; choose another branch.',
     'git_clone_failed': 'Git clone failed.',
@@ -77,7 +79,7 @@ def public_error(row, issue, base):
     # Never read error_message here, including legacy plain-text rows.
     code = row['error_code'] if row['error_code'] in REASONS else 'execution_failed'
     stage = row['error_stage'] if row['error_stage'] in {'preparation', 'codex', 'publication', 'recovery'} else 'execution'
-    operation = {'base_branch_not_found': 'git.prepare', 'work_branch_exists': 'git.prepare',
+    operation = {'no_changes_for_pr': 'git.diff', 'base_branch_not_found': 'git.prepare', 'work_branch_exists': 'git.prepare',
                  'codex_exit_nonzero': 'codex.run', 'codex_start_failed': 'codex.start',
                  'github_http_error': 'github.request'}.get(code)
     if code.startswith('git_'):

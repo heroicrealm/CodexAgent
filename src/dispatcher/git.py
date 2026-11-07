@@ -85,7 +85,7 @@ class Git:
 
     def commit_push(self, project, path, work):
         self.run(path, 'add', '--all')
-        if self.run(path, 'diff', '--cached', '--quiet', check=False).returncode != 0:
+        if self.diff_changed(path, '--cached'):
             self.run(path, 'commit', '-m', 'Dispatcher task result')
         commit = self.run(path, 'rev-parse', 'HEAD')
         self.run(path, 'push', 'origin', f'HEAD:refs/heads/{branch_name(work)}')
@@ -110,9 +110,28 @@ class Git:
             pass
         return False
 
+    def diff_changed(self, path, *args):
+        result = self.run(path, 'diff', '--quiet', *args, check=False)
+        if result.returncode not in (0, 1):
+            raise GitError('Git diff failed', code='git_diff_failed', operation='git.diff',
+                           stdout=result.stdout, stderr=result.stderr, returncode=result.returncode)
+        return result.returncode == 1
+
     def has_diff(self, project, path, base):
         self.fetch(project)
-        return self.run(path, 'diff', '--quiet', f'origin/{branch_name(base)}...HEAD', check=False).returncode == 1
+        # Stage the prospective result, including additions and deletions, then
+        # compare against the current base, including inherited group changes.
+        self.run(path, 'add', '--all')
+        base_ref = 'refs/remotes/origin/' + branch_name(base)
+        ancestor = self.run(path, 'merge-base', base_ref, 'HEAD')
+        return (self.diff_changed(path, '--cached', ancestor, '--')
+                and self.diff_changed(path, '--cached', base_ref, '--'))
+
+    def has_unpublished_changes(self, path, confirmed):
+        self.run(path, 'add', '--all')
+        if self.diff_changed(path, '--cached', 'HEAD', '--'):
+            return True
+        return bool(confirmed and self.run(path, 'rev-parse', 'HEAD') != confirmed)
 
     def worktrees(self, project):
         raw = self.run(self.checkout(project, create=False), 'worktree', 'list', '--porcelain', '-z')
