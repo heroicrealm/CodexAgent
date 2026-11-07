@@ -178,7 +178,7 @@ def test_correction_binds_only_at_approve_and_group_atomic(app):
     assert store.issue(3)['state'] == 'discovered'
     assert store.issue(3)['execution_group_id'] == 3
     assert store.issue(3)['approved_input'] is None
-    assert store.group_branches(2) == ('main', 'codex/task-1')
+    assert store.group_branches(2) == ('main', 'codex/task-0001')
 
 
 def test_virtual_children_late_links_and_readiness(app):
@@ -288,10 +288,10 @@ def test_terminal_pr_with_closed_issue_and_conflict(app):
     poll.poll_project(config.projects[0])
     state.transition(1, State.PENDING, State.PREPARING, 'test')
     state.transition(1, State.PREPARING, State.RUNNING, 'test')
-    pr = PRObservation(700, 1, 'owner/new', 700, 'codex/task-1', 'main', PRStatus.OPEN)
+    pr = PRObservation(700, 1, 'owner/new', 700, 'codex/task-0001', 'main', PRStatus.OPEN)
     state.apply_pr(pr)
     api.prs[700] = dict(id=700, number=700, state='closed', merged_at='2026-11-07T10:00:00+00:00',
-                       head={'ref': 'codex/task-1'}, base={'ref': 'different'})
+                       head={'ref': 'codex/task-0001'}, base={'ref': 'different'})
     api.issues[1]['state'] = 'closed'
     poll.poll_project(config.projects[0])
     assert store.issue(1)['state'] == 'done'
@@ -311,10 +311,10 @@ def test_merge_conflict_and_ready_removed_with_pr_block_parent(app):
     poll.poll_project(config.projects[0])
     state.transition(2, State.PENDING, State.PREPARING, 'test')
     state.transition(2, State.PREPARING, State.RUNNING, 'test')
-    pr = PRObservation(700, 2, 'owner/new', 700, 'codex/task-2', 'main', PRStatus.OPEN)
+    pr = PRObservation(700, 2, 'owner/new', 700, 'codex/task-0002', 'main', PRStatus.OPEN)
     state.apply_pr(pr)
     api.prs[700] = dict(id=700, number=700, state='open', merged_at=None,
-                       head={'ref': 'codex/task-2'}, base={'ref': 'main'})
+                       head={'ref': 'codex/task-0002'}, base={'ref': 'main'})
     api.issues[2]['labels'] = [{'name': 'dispatcher:review'}]
     poll.poll_project(config.projects[0])
     assert store.issue(2)['is_ready'] == 0
@@ -432,12 +432,12 @@ def test_group_terminal_finishes_each_direct_child_once(app):
     poll.poll_project(config.projects[0])
     state.transition(2, State.PENDING, State.PREPARING, 'test')
     state.transition(2, State.PREPARING, State.RUNNING, 'test')
-    state.apply_pr(PRObservation(700, 2, 'owner/new', 700, 'codex/task-1', 'main', PRStatus.OPEN))
-    state.apply_pr(PRObservation(700, 2, 'owner/new', 700, 'codex/task-1', 'main', PRStatus.MERGED))
+    state.apply_pr(PRObservation(700, 2, 'owner/new', 700, 'codex/task-0001', 'main', PRStatus.OPEN))
+    state.apply_pr(PRObservation(700, 2, 'owner/new', 700, 'codex/task-0001', 'main', PRStatus.MERGED))
     assert store.issue(1)['state'] == store.issue(2)['state'] == 'done'
     assert store.issue(3)['state'] == 'pending'
     count = len(store.rows('SELECT * FROM state_history'))
-    state.apply_pr(PRObservation(700, 2, 'owner/new', 700, 'codex/task-1', 'main', PRStatus.MERGED))
+    state.apply_pr(PRObservation(700, 2, 'owner/new', 700, 'codex/task-0001', 'main', PRStatus.MERGED))
     assert len(store.rows('SELECT * FROM state_history')) == count
 
 
@@ -536,7 +536,7 @@ def test_child_without_ready_can_approve_and_complete_dependency(app, terminal):
     else:
         state.transition(2, State.PENDING, State.PREPARING, 'test')
         state.transition(2, State.PREPARING, State.RUNNING, 'test')
-        pr = PRObservation(700, 2, 'owner/new', 700, 'codex/task-2', 'main', PRStatus.OPEN)
+        pr = PRObservation(700, 2, 'owner/new', 700, 'codex/task-0002', 'main', PRStatus.OPEN)
         state.apply_pr(pr)
         state.apply_pr(replace(pr, status=PRStatus.MERGED))
     assert store.issue(2)['state'] == terminal and store.issue(2)['is_ready'] == 0
@@ -590,3 +590,47 @@ def test_null_child_state_is_not_terminal_even_without_ready(app):
         db.execute('PRAGMA ignore_check_constraints=ON')
         db.execute('UPDATE issues SET state=NULL,is_ready=0 WHERE issue_id=2')
     assert groups.evaluate(1).reasons == ('unfinished-child',)
+
+
+@pytest.mark.parametrize('number', [1, 10, 125, 9999, 10000])
+@pytest.mark.parametrize('run_codex,prefix', [(True, 'codex'), (False, 'manual')])
+def test_auto_branch_uses_repository_issue_number(app, number, run_codex, prefix):
+    from dispatcher.models import InputComment
+    config, store, api, gh, groups, state, *_ = app
+    observation = IssueObservation(987654321, 'owner/new', number, 'Task')
+    store.register_issue(observation, 'p')
+    comment = InputComment(101, INPUT_MARKER + '\n```yaml\ndispatcher:\n  run_codex: '
+                           + str(run_codex).lower() + '\n```')
+    assert state.approve(config.projects[0], observation, comment)
+    assert store.group_branches(observation.issue_id) == ('main', f'{prefix}/task-{number:04d}')
+    assert store.issue(observation.issue_id)['execution_group_id'] == observation.issue_id
+    assert not api.calls
+
+
+def test_same_issue_number_in_different_repositories(app):
+    config, store, api, gh, groups, state, *_ = app
+    for global_id, project in [(100001, config.projects[0]), (200002, Project('q', 'other/repo'))]:
+        observation = IssueObservation(global_id, project.repository, 10, 'Task')
+        store.register_issue(observation, project.id)
+        assert state.approve(project, observation, None)
+        assert store.group_branches(global_id) == ('main', 'codex/task-0010')
+        assert store.issue(global_id)['execution_group_id'] == global_id
+
+
+@pytest.mark.parametrize('branch', ['user/Keep-This-Name', 'codex/task-987654321'])
+def test_pinned_branch_survives_reapproval_restart_and_correction(app, branch):
+    config, store, api, gh, groups, state, pub, poll = app
+    approve(api, yaml=f'dispatcher:\n  branch: {branch}\n')
+    poll.poll_project(config.projects[0])
+    # An old automatically generated name is indistinguishable from any pinned name.
+    restarted = StateService(Storage(config.database), GroupService(store), config)
+    assert not restarted.approve(config.projects[0], IssueObservation(1, 'owner/new', 10, 'Edited'), None)
+    assert store.group_branches(1) == ('main', branch)
+    state.transition(1, State.PENDING, State.PREPARING, 'test')
+    state.transition(1, State.PREPARING, State.ERROR, 'test')
+    state.transition(1, State.ERROR, State.NEED_FIX, 'test')
+    api.issues[2] = issue(2)
+    approve(api, 2, 'dispatcher:\n  correction_for: 1\n')
+    poll.poll_project(config.projects[0])
+    assert store.issue(2)['execution_group_id'] == 1
+    assert store.group_branches(2) == ('main', branch)

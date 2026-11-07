@@ -115,7 +115,7 @@ class StateService:
             base = params.base_branch or project.base_branch
             from .input import branch_name
             branch_name(base)
-            branches = (base, params.branch or f"{'codex' if params.run_codex else 'manual'}/task-{issue.issue_id}")
+            branches = (base, params.branch or f"{'codex' if params.run_codex else 'manual'}/task-{issue.issue_number:04d}")
             if branches[0] == branches[1]:
                 raise ValueError('Work branch must differ from base branch')
         snapshot = ApprovedSnapshot(issue.title, issue.body, raw,

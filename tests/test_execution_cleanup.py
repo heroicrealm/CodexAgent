@@ -87,7 +87,7 @@ def test_execution_publication_and_no_second_run(environment):
     execution = store.execution(execution_id)
     assert execution['codex_started_at'] and execution['push_completed'] and execution['pr_published']
     assert 'Agent final result' in store.issue(1)['output_body']
-    assert gitcmd(config.projects[0].checkout, 'ls-remote', '--heads', 'origin', 'codex/task-1')
+    assert gitcmd(config.projects[0].checkout, 'ls-remote', '--heads', 'origin', 'codex/task-0001')
     with pytest.raises(ValueError):
         executor.run_once(execution_id)
     assert len(api.prs) == 1
@@ -106,9 +106,9 @@ def test_manual_has_no_codex_worktree_or_running_label(environment):
     assert store.execution(execution_id)['worktree_path'] is None
     names = {v['name'] for v in api.issues[1]['labels']}
     assert 'dispatcher:manual-running' in names and 'dispatcher:running' not in names
-    assert gitcmd(config.projects[0].checkout, 'ls-remote', '--heads', 'origin', 'manual/task-1')
+    assert gitcmd(config.projects[0].checkout, 'ls-remote', '--heads', 'origin', 'manual/task-0001')
     api.prs[600] = dict(id=600, number=600, state='open', merged_at=None,
-                       head={'ref': 'manual/task-1', 'repo': {'full_name': 'owner/new'}}, base={'ref': 'main'})
+                       head={'ref': 'manual/task-0001', 'repo': {'full_name': 'owner/new'}}, base={'ref': 'main'})
     poll.poll_project(config.projects[0])
     assert store.issue(1)['state'] == 'review'
 
@@ -181,7 +181,7 @@ def test_recovery_existing_pr_restores_review_without_execution(environment):
     executor.prepare(execution_id)
     store.mark_codex_started(execution_id)
     api.prs[600] = dict(id=600, number=600, state='open', merged_at=None,
-                       head={'ref': 'codex/task-1', 'repo': {'full_name': 'owner/new'}}, base={'ref': 'main'})
+                       head={'ref': 'codex/task-0001', 'repo': {'full_name': 'owner/new'}}, base={'ref': 'main'})
     executor.recover()
     assert store.issue(1)['state'] == 'review'
     assert runner.calls == 0
@@ -300,7 +300,7 @@ def test_non_fast_forward_retains_unpublished_result(environment):
             (checkout / 'competitor.txt').write_text('competing user result')
             gitcmd(checkout, 'add', '.')
             gitcmd(checkout, 'commit', '-m', 'competitor')
-            gitcmd(checkout, 'push', 'origin', 'HEAD:refs/heads/codex/task-1')
+            gitcmd(checkout, 'push', 'origin', 'HEAD:refs/heads/codex/task-0001')
             return super().run(path, prompt)
     runner = RacingRunner(store)
     executor, execution_id, _ = start(environment, runner=runner)
@@ -324,7 +324,7 @@ def test_group_cancellation_deletes_only_published_managed_branch(environment):
     assert store.issue(1)['state'] == 'rejected'
     state.transition(1, State.REJECTED, State.CANCELLED, 'cancel')
     Cleanup(config, store, git).known()
-    assert not gitcmd(config.projects[0].checkout, 'ls-remote', '--heads', 'origin', 'codex/task-1')
+    assert not gitcmd(config.projects[0].checkout, 'ls-remote', '--heads', 'origin', 'codex/task-0001')
     assert gitcmd(config.projects[0].checkout, 'ls-remote', '--heads', 'origin', 'main')
 
 
@@ -457,7 +457,7 @@ def test_manual_pr_merged_between_polls_is_not_missed(environment):
     executor, execution_id, runner = start(environment, 'dispatcher:\n  run_codex: false\n')
     executor.execute(execution_id)
     api.prs[600] = dict(id=600, number=600, state='closed', merged_at='2026-11-07T10:00:00+00:00',
-                       head={'ref': 'manual/task-1', 'repo': {'full_name': 'owner/new'}}, base={'ref': 'main'})
+                       head={'ref': 'manual/task-0001', 'repo': {'full_name': 'owner/new'}}, base={'ref': 'main'})
     poll.poll_project(config.projects[0])
     assert store.issue(1)['state'] == 'done'
     assert runner.calls == 0
@@ -547,15 +547,40 @@ def test_terminal_cleanup_preserves_new_remote_user_commits(environment):
     checkout = config.projects[0].checkout
     # User commits after the last confirmed PR observation are unknown results.
     gitcmd(checkout, 'fetch', 'origin')
-    gitcmd(checkout, 'checkout', '-b', 'user-follow-up', 'origin/codex/task-1')
+    gitcmd(checkout, 'checkout', '-b', 'user-follow-up', 'origin/codex/task-0001')
     (checkout / 'new-user-result.txt').write_text('new result')
     gitcmd(checkout, 'add', '.')
     gitcmd(checkout, 'commit', '-m', 'user follow-up')
-    gitcmd(checkout, 'push', 'origin', 'HEAD:refs/heads/codex/task-1')
+    gitcmd(checkout, 'push', 'origin', 'HEAD:refs/heads/codex/task-0001')
     pr = next(iter(api.prs.values()))
     pr['state'] = 'closed'
     poll.poll_project(config.projects[0])
     state.transition(1, State.REJECTED, State.CANCELLED, 'cancel')
     Cleanup(config, store, git).known()
-    assert gitcmd(checkout, 'ls-remote', '--heads', 'origin', 'codex/task-1')
+    assert gitcmd(checkout, 'ls-remote', '--heads', 'origin', 'codex/task-0001')
     assert store.rows("SELECT * FROM error_log WHERE error_code='branch_cleanup_failed'")
+
+
+@pytest.mark.parametrize('run_codex,prefix', [(True, 'codex'), (False, 'manual')])
+def test_auto_branch_collision_preserves_remote(environment, run_codex, prefix):
+    config, store, api, gh, git, groups, state, pub, poll = environment
+    api.issues[10] = api.issues.pop(1)
+    api.issues[10]['number'] = 10
+    branch = f'{prefix}/task-0010'
+    checkout = config.projects[0].checkout
+    gitcmd(checkout, 'push', 'origin', f'main:refs/heads/{branch}')
+    before = gitcmd(checkout, 'ls-remote', '--heads', 'origin', branch)
+    approve(api, 10, f'dispatcher:\n  run_codex: {str(run_codex).lower()}\n')
+    poll.poll_project(config.projects[0])
+    execution_id = Scheduler(store, groups, state).reserve(1).execution_id
+    runner = FakeRunner(store)
+    executor = Executor(config, store, git, state, pub, runner)
+    assert store.group_branches(1) == ('main', branch)
+    executor.execute(execution_id)
+    assert store.issue(1)['state'] == 'error'
+    assert runner.calls == 0
+    assert not store.execution(execution_id)['push_completed']
+    assert not api.prs
+    state.transition(1, State.ERROR, State.CANCELLED, 'cancel')
+    Cleanup(config, store, git).known()
+    assert gitcmd(checkout, 'ls-remote', '--heads', 'origin', branch) == before
