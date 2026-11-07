@@ -8,6 +8,7 @@ import sys
 import threading
 from .input import ERROR_MARKER, OUTPUT_MARKER, parse_input
 from .github import GitHubError
+from .output import confirmed_sha, public_result
 from .models import Execution, ExecutionStatus, ExecutionResult, PublishResult, State, utc_now
 
 
@@ -108,10 +109,14 @@ class Publisher:
             prs = self.storage.rows('SELECT * FROM pull_requests WHERE issue_id=? ORDER BY pr_id DESC', (issue_id,))
             if prs:
                 pr = prs[0]
-                parts.append(f"PR #{pr['pr_number']} ({pr['status']}) → `{pr['base_branch']}`.")
+                parts.append(f"PR [#{pr['pr_number']}](https://github.com/{issue['repository']}/pull/{pr['pr_number']}) "
+                             f"({pr['status']}) → `{pr['base_branch']}`.")
             executions = self.storage.rows('SELECT * FROM executions WHERE issue_id=?', (issue_id,))
             if executions:
                 execution = executions[0]
+                sha = confirmed_sha(execution)
+                if sha:
+                    parts.append(f"Result commit: [{sha}](https://github.com/{issue['repository']}/commit/{sha}).")
                 parts.append(f"Started: {execution['started_at']}. Finished: {execution['finished_at']}.")
                 if execution['codex_started_at'] and execution['codex_finished_at']:
                     duration = (datetime.fromisoformat(execution['codex_finished_at']) -
@@ -120,7 +125,9 @@ class Publisher:
                 parts.append(f"Push confirmed: {bool(execution['push_completed'])}.")
                 result_file = self.config.workspace / 'results' / f"{execution['execution_id']}.txt"
                 if result_file.is_file():
-                    parts.append(result_file.read_text()[:20000])
+                    parts.append(public_result(result_file.read_text(), execution, issue['repository'],
+                        lambda sha, relative: self.git.committed_file(self.project(issue),
+                            execution['worktree_path'], sha, relative))[:20000])
             confirmed = self.output(issue_id, '\n\n'.join(parts))
             if executions:
                 self.storage.update_execution(executions[0]['execution_id'], comment_published=int(confirmed))

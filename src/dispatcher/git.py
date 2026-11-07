@@ -81,6 +81,25 @@ class Git:
         self.run(path, 'push', 'origin', f'HEAD:refs/heads/{branch_name(work)}')
         return commit
 
+    def committed_file(self, project, worktree, sha, relative):
+        """Check a literal tree entry locally, even after worktree cleanup."""
+        from .output import SHA
+        if not SHA.fullmatch(sha):
+            return False
+        try:
+            path = Path(worktree) if worktree and Path(worktree).is_dir() else self.checkout(project, create=False)
+            result = self.run(path, 'ls-tree', '-z', sha, '--', ':(literal)' + relative, check=False)
+            if result.returncode:
+                return False
+            for entry in result.stdout.split('\0'):
+                metadata, sep, name = entry.partition('\t')
+                if sep and name == relative and metadata.split()[:2] in (
+                        ['100644', 'blob'], ['100755', 'blob']):
+                    return True
+        except (GitError, OSError, subprocess.SubprocessError):
+            pass
+        return False
+
     def has_diff(self, project, path, base):
         self.fetch(project)
         return self.run(path, 'diff', '--quiet', f'origin/{branch_name(base)}...HEAD', check=False).returncode == 1

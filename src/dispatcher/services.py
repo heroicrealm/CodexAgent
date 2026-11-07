@@ -193,7 +193,7 @@ class StateService:
                        'merged_at=excluded.merged_at,updated_at=excluded.updated_at',
                 (pr.pr_id, pr.issue_id, pr.repository, pr.pr_number, pr.head_branch, pr.base_branch, pr.status, pr.merged_at, utc_now()))
             if pr.head_commit:
-                db.execute('UPDATE executions SET result_commit=? WHERE issue_id=?', (pr.head_commit, pr.issue_id))
+                db.execute('UPDATE executions SET result_commit=? WHERE issue_id=? AND push_completed=0', (pr.head_commit, pr.issue_id))
             current = State(issue['state'])
             if (current in (State.MANUAL_RUNNING, State.RUNNING) or
                     (recover and current in (State.PREPARING, State.ERROR))):
