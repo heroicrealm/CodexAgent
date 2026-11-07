@@ -233,7 +233,7 @@ class PollService:
                 try:
                     comment = self.github.input_comment(project, issue.issue_number, poll_id)
                 except ValueError as exc:
-                    batch.approval_errors[issue.issue_id] = str(exc)
+                    batch.approval_errors[issue.issue_id] = exc
                     continue
                 batch.approvals[issue.issue_id] = (fresh, comment)
                 try:
@@ -247,7 +247,7 @@ class PollService:
                         if exc.status != 404:
                             raise
                     except ValueError as exc:
-                        batch.approval_errors[issue.issue_id] = str(exc)
+                        batch.approval_errors[issue.issue_id] = exc
         prs = []
         for row in self.storage.rows("SELECT p.* FROM pull_requests p JOIN issues i ON i.issue_id=p.issue_id "
                                      "WHERE i.project_id=? AND p.status='open'", (project.id,)):
@@ -293,7 +293,7 @@ class PollService:
             try:
                 if 'approve' in commands:
                     if observation.issue_id in batch.approval_errors:
-                        raise ValueError(batch.approval_errors[observation.issue_id])
+                        raise batch.approval_errors[observation.issue_id]
                     if observation.issue_id in batch.approvals:
                         fresh, comment = batch.approvals[observation.issue_id]
                         self.state.approve(project, fresh, comment, batch.corrections.get(observation.issue_id))
@@ -302,8 +302,8 @@ class PollService:
                     command = next(iter(commands))
                     self.state.transition(row['issue_id'], State(row['state']), State(command), 'user-command')
             except ValueError as exc:
-                # Validation errors contain only controlled summaries, not raw INPUT.
-                self.publisher.approval_error(project, row, str(exc))
+                # Keep the original exception private; publish a controlled summary.
+                self.publisher.approval_error(project, row, exc)
                 if 'approve' in commands:
                     self.github.remove_label(project, row['issue_number'], labels['approve'], batch.poll_id)
             current = self.storage.issue(row['issue_id'])

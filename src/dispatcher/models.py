@@ -146,4 +146,4 @@ class ObservationBatch:
     approvals: dict[int, tuple[IssueObservation, InputComment | None]] = field(default_factory=dict)
     corrections: dict[int, IssueObservation] = field(default_factory=dict)
     prs: tuple[PRObservation, ...] = ()
-    approval_errors: dict[int, str] = field(default_factory=dict)
+    approval_errors: dict[int, ValueError] = field(default_factory=dict)

@@ -3,11 +3,12 @@ from pathlib import Path
 import re
 import subprocess
 from uuid import uuid4
+from .error_diagnostics import OperationError
 from .input import branch_name
 from .config import is_v1_path
 
 
-class GitError(RuntimeError):
+class GitError(OperationError):
     pass
 
 
@@ -15,11 +16,20 @@ class Git:
     def __init__(self, config):
         self.config = config
 
+    def command(self, args, operation):
+        try:
+            return subprocess.run(args, capture_output=True, text=True, timeout=120)
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise GitError('Git command could not complete', code=f'git_{operation}_failed',
+                operation='git.' + operation, stdout=getattr(exc, 'stdout', None),
+                stderr=getattr(exc, 'stderr', None)) from exc
+
     def run(self, directory, *args, check=True):
-        result = subprocess.run(['git', '-C', str(directory), *args], capture_output=True, text=True, timeout=120)
+        result = self.command(['git', '-C', str(directory), *args], args[0])
         if check and result.returncode:
             # Never expose raw stderr (may contain credentials or task data).
-            raise GitError(f'Git {args[0]} failed')
+            raise GitError(f'Git {args[0]} failed', code=f'git_{args[0]}_failed',
+                           operation=f'git.{args[0]}', stdout=result.stdout, stderr=result.stderr, returncode=result.returncode)
         return result.stdout.strip() if check else result
 
     def checkout(self, project, *, create=True):
@@ -30,10 +40,10 @@ class Git:
             if not create:
                 raise GitError("V2 checkout is missing")
             path.parent.mkdir(parents=True, exist_ok=True)
-            result = subprocess.run(['git', 'clone', f'git@github.com:{project.repository}.git', str(path)],
-                                    capture_output=True, text=True, timeout=120)
+            result = self.command(['git', 'clone', f'git@github.com:{project.repository}.git', str(path)], 'clone')
             if result.returncode:
-                raise GitError('Git clone failed')
+                raise GitError('Git clone failed', code='git_clone_failed', operation='git.clone',
+                               stdout=result.stdout, stderr=result.stderr, returncode=result.returncode)
         self.run(path, 'rev-parse', '--git-dir')
         return path
 
@@ -58,7 +68,7 @@ class Git:
         checkout = self.fetch(project)
         start = self.remote_ref(checkout, work) or self.remote_ref(checkout, base)
         if not start:
-            raise GitError('Base branch not found')
+            raise GitError('Base branch not found', code='base_branch_not_found', operation='git.prepare')
         suffix = f'{execution_id}-{uuid4().hex}'
         path = self.area(project) / ('e-' + suffix)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -69,7 +79,7 @@ class Git:
         checkout = self.fetch(project)
         ref = self.remote_ref(checkout, work) or self.remote_ref(checkout, base)
         if not ref:
-            raise GitError('Base branch not found')
+            raise GitError('Base branch not found', code='base_branch_not_found', operation='git.prepare')
         self.run(checkout, 'push', 'origin', f'{ref}:refs/heads/{branch_name(work)}')
         return self.run(checkout, 'rev-parse', ref)
 

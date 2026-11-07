@@ -42,7 +42,7 @@ def main():
                 'ON c.issue_id=r.child_issue_id WHERE r.parent_issue_id=?', (row['issue_id'],))]
             value['prs'] = [dict(r) for r in runtime.storage.rows(
                 'SELECT pr_number,status,base_branch FROM pull_requests WHERE issue_id=?', (row['issue_id'],))]
-            errors = runtime.storage.rows('SELECT error_code,error_stage,error_message FROM error_log '
+            errors = runtime.storage.rows('SELECT error_code,error_stage FROM error_log '
                                           'WHERE issue_id=? ORDER BY id DESC LIMIT 1', (row['issue_id'],))
             value['last_error'] = dict(errors[0]) if errors else None
             print(json.dumps(value, ensure_ascii=False))

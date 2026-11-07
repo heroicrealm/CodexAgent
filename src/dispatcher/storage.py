@@ -3,6 +3,9 @@ from contextlib import contextmanager
 from importlib.resources import files
 from pathlib import Path
 import sqlite3
+import os
+import warnings
+from .error_diagnostics import private_directory, private_file
 import yaml
 from collections.abc import Callable, Iterator
 from .models import (ACTIVE, State, Execution, ExecutionStatus, IssueObservation,
@@ -50,7 +53,12 @@ class Storage:
                     _validate(db)
             except sqlite3.DatabaseError as exc:
                 raise SchemaError("Cannot open V2 database") from exc
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        private_directory(self.path.parent)
+        private_file(self.path)
+        if self.path.parent.stat().st_mode & 0o077:
+            warnings.warn('SQLite parent directory permits other users; restrict access to local diagnostics',
+                          RuntimeWarning, stacklevel=2)
+        self._secure_sidecars()
         db = sqlite3.connect(self.path, isolation_level=None)
         try:
             db.execute("PRAGMA busy_timeout=5000")
@@ -70,6 +78,12 @@ class Storage:
         finally:
             db.close()
 
+    def _secure_sidecars(self):
+        for suffix in ('-wal', '-shm'):
+            sidecar = Path(str(self.path) + suffix)
+            if sidecar.exists():
+                os.chmod(sidecar, 0o600)
+
     @contextmanager
     def _readonly(self) -> Iterator[sqlite3.Connection]:
         db = sqlite3.connect(self.path.as_uri() + "?mode=ro", uri=True)
@@ -86,6 +100,7 @@ class Storage:
             db.execute("PRAGMA foreign_keys=ON")
             db.execute("PRAGMA busy_timeout=5000")
             db.execute("PRAGMA journal_mode=WAL")
+            self._secure_sidecars()
             yield db
         finally:
             db.close()
@@ -324,7 +339,7 @@ class Storage:
 
     def record_error(self, issue_id: int, code: str, stage: str, safe_message: str,
                      execution_id: int | None = None) -> None:
-        """Message must already be a safe application summary, never raw command output."""
+        """Private local diagnostics; never publish error_message directly."""
         with self.transaction() as db:
             if execution_id is not None and not db.execute("SELECT 1 FROM executions WHERE execution_id=? AND issue_id=?",
                                                          (execution_id, issue_id)).fetchone():

@@ -6,6 +6,7 @@ import re
 import subprocess
 import time
 from urllib.parse import urlencode, quote
+from .error_diagnostics import OperationError
 from .config import Config, Project
 from .input import INPUT_MARKER, OUTPUT_MARKER
 from .models import InputComment, IssueObservation, GitHubState, PRObservation, PRStatus
@@ -14,10 +15,11 @@ from .models import InputComment, IssueObservation, GitHubState, PRObservation, 
 POLL_ID = ContextVar('github_poll_id', default=None)
 
 
-class GitHubError(RuntimeError):
-    def __init__(self, status: int | None = None):
+class GitHubError(OperationError):
+    def __init__(self, status: int | None = None, **diagnostics):
         self.status = status
-        super().__init__(f'GitHub request failed (status={status})')
+        super().__init__(f'GitHub request failed (status={status})', code='github_http_error',
+                         operation='github.request', **diagnostics)
 
 
 class GhTransport:
@@ -25,12 +27,19 @@ class GhTransport:
         args = ['gh', 'api', '--method', method, endpoint]
         if payload is not None:
             args += ['--input', '-']
-        result = subprocess.run(args, input=json.dumps(payload) if payload is not None else None,
-                                capture_output=True, text=True, timeout=60)
+        try:
+            result = subprocess.run(args, input=json.dumps(payload) if payload is not None else None,
+                                    capture_output=True, text=True, timeout=60)
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise GitHubError(stdout=getattr(exc, 'stdout', None), stderr=getattr(exc, 'stderr', None)) from exc
         if result.returncode:
             status = re.search(r'HTTP (\d{3})', result.stderr)
-            raise GitHubError(int(status[1]) if status else None)
-        return json.loads(result.stdout) if result.stdout.strip() else None
+            raise GitHubError(int(status[1]) if status else None, stdout=result.stdout,
+                              stderr=result.stderr, returncode=result.returncode)
+        try:
+            return json.loads(result.stdout) if result.stdout.strip() else None
+        except ValueError as exc:
+            raise GitHubError(stdout=result.stdout, stderr=result.stderr, returncode=result.returncode) from exc
 
 
 class GitHubAdapter:

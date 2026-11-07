@@ -6,6 +6,7 @@ import time
 import sys
 import threading
 from pathlib import Path
+from .error_diagnostics import original, private_directory, private_file
 from .cleanup import Cleanup
 from .diagnostics import DiagnosticLogger
 from .execution import Executor, ProcessRunner, Publisher
@@ -91,7 +92,15 @@ class Runtime:
                                     break
                                 try:
                                     self.poll.poll_project(project)
-                                except Exception:
+                                except Exception as exc:
+                                    # Schema v1 requires an Issue FK. Unbound poll failures
+                                    # stay local without inventing a registered Issue.
+                                    area = private_directory(self.config.workspace / 'diagnostics')
+                                    diagnostic = area / 'poll-errors.jsonl'
+                                    private_file(diagnostic)
+                                    with diagnostic.open('a') as stream:
+                                        stream.write(original(exc, 'runtime.poll', {
+                                            'project_id': project.id, 'repository': project.repository}) + '\n')
                                     poll_ok = False
                                     print(f'Project {project.id}: poll failed; no new execution scheduled', file=sys.stderr)
                                     self.logger.record('verbose', 'Runtime', 'poll', {'repository': project.repository}, 'failed')

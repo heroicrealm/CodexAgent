@@ -6,6 +6,8 @@ import signal
 import subprocess
 import sys
 import threading
+import tempfile
+from .error_diagnostics import OperationError, original, public_error, public_field, private_directory, private_file
 from .input import ERROR_MARKER, OUTPUT_MARKER, parse_input
 from .github import GitHubError
 from .output import confirmed_sha, public_result
@@ -29,10 +31,30 @@ class ProcessRunner:
                     pass
 
     def run(self, path, prompt):
+        self.stderr = None
+        # TemporaryFile is unlinked, mode 0600, and cannot fill a pipe buffer.
+        with tempfile.TemporaryFile(mode='w+b') as stderr_file, tempfile.TemporaryFile(mode='w+b') as startup:
+            os.fchmod(stderr_file.fileno(), 0o600)
+            try:
+                result = self._run(path, prompt, stderr_file, startup)
+                if result[0] or self.cancelled.is_set():
+                    stderr_file.seek(0)
+                    self.stderr = stderr_file.read().decode('utf-8', errors='replace')
+                startup.seek(0)
+                if startup.read() == b'failed':
+                    raise OperationError('Codex could not be started', code='codex_start_failed',
+                        operation='codex.start', returncode=result[0], stdout=result[1], stderr=self.stderr)
+                return result
+            except OperationError:
+                raise
+            except Exception as exc:
+                stderr_file.seek(0)
+                raise OperationError('Codex process failed', code='codex_start_failed',
+                    operation='codex.start', stderr=stderr_file.read().decode('utf-8', errors='replace')) from exc
+
+    def _run(self, path, prompt, stderr_file, startup):
         if self.cancelled.is_set():
             raise RuntimeError('Execution interrupted')
-        # Codex stdout/stderr are not diagnostic logs. Only final stdout is kept
-        # as the task result; stderr is discarded to avoid raw secret-bearing logs.
         with self._lock:
             if self.cancelled.is_set():
                 raise RuntimeError('Execution interrupted')
@@ -40,24 +62,27 @@ class ProcessRunner:
             # descriptors. If the coordinator crashes, a new runtime cannot recover
             # while this process (and therefore the old Codex) is still alive.
             supervisor = (
-                "import signal,subprocess,sys; "
-                "signal.signal(signal.SIGTERM, lambda *_: None); "
-                "child=subprocess.Popen(sys.argv[1:]); "
-                "sys.exit(child.wait())"
+                "import os,signal,subprocess,sys\n"
+                "signal.signal(signal.SIGTERM, lambda *_: None)\n"
+                "try:\n"
+                " child=subprocess.Popen(sys.argv[2:])\n"
+                "except Exception:\n"
+                " os.write(int(sys.argv[1]), b'failed')\n"
+                " raise\n"
+                "sys.exit(child.wait())\n"
             )
-            process = subprocess.Popen((sys.executable, '-c', supervisor, *self.command), cwd=path, stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
-                start_new_session=True, pass_fds=self.pass_fds)
+            process = subprocess.Popen((sys.executable, '-c', supervisor, str(startup.fileno()), *self.command),
+                cwd=path, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=stderr_file, text=True,
+                start_new_session=True, pass_fds=(*self.pass_fds, startup.fileno()))
             self._process = process
         try:
-            process.stdin.write(prompt)
-            process.stdin.close()
-            process.stdin = None
+            pending_input = prompt
             while True:
                 try:
-                    output, _ = process.communicate(timeout=0.2)
+                    output, _ = process.communicate(input=pending_input, timeout=0.2)
                     return process.returncode, output
                 except subprocess.TimeoutExpired:
+                    pending_input = None
                     if self.cancelled.is_set():
                         try:
                             os.killpg(process.pid, signal.SIGTERM)
@@ -105,7 +130,7 @@ class Publisher:
         with self._output_lock:
             issue = self.storage.issue(issue_id)
             _, branch = self.storage.group_branches(issue_id)
-            parts = [f"State: `{issue['state']}`. Group branch: `{branch}`."]
+            parts = [f"State: `{issue['state']}`. Group branch: `{public_field(branch)}`."]
             prs = self.storage.rows('SELECT * FROM pull_requests WHERE issue_id=? ORDER BY pr_id DESC', (issue_id,))
             if prs:
                 pr = prs[0]
@@ -124,7 +149,7 @@ class Publisher:
                     parts.append(f"Codex duration: {duration:.1f}s; exit code: {execution['exit_code']}.")
                 parts.append(f"Push confirmed: {bool(execution['push_completed'])}.")
                 result_file = self.config.workspace / 'results' / f"{execution['execution_id']}.txt"
-                if result_file.is_file():
+                if result_file.is_file() and execution['status'] != 'failed':
                     parts.append(public_result(result_file.read_text(), execution, issue['repository'],
                         lambda sha, relative: self.git.committed_file(self.project(issue),
                             execution['worktree_path'], sha, relative))[:20000])
@@ -134,8 +159,9 @@ class Publisher:
 
     def approval_error(self, project, issue, message):
         # Not an execution failure: discovered remains discovered for another approve.
-        self.storage.record_error(issue['issue_id'], 'approval_rejected', 'approval', message)
-        self.output(issue['issue_id'], 'Approval rejected: ' + message)
+        exc = message if isinstance(message, Exception) else ValueError(message)
+        self.storage.record_error(issue['issue_id'], 'approval_rejected', 'approval', original(exc, 'approval.validate'))
+        self.output(issue['issue_id'], 'Approval rejected; inspect local SQLite error_log for details.')
 
     def find_pr(self, issue, poll_id=None):
         project = self.project(issue)
@@ -178,29 +204,61 @@ class Publisher:
         return PublishResult(True, pr.pr_id)
 
     def send_final_error_report(self, issue_id):
+        with self._output_lock:
+            return self._send_final_error_report(issue_id)
+
+    def _send_final_error_report(self, issue_id):
         issue = self.storage.issue(issue_id)
         if issue['error_report_sent']:
             return False
-        errors = self.storage.rows('SELECT error_stage,error_code,error_message FROM error_log WHERE issue_id=? ORDER BY id', (issue_id,))
-        text = ERROR_MARKER + '\n' + '\n'.join(f"{r['error_stage']}: {r['error_code']} — {r['error_message']}" for r in errors)
-        self.github.comment(self.project(issue), issue['issue_number'], text)
+        errors = self.storage.rows('SELECT id,execution_id,error_stage,error_code FROM error_log '
+                                   'WHERE issue_id=? ORDER BY id', (issue_id,))
+        attempts = [r for r in errors if r['error_code'] in
+                    ('error_report_attempt', 'error_report_rejected', 'error_report_uncertain')]
+        if attempts and attempts[-1]['error_code'] != 'error_report_rejected':
+            return False  # ambiguous POST/crash: never risk an automatic duplicate
+        executions = self.storage.rows('SELECT * FROM executions WHERE issue_id=?', (issue_id,))
+        execution_id = executions[0]['execution_id'] if executions else None
+        primary = next((r for r in errors if r['execution_id'] == execution_id
+                        and r['error_stage'] not in ('salvage', 'error_report', 'output', 'recovery_sync')), errors[0] if errors else None)
+        if primary is None:
+            return False
+        text = ERROR_MARKER + '\n' + public_error(primary, issue, self.storage.group_branches(issue_id)[0])
+        secondary = sum(r['error_stage'] in ('salvage', 'error_report')
+                        and r['error_code'] != 'error_report_attempt' for r in errors)
+        if secondary:
+            text += f'\nSecondary diagnostic records: {secondary} (local only).'
+        text = text[:4000]
+        self.storage.record_error(issue_id, 'error_report_attempt', 'error_report',
+                                  'ERROR POST pending confirmation', execution_id)
+        try:
+            self.github.comment(self.project(issue), issue['issue_number'], text)
+        except Exception as exc:
+            rejected = isinstance(exc, GitHubError) and exc.status is not None
+            self.storage.record_error(issue_id, 'error_report_rejected' if rejected else 'error_report_uncertain',
+                                      'error_report', original(exc, 'publisher.error_report'), execution_id)
+            raise
         with self.storage.transaction() as db:
             db.execute('UPDATE issues SET error_report_sent=1 WHERE issue_id=?', (issue_id,))
         return True
 
-    def fail(self, execution_id, code='execution_failed'):
+    def fail(self, execution_id, code='execution_failed', exc=None, stage=None):
         execution = self.storage.execution(execution_id)
         issue = self.storage.issue(execution['issue_id'])
+        stage = stage or code.split('_')[0]
+        exc = exc or OperationError('Execution interrupted; original exception unavailable')
+        diagnostic_code = getattr(exc, 'code', None) or code
+        self.storage.record_error(issue['issue_id'], diagnostic_code, stage,
+            original(exc, getattr(exc, 'operation', None) or 'executor.' + stage), execution_id)
         # Best effort to save dirty work, even when the main pipeline failed.
         if execution['worktree_path'] and Path(execution['worktree_path']).exists():
             try:
                 commit = self.git.commit_push(self.project(issue), Path(execution['worktree_path']),
                                               self.storage.group_branches(issue['issue_id'])[1])
                 self.storage.update_execution(execution_id, result_commit=commit, push_completed=1)
-            except Exception:
-                pass  # retain the only local copy
-        self.storage.record_error(issue['issue_id'], code, code.split('_')[0],
-                                  'Task failed; surviving local results are retained', execution_id)
+            except Exception as secondary:
+                self.storage.record_error(issue['issue_id'], 'salvage_failed', 'salvage',
+                    original(secondary, 'publisher.salvage'), execution_id)
         self.storage.update_execution(execution_id, status='failed', error_code=code, finished_at=utc_now())
         if issue['state'] in (State.PREPARING, State.RUNNING):
             self.state.transition(issue['issue_id'], State(issue['state']), State.ERROR, code)
@@ -208,17 +266,18 @@ class Publisher:
             self.phase_output(issue['issue_id'])
             self.send_final_error_report(issue['issue_id'])
             self.github.sync_labels(self.project(issue), issue['issue_number'], self.storage.issue(issue['issue_id'])['state'])
-        except Exception:
-            pass  # reconciliation retries effects without rerunning Codex
+        except Exception as secondary:
+            self.storage.record_error(issue['issue_id'], 'error_report_failed', 'error_report',
+                original(secondary, 'publisher.error_report'), execution_id)
 
     def reconcile(self, project):
         for issue in self.storage.rows('SELECT * FROM issues WHERE project_id=? AND is_virtual=0', (project.id,)):
             if issue['approved_at']:
                 try:
                     self.phase_output(issue['issue_id'])
-                except Exception:
+                except Exception as exc:
                     self.storage.record_error(issue['issue_id'], 'output_sync_failed', 'output',
-                                              'OUTPUT update was not confirmed; local state retained')
+                                              original(exc, 'publisher.output'))
             if issue['state'] in (State.DONE, State.CANCELLED) and issue['issue_id'] not in self._closed:
                 self.github.sync_labels(project, issue['issue_number'], issue['state'])
                 self.github.close_issue(project, issue['issue_number'], issue['state'])
@@ -244,7 +303,8 @@ class Executor:
         params, _ = parse_input(issue['approved_input'])
         checkout = self.git.fetch(project)
         if not issue['correction_of_issue_id'] and not execution['push_completed'] and self.git.remote_ref(checkout, branch):
-            raise ValueError('New group branch already exists; choose another branch')
+            raise OperationError('New group branch already exists; choose another branch',
+                                 code='work_branch_exists', operation='git.prepare')
         self.storage.update_execution(execution_id, status='preparing', branch_name=branch)
         if not params.run_codex:
             commit = self.git.publish_manual(project, base, branch)
@@ -278,10 +338,16 @@ class Executor:
             issue['approved_title'] + '\n\n' + issue['approved_body'] + '\n\n' + (issue['approved_input'] or ''))
         self.storage.update_execution(execution_id, codex_finished_at=utc_now(), exit_code=code)
         result_dir = self.config.workspace / 'results'
-        result_dir.mkdir(parents=True, exist_ok=True)
-        (result_dir / f'{execution_id}.txt').write_text(result)
+        private_directory(result_dir)
+        result_path = result_dir / f'{execution_id}.txt'
+        private_file(result_path)
+        result_path.write_text(result)
+        if self.runner.cancelled.is_set() and not code:
+            raise OperationError('Codex execution interrupted', code='codex_interrupted', operation='codex.run',
+                                 returncode=code, stdout=result, stderr=getattr(self.runner, 'stderr', None))
         if code:
-            raise RuntimeError('Codex process failed')
+            raise OperationError('Codex process failed', code='codex_exit_nonzero', operation='codex.run',
+                                 returncode=code, stdout=result, stderr=getattr(self.runner, 'stderr', None))
         self.state.diagnose('Executor', 'run_once', {'issue_id': issue['issue_id']})
         return ExecutionResult(execution_id, code)
 
@@ -298,8 +364,8 @@ class Executor:
             if self.runner.cancelled.is_set():
                 raise RuntimeError("Execution interrupted before publication")
             self.publisher.publish(execution_id)
-        except Exception:
-            self.publisher.fail(execution_id, stage + "_failed")
+        except Exception as exc:
+            self.publisher.fail(execution_id, stage + "_failed", exc, stage)
 
     def recover(self):
         # Runtime lock must be held: no old Codex process may remain alive.
@@ -316,7 +382,8 @@ class Executor:
                                                   status='completed', finished_at=utc_now())
                     self.publisher.phase_output(issue['issue_id'])
                     continue
-            except Exception:
+            except Exception as exc:
                 # A failed reconciliation is not proof of absence, but Codex is never retried.
-                pass
+                self.storage.record_error(issue['issue_id'], 'recovery_sync_failed', 'recovery_sync',
+                    original(exc, 'publisher.recover'), execution['execution_id'])
             self.publisher.fail(execution['execution_id'], 'interrupted_execution')
