@@ -1,0 +1,9 @@
+# Paths are relative to this file. Set a NEW V2 test repository before stage B.
+dispatcher:
+  workspace: ../workspace-v2
+  database: ../runtime-v2/dispatcher.sqlite3
+  debug:
+    mode: 'off'
+    retention_days: 7
+  labels: {}
+projects: []
