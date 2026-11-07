@@ -36,14 +36,16 @@ class GroupService:
         base = base_branch or root['base_branch']
         reasons = []
         children = db.execute('SELECT i.* FROM issue_relations r JOIN issues i ON i.issue_id=r.child_issue_id '
-                              'WHERE r.parent_issue_id=?', (issue_id,)).fetchall()
+                              'WHERE r.parent_issue_id=? AND i.is_virtual=0', (issue_id,)).fetchall()
         for child in children:
             prs = db.execute('SELECT * FROM pull_requests WHERE issue_id=?', (child['issue_id'],)).fetchall()
             if not child['is_ready'] and any(pr['status'] == 'open' for pr in prs):
                 reasons.append('child-ready-removed-with-open-pr')
             if any(pr['status'] == 'merged' and base and pr['base_branch'] != base for pr in prs):
                 reasons.append('child-merge-target-conflict')
-            if child['is_ready'] and child['state'] not in TERMINAL:
+            # Registration and the tracked relation define the dependency;
+            # is_ready only records the currently observed GitHub label.
+            if child['state'] not in TERMINAL:
                 reasons.append('unfinished-child')
         return Eligibility(not reasons, tuple(sorted(set(reasons))))
 

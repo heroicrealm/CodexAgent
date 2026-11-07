@@ -202,6 +202,11 @@ def test_virtual_children_late_links_and_readiness(app):
     poll.poll_project(config.projects[0])
     assert not store.rows('SELECT * FROM issue_relations WHERE child_issue_id=3')
     assert store.issue(1)['state'] == 'preparing'
+    api.issues[3]['labels'] = [{'name': 'dispatcher:discovered'}]
+    poll.poll_project(config.projects[0])
+    assert store.issue(3)['is_ready'] == 0
+    assert not store.rows('SELECT * FROM issue_relations WHERE child_issue_id=3')
+    assert store.issue(1)['state'] == 'preparing'
 
 
 def test_partial_reads_preserve_whole_project(app):
@@ -308,8 +313,13 @@ def test_merge_conflict_and_ready_removed_with_pr_block_parent(app):
     state.transition(2, State.PREPARING, State.RUNNING, 'test')
     pr = PRObservation(700, 2, 'owner/new', 700, 'codex/task-2', 'main', PRStatus.OPEN)
     state.apply_pr(pr)
-    with store.transaction() as db:
-        db.execute('UPDATE issues SET is_ready=0 WHERE issue_id=2')
+    api.prs[700] = dict(id=700, number=700, state='open', merged_at=None,
+                       head={'ref': 'codex/task-2'}, base={'ref': 'main'})
+    api.issues[2]['labels'] = [{'name': 'dispatcher:review'}]
+    poll.poll_project(config.projects[0])
+    assert store.issue(2)['is_ready'] == 0
+    assert store.issue(1)['state'] == 'awaiting-children'
+    assert {v['name'] for v in api.issues[2]['labels']} == {'dispatcher:review'}
     assert 'child-ready-removed-with-open-pr' in groups.evaluate(1).reasons
     state.apply_pr(replace(pr, status=PRStatus.MERGED, base_branch='different'))
     assert store.issue(2)['state'] == 'done'
@@ -448,3 +458,135 @@ def test_v1_path_guard_does_not_depend_on_package_location(tmp_path, monkeypatch
     with pytest.raises(ValueError, match='V1'):
         Config(tmp_path / 'work', tmp_path / 'db',
                (Project('p', 'owner/new', checkout=tmp_path / 'elsewhere/v1/checkout'),))
+
+
+@pytest.mark.parametrize('custom_labels', [False, True])
+def test_registered_child_without_ready_still_blocks_and_keeps_status(app, custom_labels):
+    config, store, api, gh, groups, state, pub, poll = app
+    if custom_labels:
+        project = replace(config.projects[0], labels={
+            'codex-ready': 'custom-ready', 'discovered': 'custom-discovered'})
+        config = replace(config, projects=(project,))
+        gh.config = state.config = poll.config = pub.config = config
+    project = config.projects[0]
+    labels = config.effective_labels(project)
+    api.issues[2] = issue(2, labels=(labels['codex-ready'], 'user-label'))
+    api.parents[2] = 1
+    api.children[1] = [2]
+    approve(api, 1)
+    if custom_labels:
+        api.issues[1]['labels'][0]['name'] = labels['codex-ready']
+    poll.poll_project(project)
+    assert store.issue(1)['state'] == 'awaiting-children'
+    api.issues[2]['labels'] = [v for v in api.issues[2]['labels'] if v['name'] != labels['codex-ready']]
+    history = [tuple(r) for r in store.rows('SELECT * FROM state_history ORDER BY id')]
+    api.calls.clear()
+    for _ in range(2):
+        poll.poll_project(project)
+        assert store.issue(1)['state'] == 'awaiting-children'
+        assert store.issue(2)['state'] == 'discovered'
+        assert store.issue(2)['is_virtual'] == 0 and store.issue(2)['is_ready'] == 0
+        assert groups.evaluate(1).reasons == ('unfinished-child',)
+        assert {v['name'] for v in api.issues[2]['labels']} == {labels['discovered'], 'user-label'}
+    assert [tuple(r) for r in store.rows('SELECT * FROM state_history ORDER BY id')] == history
+    assert store.rows('SELECT * FROM issue_relations WHERE parent_issue_id=1 AND child_issue_id=2')
+    assert not any('/labels' in endpoint for _, endpoint, _ in api.calls)
+    assert Scheduler(store, groups, state).reserve(1) is None
+
+
+def test_missing_status_is_restored_without_restoring_registration_label(app):
+    config, store, api, gh, groups, state, pub, poll = app
+    project = replace(config.projects[0], labels={'discovered': 'custom-discovered'})
+    config = replace(config, projects=(project,))
+    gh.config = state.config = poll.config = pub.config = config
+    poll.poll_project(project)
+    api.issues[1]['labels'] = [{'name': 'user-label'}]
+    api.calls.clear()
+    poll.poll_project(project)
+    assert store.issue(1)['state'] == 'discovered' and store.issue(1)['is_ready'] == 0
+    assert {v['name'] for v in api.issues[1]['labels']} == {'user-label', 'custom-discovered'}
+    writes = [call for call in api.calls if '/labels' in call[1]]
+    assert len(writes) == 1
+    assert writes[0] == ('POST', 'repos/owner/new/issues/1/labels', {'labels': ['custom-discovered']})
+    api.calls.clear()
+    poll.poll_project(project)
+    assert not any('/labels' in endpoint for _, endpoint, _ in api.calls)
+    assert len(store.rows('SELECT * FROM state_history')) == 1
+
+
+@pytest.mark.parametrize('terminal', [State.DONE, State.CANCELLED])
+def test_child_without_ready_can_approve_and_complete_dependency(app, terminal):
+    config, store, api, gh, groups, state, pub, poll = app
+    project = config.projects[0]
+    api.issues[2] = issue(2)
+    api.parents[2] = 1
+    api.children[1] = [2]
+    approve(api, 1)
+    poll.poll_project(project)
+    api.issues[2]['labels'] = [{'name': 'dispatcher:discovered'}]
+    poll.poll_project(project)
+    assert store.issue(1)['state'] == 'awaiting-children'
+    # Approve an already registered child without re-adding codex-ready.
+    api.issues[2]['labels'].append({'name': 'dispatcher:approve'})
+    poll.poll_project(project)
+    assert store.issue(2)['state'] == 'pending' and store.issue(2)['approved_at']
+    assert store.issue(2)['is_ready'] == 0
+    if terminal == State.CANCELLED:
+        assert state.transition(2, State.PENDING, State.CANCELLED, 'user-command')
+    else:
+        state.transition(2, State.PENDING, State.PREPARING, 'test')
+        state.transition(2, State.PREPARING, State.RUNNING, 'test')
+        pr = PRObservation(700, 2, 'owner/new', 700, 'codex/task-2', 'main', PRStatus.OPEN)
+        state.apply_pr(pr)
+        state.apply_pr(replace(pr, status=PRStatus.MERGED))
+    assert store.issue(2)['state'] == terminal and store.issue(2)['is_ready'] == 0
+    assert store.issue(1)['state'] == 'pending'
+    assert groups.evaluate(1).eligible
+    poll.poll_project(project)
+    assert 'dispatcher:codex-ready' not in {v['name'] for v in api.issues[2]['labels']}
+    assert store.issue(1)['state'] == 'pending'
+
+
+def test_removed_ready_child_relation_can_be_removed_before_preparing(app):
+    config, store, api, gh, groups, state, pub, poll = app
+    project = config.projects[0]
+    api.issues[2] = issue(2)
+    api.parents[2] = 1
+    api.children[1] = [2]
+    approve(api, 1)
+    poll.poll_project(project)
+    api.issues[2]['labels'] = [{'name': 'dispatcher:discovered'}]
+    poll.poll_project(project)
+    assert store.issue(1)['state'] == 'awaiting-children'
+    del api.parents[2]
+    api.children[1] = []
+    poll.poll_project(project)
+    assert store.issue(1)['state'] == 'pending'
+    assert not store.rows('SELECT * FROM issue_relations WHERE parent_issue_id=1')
+    assert store.issue(2)['state'] == 'discovered' and store.issue(2)['is_ready'] == 0
+    history = [tuple(r) for r in store.rows('SELECT * FROM state_history ORDER BY id')]
+    poll.poll_project(project)
+    assert [tuple(r) for r in store.rows('SELECT * FROM state_history ORDER BY id')] == history
+
+
+def test_virtual_child_relation_does_not_block_real_parent(app):
+    config, store, api, gh, groups, state, pub, poll = app
+    store.register_issue(IssueObservation(1, 'owner/new', 1, 'Real parent'), 'p')
+    store.register_child(IssueObservation(2, 'owner/new', 2, 'Real child'),
+                         IssueObservation(3, 'owner/new', 3, 'Virtual container'), 'p')
+    with store.transaction() as db:
+        db.execute('INSERT INTO issue_relations VALUES (1,3)')
+    assert groups.evaluate(1).eligible
+
+
+def test_null_child_state_is_not_terminal_even_without_ready(app):
+    config, store, api, gh, groups, state, pub, poll = app
+    store.register_child(IssueObservation(2, 'owner/new', 2, 'Child'),
+                         IssueObservation(1, 'owner/new', 1, 'Parent'), 'p')
+    store.register_issue(IssueObservation(1, 'owner/new', 1, 'Parent'), 'p')
+    # The normative CHECK disallows this for real Issues. Exercise the defensive
+    # readiness rule directly against an anomalous row without treating NULL as done.
+    with store.connection() as db:
+        db.execute('PRAGMA ignore_check_constraints=ON')
+        db.execute('UPDATE issues SET state=NULL,is_ready=0 WHERE issue_id=2')
+    assert groups.evaluate(1).reasons == ('unfinished-child',)
