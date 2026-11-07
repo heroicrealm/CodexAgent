@@ -1,9 +1,32 @@
-# Paths are relative to this file. Set a NEW V2 test repository before stage B.
+# V2 config example. Paths are relative to this file.
+# Configure a NEW V2 test repository before integration testing.
+# Projects inherit dispatcher.labels; individual labels may be overridden per project.
 dispatcher:
   workspace: ../workspace-v2
   database: ../runtime-v2/dispatcher.sqlite3
   debug:
     mode: 'off'
     retention_days: 7
-  labels: {}
+  labels:
+    codex-ready: "dispatcher:codex-ready"
+    discovered: "dispatcher:discovered"
+    approve: "dispatcher:approve"
+    awaiting-children: "dispatcher:awaiting-children"
+    pending: "dispatcher:pending"
+    running: "dispatcher:running"
+    manual-running: "dispatcher:manual-running"
+    review: "dispatcher:review"
+    rejected: "dispatcher:rejected"
+    done: "dispatcher:done"
+    cancelled: "dispatcher:cancelled"
+    error: "dispatcher:error"
+    need-fix: "dispatcher:need-fix"
+# preparing is an internal SQLite state and has no GitHub status label.
+# Example project overrides:
+# projects:
+#   - id: test-project
+#     repository: owner/new-v2-test
+#     labels:
+#       codex-ready: "custom-ready"
+#       review: "custom-review"
 projects: []
