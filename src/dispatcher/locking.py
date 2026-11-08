@@ -1,5 +1,6 @@
 """Process exclusion shared by runtime and maintenance; inherited by Codex."""
 import fcntl
+import os
 
 
 class AlreadyRunning(RuntimeError):
@@ -19,8 +20,10 @@ class InstanceLock:
     def __enter__(self):
         try:
             for path in self.paths:
+                if any(p.is_symlink() for p in (path, *path.parents)):
+                    raise AlreadyRunning('Symlink lock path forbidden')
                 path.parent.mkdir(parents=True, exist_ok=True)
-                handle = path.open('a+')
+                handle = os.fdopen(os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600), 'a+')
                 try:
                     fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 except BlockingIOError as exc:

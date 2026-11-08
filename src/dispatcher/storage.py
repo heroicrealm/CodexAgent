@@ -5,7 +5,7 @@ from pathlib import Path
 import sqlite3
 import os
 import warnings
-from .error_diagnostics import private_directory, private_file
+from .error_diagnostics import private_directory
 import yaml
 from collections.abc import Callable, Iterator
 from .models import (ACTIVE, State, Execution, ExecutionStatus, IssueObservation,
@@ -25,10 +25,13 @@ def _signature(db: sqlite3.Connection) -> list[tuple]:
                       "WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name").fetchall()
 
 
-def _validate(db: sqlite3.Connection) -> None:
+def _validate(db: sqlite3.Connection, *, metadata=False) -> None:
     reference = sqlite3.connect(":memory:")
     try:
         reference.executescript(_ddl())
+        if metadata:
+            from .db_guard import META
+            reference.execute(META)
         if _signature(db) != _signature(reference):
             raise SchemaError("Incompatible V2 structure; migration is not supported")
         if db.execute("SELECT version FROM schema_migrations").fetchall() != [(1,)]:
@@ -45,38 +48,29 @@ def _validate(db: sqlite3.Connection) -> None:
 
 class Storage:
     def __init__(self, path: Path):
-        self.path = Path(path).resolve()
-        if self.path.exists() and self.path.stat().st_size:
-            # Validate read-only BEFORE journal_mode or any other persistent change.
-            try:
-                with self._readonly() as db:
-                    _validate(db)
-            except sqlite3.DatabaseError as exc:
-                raise SchemaError("Cannot open V2 database") from exc
-        private_directory(self.path.parent)
-        private_file(self.path)
-        if self.path.parent.stat().st_mode & 0o077:
+        self.path = Path(path).absolute()
+        from .db_guard import safe_path, inspection
+        safe_path(self.path)
+        with inspection(self.path) as db:
+            registered = bool(db.execute("SELECT 1 FROM sqlite_master WHERE name='dispatcher_metadata'").fetchone())
+            _validate(db, metadata=registered)
+
+    @classmethod
+    def bootstrap(cls, path):
+        path = Path(path).absolute()
+        if any(p.is_symlink() for p in (path, *path.parents)):
+            raise SchemaError('Symlink path forbidden')
+        private_directory(path.parent)
+        if path.parent.stat().st_mode & 0o077:
             warnings.warn('SQLite parent directory permits other users; restrict access to local diagnostics',
                           RuntimeWarning, stacklevel=2)
-        self._secure_sidecars()
-        db = sqlite3.connect(self.path, isolation_level=None)
-        try:
-            db.execute("PRAGMA busy_timeout=5000")
-            db.execute("PRAGMA foreign_keys=ON")
-            db.execute("BEGIN IMMEDIATE")
-            if not db.execute("SELECT name FROM sqlite_master").fetchone():
-                for statement in _ddl().split(';'):
-                    if statement.strip():
-                        db.execute(statement)
-                db.execute("INSERT INTO schema_migrations VALUES (1,?)", (utc_now(),))
-            _validate(db)
-            db.commit()
-            db.execute("PRAGMA journal_mode=WAL")
-        except BaseException:
-            db.rollback()
-            raise
-        finally:
-            db.close()
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        os.close(fd)
+        from .db_guard import connection
+        with connection(path) as db:
+            db.executescript(_ddl())
+            db.execute('INSERT INTO schema_migrations VALUES (1,?)', (utc_now(),))
+        return cls(path)
 
     def _secure_sidecars(self):
         for suffix in ('-wal', '-shm'):
@@ -94,9 +88,13 @@ class Storage:
 
     @contextmanager
     def connection(self) -> Iterator[sqlite3.Connection]:
-        db = sqlite3.connect(self.path, isolation_level=None)
-        db.row_factory = sqlite3.Row
+        db = sqlite3.connect(self.path.as_uri() + "?mode=rw", uri=True, isolation_level=None)
         try:
+            if db.execute("SELECT 1 FROM sqlite_master WHERE name='dispatcher_metadata'").fetchone():
+                from .db_guard import validate
+                if validate(db)[3]:
+                    raise SchemaError('Recovery admission blocked')
+            db.row_factory = sqlite3.Row
             db.execute("PRAGMA foreign_keys=ON")
             db.execute("PRAGMA busy_timeout=5000")
             db.execute("PRAGMA journal_mode=WAL")
@@ -124,7 +122,7 @@ class Storage:
                   correction_of: int | None) -> None:
         old = db.execute("SELECT * FROM issues WHERE issue_id=?", (issue.issue_id,)).fetchone()
         if old:
-            if (old['repository'], old['issue_number'], old['project_id']) != (issue.repository, issue.issue_number, project_id):
+            if (old['repository'].lower(), old['issue_number']) != (issue.repository.lower(), issue.issue_number):
                 raise ValueError("Issue identity mismatch")
             if not old['is_virtual']:
                 if old['correction_of_issue_id'] != correction_of:
@@ -133,12 +131,12 @@ class Storage:
         group = issue.issue_id
         if correction_of is not None:
             source = db.execute("SELECT * FROM issues WHERE issue_id=?", (correction_of,)).fetchone()
-            if (not source or source['is_virtual'] or source['repository'] != issue.repository
+            if (not source or source['is_virtual'] or source['repository'].lower() != issue.repository.lower()
                     or source['state'] in (State.DONE, State.CANCELLED)):
                 raise ValueError("Correction requires a real same-repository source")
             group = source['execution_group_id']
             root = db.execute("SELECT * FROM issues WHERE issue_id=?", (group,)).fetchone()
-            if not root or root['repository'] != issue.repository or root['state'] in (State.DONE, State.CANCELLED):
+            if not root or root['repository'].lower() != issue.repository.lower() or root['state'] in (State.DONE, State.CANCELLED):
                 raise ValueError("Invalid or completed group")
             if not db.execute("SELECT 1 FROM issues WHERE execution_group_id=? AND state=?",
                               (group, State.NEED_FIX)).fetchone():
@@ -171,12 +169,12 @@ class Storage:
 
     def register_child(self, child: IssueObservation, parent: IssueObservation,
                        project_id: str, correction_of: int | None = None) -> None:
-        if child.repository != parent.repository:
+        if child.repository.lower() != parent.repository.lower():
             raise ValueError("Parent must be in same repository")
         with self.transaction() as db:
             self._register(db, child, project_id, correction_of)
             row = db.execute("SELECT * FROM issues WHERE issue_id=?", (parent.issue_id,)).fetchone()
-            if row and (row['repository'], row['issue_number'], row['project_id']) != (parent.repository, parent.issue_number, project_id):
+            if row and (row['repository'].lower(), row['issue_number']) != (parent.repository.lower(), parent.issue_number):
                 raise ValueError("Parent identity mismatch")
             if not row:
                 now = utc_now()
@@ -252,12 +250,12 @@ class Storage:
                 return False
             if correction_of is not None:
                 source = db.execute("SELECT * FROM issues WHERE issue_id=?", (correction_of,)).fetchone()
-                if (not source or source['is_virtual'] or source['repository'] != row['repository']
+                if (not source or source['is_virtual'] or source['repository'].lower() != row['repository'].lower()
                         or source['issue_id'] == issue_id):
                     raise ValueError("Invalid correction source")
                 root = db.execute("SELECT * FROM issues WHERE issue_id=?", (source['execution_group_id'],)).fetchone()
                 if (not root or root['is_virtual'] or root['execution_group_id'] != root['issue_id']
-                        or root['repository'] != row['repository'] or root['state'] in (State.DONE, State.CANCELLED)):
+                        or root['repository'].lower() != row['repository'].lower() or root['state'] in (State.DONE, State.CANCELLED)):
                     raise ValueError("Correction group is completed or invalid")
                 members = db.execute("SELECT * FROM issues WHERE execution_group_id=?", (root['issue_id'],)).fetchall()
                 if any(member['state'] in ACTIVE for member in members):
@@ -326,7 +324,7 @@ class Storage:
     def record_pr(self, pr: PRObservation) -> None:
         with self.transaction() as db:
             issue = db.execute("SELECT repository FROM issues WHERE issue_id=?", (pr.issue_id,)).fetchone()
-            if not issue or issue['repository'] != pr.repository:
+            if not issue or issue['repository'].lower() != pr.repository.lower():
                 raise ValueError("PR repository mismatch")
             old = db.execute("SELECT issue_id,repository,pr_number FROM pull_requests WHERE pr_id=?", (pr.pr_id,)).fetchone()
             if old and tuple(old) != (pr.issue_id, pr.repository, pr.pr_number):

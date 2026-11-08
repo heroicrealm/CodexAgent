@@ -19,6 +19,8 @@ from .storage import Storage
 
 class Runtime:
     def __init__(self, config, *, github=None, git=None, runner=None):
+        from .db_guard import check
+        check(config, execution=True)
         self.config = config
         self.storage = Storage(config.database)
         self.logger = DiagnosticLogger(self.storage, config.debug_mode, config.retention_days)
@@ -61,6 +63,8 @@ class Runtime:
 
     def run(self, *, once=False):
         with InstanceLock(self.config) as lock:
+            from .db_guard import check
+            check(self.config, execution=True)
             self.runner.pass_fds = lock.fds
             self.executor.recover()
             self.cleanup.known()
@@ -88,6 +92,8 @@ class Runtime:
                         if not self.stopping and time.monotonic() >= next_poll:
                             poll_ok = True
                             for project in self.config.projects:
+                                if not project.enabled:
+                                    continue
                                 if self.stopping:
                                     break
                                 try:
@@ -110,7 +116,7 @@ class Runtime:
                             next_poll = time.monotonic() + self.config.poll_interval
                             with self._gate:
                                 if poll_ok and not future and not self.stopping:
-                                    execution = self.scheduler.next()
+                                    execution = self.scheduler.next(repositories={p.repository.lower() for p in self.config.projects if p.enabled})
                                     if execution:
                                         future = pool.submit(self.executor.execute, execution.execution_id)
                             if once:

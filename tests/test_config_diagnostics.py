@@ -24,7 +24,7 @@ def test_labels(tmp_path):
 
 @pytest.mark.parametrize('mode,expected', [('off', 0), ('api', 2), ('verbose', 3)])
 def test_modes_and_safe_fields(tmp_path, mode, expected):
-    store = Storage(tmp_path / 'db')
+    store = Storage.bootstrap(tmp_path / 'db')
     log = DiagnosticLogger(store, mode)
     context = dict(poll_id='poll-1', repository='owner/new', issue_id=1, method='GET',
         endpoint='/repos/{owner}/{repo}/issues', duration_ms=10, http_status=200,
@@ -41,7 +41,7 @@ def test_modes_and_safe_fields(tmp_path, mode, expected):
 
 
 def test_retention_throttling_and_failure(tmp_path):
-    store = Storage(tmp_path / 'db')
+    store = Storage.bootstrap(tmp_path / 'db')
     old = (datetime.now(timezone.utc) - timedelta(days=8)).isoformat()
     with store.transaction() as db:
         db.execute("INSERT INTO debug_operations(created_at,level,component,operation,result) VALUES (?,'api','a','b','ok')", (old,))

@@ -116,7 +116,7 @@ class Publisher:
         self._unavailable_outputs = set()
 
     def project(self, issue):
-        return next(p for p in self.config.projects if p.id == issue['project_id'])
+        return next(p for p in self.config.projects if p.enabled and p.repository.lower() == issue['repository'].lower())
 
     def output(self, issue_id, body):
         with self._output_lock:
@@ -298,7 +298,7 @@ class Publisher:
                 original(secondary, 'publisher.error_report'), execution_id)
 
     def reconcile(self, project):
-        for issue in self.storage.rows('SELECT * FROM issues WHERE project_id=? AND is_virtual=0', (project.id,)):
+        for issue in self.storage.rows('SELECT * FROM issues WHERE lower(repository)=? AND is_virtual=0', (project.repository.lower(),)):
             if issue['approved_at']:
                 try:
                     self.phase_output(issue['issue_id'])
@@ -399,6 +399,8 @@ class Executor:
         for execution in self.storage.rows("SELECT e.* FROM executions e JOIN issues i ON i.issue_id=e.issue_id "
                                             "WHERE i.state IN ('preparing','running')"):
             issue = self.storage.issue(execution['issue_id'])
+            if not any(p.enabled and p.repository.lower() == issue['repository'].lower() for p in self.config.projects):
+                continue
             project = self.publisher.project(issue)
             branch = self.storage.group_branches(issue['issue_id'])[1]
             try:

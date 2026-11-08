@@ -35,6 +35,12 @@ class Project:
     labels: Mapping[str, str] = field(default_factory=dict)
     base_branch: str = "main"
     checkout: Path | None = None
+    enabled: bool = True
+
+    def __post_init__(self):
+        if type(self.enabled) is not bool:
+            raise ValueError('Project enabled must be boolean')
+        object.__setattr__(self, 'repository', self.repository.lower())
 
 
 @dataclass(frozen=True)
