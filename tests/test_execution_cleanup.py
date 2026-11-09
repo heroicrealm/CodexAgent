@@ -37,6 +37,8 @@ def environment(tmp_path):
     gitcmd(checkout, 'push', '-u', 'origin', 'main')
     config = Config(tmp_path / 'V2 workspace with spaces', tmp_path / 'db',
                     (Project('p', 'owner/new', checkout=checkout),), poll_interval=0.01)
+    from dispatcher.db_guard import maintain
+    maintain(config, 'bootstrap')
     store = Storage(config.database)
     api = FakeAPI()
     gh = GitHubAdapter(config, DiagnosticLogger(store), api, retries=0)

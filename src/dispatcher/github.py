@@ -108,7 +108,7 @@ class GitHubAdapter:
                 return None
             raise
         repository = value.get('repository_url', '').split('/repos/')[-1]
-        if repository != project.repository:
+        if repository.lower() != project.repository.lower():
             raise ValueError('Cross-repository Sub-issues require explicit project mapping')
         return self.issue_observation(value, repository)
 
@@ -142,7 +142,7 @@ class GitHubAdapter:
         matches = [v for v in values if v['id'] not in excluded
                    and (not since or not v.get('created_at') or datetime.fromisoformat(v['created_at']) >= datetime.fromisoformat(since))
                    and v['head']['ref'] == branch
-                   and (v['head'].get('repo') or {}).get('full_name') == project.repository]
+                   and (v['head'].get('repo') or {}).get('full_name', '').lower() == project.repository.lower()]
         if len(matches) > 1:
             raise ValueError('Multiple candidate PRs for this execution')
         return self.pr_observation(matches[0], issue_id, project.repository) if matches else None

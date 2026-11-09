@@ -11,7 +11,7 @@ from dispatcher.storage import SchemaError, Storage
 
 @pytest.fixture
 def store(tmp_path):
-    storage = Storage(tmp_path / 'v2.sqlite')
+    storage = Storage.bootstrap(tmp_path / 'v2.sqlite')
     storage.register_issue(IssueObservation(1, 'owner/new', 1, 'Observed title'), 'p')
     return storage
 

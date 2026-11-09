@@ -17,6 +17,8 @@ def main():
         parser.error('Existing V2 SQLite required')
     if args.project and args.project not in {p.id for p in config.projects}:
         parser.error('Unknown project')
+    from ..db_guard import check
+    check(config, execution=args.apply)
     cleanup = Cleanup(config, Storage(config.database), Git(config))
     results = cleanup.orphans(apply=args.apply, project_id=args.project)
     for result in results:

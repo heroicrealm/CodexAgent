@@ -19,8 +19,23 @@ def main():
     commands.add_parser('status')
     retry = commands.add_parser('publish')
     retry.add_argument('execution_id', type=int)
+    db = commands.add_parser('db')
+    maintenance = db.add_subparsers(dest='db_command', required=True)
+    for name in ('check', 'bootstrap', 'bind'):
+        maintenance.add_parser(name)
+    for name in ('backup', 'restore', 'register'):
+        maintenance.add_parser(name).add_argument('path', type=Path)
     args = parser.parse_args()
     config = load_config(args.config)
+    if args.command == 'db':
+        from .db_guard import maintain
+        from .storage import SchemaError
+        import sqlite3
+        try:
+            print(maintain(config, args.db_command, getattr(args, 'path', None)))
+        except (SchemaError, OSError, RuntimeError, sqlite3.DatabaseError) as exc:
+            parser.exit(1, f'FAIL {exc}\n')
+        return
     if args.command == 'stop':
         with socket.socket(socket.AF_UNIX) as connection:
             connection.settimeout(5)
@@ -28,6 +43,12 @@ def main():
             connection.sendall(b'force' if args.force else b'stop')
             print(connection.recv(32).decode())
         return
+    from .db_guard import check
+    from .storage import SchemaError
+    try:
+        check(config, execution=args.command not in ('queue', 'status'))
+    except (SchemaError, OSError) as exc:
+        parser.exit(1, f'FAIL {exc}\n')
     runtime = Runtime(config)
     if args.command == 'run':
         runtime.run(once=args.once)
@@ -49,8 +70,11 @@ def main():
     else:
         from .locking import InstanceLock
         with InstanceLock(config):
+            check(config, execution=True)
             if args.command == 'init-labels':
                 for project in config.projects:
+                    if not project.enabled:
+                        continue
                     runtime.github.initialize_labels(project)
             else:
                 runtime.publisher.publish(args.execution_id)

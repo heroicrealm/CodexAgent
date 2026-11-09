@@ -126,16 +126,19 @@ def test_gh_original_status_and_no_payload_publication(monkeypatch):
 
 def test_private_database_sidecars_and_parent(tmp_path):
     parent = tmp_path / 'owned' / 'diagnostics'
-    store = Storage(parent / 'state.sqlite')
+    store = Storage.bootstrap(parent / 'state.sqlite')
     assert parent.stat().st_mode & 0o777 == 0o700
     assert parent.parent.stat().st_mode & 0o777 == 0o700
     assert store.path.stat().st_mode & 0o777 == 0o600
-    with store.connection():
+    with store.connection() as db:
+        db.execute('SELECT * FROM issues').fetchall()
         for suffix in ('-wal', '-shm'):
             assert Path(str(store.path) + suffix).stat().st_mode & 0o777 == 0o600
     os.chmod(store.path, 0o666)
-    Storage(store.path)
-    assert store.path.stat().st_mode & 0o777 == 0o600
+    from dispatcher.storage import SchemaError
+    with pytest.raises(SchemaError, match='permissions'):
+        Storage(store.path)
+    assert store.path.stat().st_mode & 0o777 == 0o666
     assert tmp_path.stat().st_mode & 0o777 == 0o700
 
 
@@ -291,7 +294,7 @@ def test_existing_directory_permissions_warn_without_changing_parent(tmp_path):
     parent = tmp_path / 'shared'
     parent.mkdir(mode=0o755)
     with pytest.warns(RuntimeWarning, match='parent directory'):
-        store = Storage(parent / 'state.sqlite')
+        store = Storage.bootstrap(parent / 'state.sqlite')
     assert parent.stat().st_mode & 0o777 == 0o755
     assert store.path.stat().st_mode & 0o777 == 0o600
 

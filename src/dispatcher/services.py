@@ -108,7 +108,7 @@ class StateService:
         correction = None
         branches = None
         if params.correction_for is not None:
-            if not source or source.repository != issue.repository or source.issue_number != params.correction_for:
+            if not source or source.repository.lower() != issue.repository.lower() or source.issue_number != params.correction_for:
                 raise ValueError('Correction source was not fully resolved')
             correction = source.issue_id
         else:
@@ -158,7 +158,7 @@ class StateService:
                         db.execute('INSERT INTO issues(issue_id,repository,issue_number,project_id,is_virtual,title,created_at,updated_at) '
                                    'VALUES (?,?,?,?,1,?,?,?)', (parent.issue_id, parent.repository, parent.issue_number, project.id, parent.title, now, now))
                         existing = db.execute('SELECT * FROM issues WHERE issue_id=?', (parent.issue_id,)).fetchone()
-                    if parent.repository != child['repository']:
+                    if parent.repository.lower() != child['repository'].lower():
                         raise ValueError('Cross-repository parent is unsupported')
                     if existing['state'] not in FROZEN:
                         db.execute('INSERT OR IGNORE INTO issue_relations VALUES (?,?)', (parent.issue_id, child_id))
@@ -183,7 +183,7 @@ class StateService:
         with self.storage.transaction() as db:
             issue = db.execute('SELECT * FROM issues WHERE issue_id=?', (pr.issue_id,)).fetchone()
             root = db.execute('SELECT * FROM issues WHERE issue_id=?', (issue['execution_group_id'],)).fetchone() if issue else None
-            if not issue or issue['repository'] != pr.repository or root['work_branch'] != pr.head_branch:
+            if not issue or issue['repository'].lower() != pr.repository.lower() or root['work_branch'] != pr.head_branch:
                 raise ValueError('PR does not match execution group')
             existing = db.execute('SELECT issue_id FROM pull_requests WHERE pr_id=?', (pr.pr_id,)).fetchone()
             if existing and existing['issue_id'] != pr.issue_id:
@@ -216,7 +216,7 @@ class PollService:
         poll_id = POLL_ID.get() or 'poll-' + uuid4().hex
         issues = self.github.issues(project, poll_id)
         labels = self.config.effective_labels(project)
-        known = {r['issue_id']: r for r in self.storage.rows('SELECT * FROM issues WHERE project_id=?', (project.id,))}
+        known = {r['issue_id']: r for r in self.storage.rows('SELECT * FROM issues WHERE lower(repository)=?', (project.repository.lower(),))}
         batch = ObservationBatch(poll_id, issues)
         for issue in issues:
             old = known.get(issue.issue_id)
@@ -250,7 +250,7 @@ class PollService:
                         batch.approval_errors[issue.issue_id] = exc
         prs = []
         for row in self.storage.rows("SELECT p.* FROM pull_requests p JOIN issues i ON i.issue_id=p.issue_id "
-                                     "WHERE i.project_id=? AND p.status='open'", (project.id,)):
+                                     "WHERE lower(i.repository)=? AND p.status='open'", (project.repository.lower(),)):
             prs.append(self.github.pr(project, row['pr_number'], row['issue_id'], poll_id))
         for row in known.values():
             if row['state'] == State.MANUAL_RUNNING:
@@ -346,8 +346,10 @@ class Scheduler:
             cursor = db.execute("INSERT INTO executions(issue_id,status,started_at) VALUES (?,'reserved',?)", (issue_id, utc_now()))
             return Execution(cursor.lastrowid, issue_id, ExecutionStatus.RESERVED)
 
-    def next(self):
-        for row in self.storage.rows("SELECT issue_id FROM issues WHERE state='pending' ORDER BY issue_id"):
+    def next(self, repositories=None):
+        for row in self.storage.rows("SELECT issue_id,repository FROM issues WHERE state='pending' ORDER BY issue_id"):
+            if repositories is not None and row['repository'].lower() not in repositories:
+                continue
             execution = self.reserve(row['issue_id'])
             if execution:
                 return execution

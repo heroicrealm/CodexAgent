@@ -8,7 +8,7 @@ from dispatcher.models import IssueObservation, State, PRObservation, PRStatus
 
 @pytest.fixture
 def store(tmp_path):
-    return Storage(tmp_path / 'v2.sqlite')
+    return Storage.bootstrap(tmp_path / 'v2.sqlite')
 
 
 def obs(id=1, repo='owner/new', number=1):
@@ -37,7 +37,7 @@ def test_reject_without_mutation(tmp_path, damage):
         with sqlite3.connect(path) as db:
             db.execute('CREATE TABLE legacy (id)')
     else:
-        s = Storage(path)
+        s = Storage.bootstrap(path)
         with s.connection() as db:
             if damage == 'version':
                 db.execute('UPDATE schema_migrations SET version=2')

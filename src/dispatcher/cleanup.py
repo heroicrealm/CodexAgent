@@ -36,8 +36,13 @@ class Cleanup:
             raise ValueError('Existing V2 SQLite required for maintenance')
         results = []
         with InstanceLock(self.config):
+            if apply:
+                from .db_guard import check
+                check(self.config, execution=True)
             Storage(self.config.database)
             for project in self.config.projects:
+                if not project.enabled:
+                    continue
                 if project_id and project.id != project_id:
                     continue
                 try:
@@ -72,8 +77,10 @@ class Cleanup:
     def known(self):
         """Caller holds the runtime lock. Never scan unknown directories."""
         for project in self.config.projects:
+            if not project.enabled:
+                continue
             rows = self.storage.rows('SELECT e.*,i.state,i.execution_group_id FROM executions e '
-                'JOIN issues i ON i.issue_id=e.issue_id WHERE i.project_id=?', (project.id,))
+                'JOIN issues i ON i.issue_id=e.issue_id WHERE lower(i.repository)=?', (project.repository.lower(),))
             blocked = set()
             for row in rows:
                 if row['worktree_path'] and Path(row['worktree_path']).exists():
@@ -91,8 +98,8 @@ class Cleanup:
                         self.storage.record_error(row['issue_id'], 'cleanup_failed', 'cleanup', 'Worktree retained for a safe retry', row['execution_id'])
                 elif row['worktree_path'] and not row['push_completed']:
                     blocked.add(row['execution_group_id'])
-            for root in self.storage.rows("SELECT * FROM issues WHERE project_id=? AND execution_group_id=issue_id "
-                                           "AND state IN ('done','cancelled') AND work_branch IS NOT NULL", (project.id,)):
+            for root in self.storage.rows("SELECT * FROM issues WHERE lower(repository)=? AND execution_group_id=issue_id "
+                                           "AND state IN ('done','cancelled') AND work_branch IS NOT NULL", (project.repository.lower(),)):
                 if (project.id, root['issue_id']) in self._removed_branches:
                     continue
                 if root['work_branch'] == root['base_branch'] or root['issue_id'] in blocked:

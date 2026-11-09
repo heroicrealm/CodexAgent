@@ -96,7 +96,7 @@ class FakeAPI:
 @pytest.fixture
 def app(tmp_path):
     config = Config(tmp_path / 'work', tmp_path / 'db', (Project('p', 'owner/new'),), debug_mode='verbose')
-    storage = Storage(config.database)
+    storage = Storage.bootstrap(config.database)
     api = FakeAPI()
     gh = GitHubAdapter(config, DiagnosticLogger(storage, 'verbose'), api, retries=0)
     groups = GroupService(storage)
@@ -392,7 +392,7 @@ def test_need_fix_not_reused_after_a_new_failed_attempt(app):
 def test_multiple_projects_same_issue_numbers_and_label_overrides(tmp_path):
     projects = (Project('p', 'owner/new'), Project('q', 'other/new', {'approve': 'custom-approve', 'pending': 'custom-pending'}))
     config = Config(tmp_path / 'work', tmp_path / 'db', projects)
-    store = Storage(config.database)
+    store = Storage.bootstrap(config.database)
     first, second = FakeAPI(), FakeAPI()
     first.issues = {1: issue(100)}
     first.issues[1]['number'] = 1
@@ -634,3 +634,26 @@ def test_pinned_branch_survives_reapproval_restart_and_correction(app, branch):
     poll.poll_project(config.projects[0])
     assert store.issue(2)['execution_group_id'] == 1
     assert store.group_branches(2) == ('main', branch)
+
+
+def test_repository_identity_survives_project_rename_and_return(app):
+    from dataclasses import replace
+    from dispatcher.services import Scheduler
+    config, store, api, gh, groups, state, pub, poll = app
+    approve(api)
+    poll.poll_project(config.projects[0])
+    before = dict(store.issue(1))
+    scheduler = Scheduler(store, groups, state)
+    assert scheduler.next(repositories=set()) is None
+    assert dict(store.issue(1)) == before
+    renamed = replace(config.projects[0], id='renamed', repository='OWNER/NEW')
+    pub.config = replace(config, projects=(renamed,))
+    assert pub.project(store.issue(1)) == renamed
+    # The returning repository must be polled before Runtime calls Scheduler.
+    poll.poll_project(renamed)
+    assert store.issue(1)['approved_body'] == before['approved_body']
+    assert store.issue(1)['project_id'] == 'p'
+    other = replace(renamed, id='p', repository='owner/different')
+    assert poll.collect(other).prs == ()
+    assert scheduler.next(repositories={'owner/different'}) is None
+    assert scheduler.next(repositories={'owner/new'}).issue_id == 1
