@@ -66,7 +66,7 @@ def test_invalid_unchanged(config, tmp_path, damage):
     else:
         with connection(config.database) as db:
             if damage == 'version':
-                db.execute('UPDATE schema_migrations SET version=99')
+                db.execute('UPDATE schema_migrations SET version=99 WHERE version=1')
             elif damage == 'index':
                 db.execute('DROP INDEX idx_issues_state')
             else:

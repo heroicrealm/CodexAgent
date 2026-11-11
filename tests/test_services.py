@@ -398,6 +398,7 @@ def test_multiple_projects_same_issue_numbers_and_label_overrides(tmp_path):
     first.issues[1]['number'] = 1
     second.issues = {1: issue(200, labels=('dispatcher:codex-ready', 'custom-approve'))}
     second.issues[1]['number'] = 1
+    second.issues[1]['repository_url'] = 'https://api.github.com/repos/other/new'
     gh = GitHubAdapter(config, DiagnosticLogger(store),
         lambda method, endpoint, payload: (first if '/owner/new/' in endpoint else second)(method, endpoint, payload))
     groups = GroupService(store)

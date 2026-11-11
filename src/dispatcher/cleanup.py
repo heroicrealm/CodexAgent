@@ -25,6 +25,8 @@ class Cleanup:
     def orphan_check(self, project, path):
         if Path(path).resolve() in self.referenced():
             return False, 'referenced-by-sqlite'
+        if self.storage.rows('SELECT 1 FROM recovery_quarantine LIMIT 1'):
+            return False, 'recovery-quarantine'
         if self.storage.rows("SELECT 1 FROM issues WHERE state IN ('preparing','running')"):
             return False, 'unfinished-execution'
         return self.git.safe_worktree(project, path)
@@ -70,6 +72,8 @@ class Cleanup:
     def _dry_check(self, project, path):
         if Path(path).resolve() in self.referenced():
             return False, 'referenced-by-sqlite'
+        if self.storage.rows('SELECT 1 FROM recovery_quarantine LIMIT 1'):
+            return False, 'recovery-quarantine'
         if self.storage.rows("SELECT 1 FROM issues WHERE state IN ('preparing','running')"):
             return False, 'unfinished-execution'
         return self.git.safe_worktree(project, path, refresh=False)
@@ -83,6 +87,9 @@ class Cleanup:
                 'JOIN issues i ON i.issue_id=e.issue_id WHERE lower(i.repository)=?', (project.repository.lower(),))
             blocked = set()
             for row in rows:
+                if self.storage.blocked(row['issue_id']):
+                    blocked.add(row['execution_group_id'])
+                    continue
                 if row['worktree_path'] and Path(row['worktree_path']).exists():
                     try:
                         if row['state'] in ('preparing', 'running') or not row['push_completed']:
@@ -100,6 +107,8 @@ class Cleanup:
                     blocked.add(row['execution_group_id'])
             for root in self.storage.rows("SELECT * FROM issues WHERE lower(repository)=? AND execution_group_id=issue_id "
                                            "AND state IN ('done','cancelled') AND work_branch IS NOT NULL", (project.repository.lower(),)):
+                if self.storage.blocked(root['issue_id']):
+                    continue
                 if (project.id, root['issue_id']) in self._removed_branches:
                     continue
                 if root['work_branch'] == root['base_branch'] or root['issue_id'] in blocked:

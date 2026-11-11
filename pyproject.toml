@@ -19,7 +19,7 @@ test = ["pytest>=8"]
 where = ["src"]
 
 [tool.setuptools.package-data]
-dispatcher = ["schema.sql"]
+dispatcher = ["schema.sql", "schema_v1.sql", "recovery_schema.sql"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -16,8 +16,8 @@ class SchemaError(RuntimeError):
     pass
 
 
-def _ddl() -> str:
-    return files("dispatcher").joinpath("schema.sql").read_text()
+def _ddl(version=2) -> str:
+    return files("dispatcher").joinpath("schema.sql" if version == 2 else "schema_v1.sql").read_text()
 
 
 def _signature(db: sqlite3.Connection) -> list[tuple]:
@@ -25,16 +25,18 @@ def _signature(db: sqlite3.Connection) -> list[tuple]:
                       "WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name").fetchall()
 
 
-def _validate(db: sqlite3.Connection, *, metadata=False) -> None:
+def _validate(db: sqlite3.Connection, *, metadata=False, version=None) -> None:
     reference = sqlite3.connect(":memory:")
     try:
-        reference.executescript(_ddl())
+        versions = db.execute("SELECT version FROM schema_migrations ORDER BY version").fetchall()
+        version = version or (2 if versions == [(1,), (2,)] else 1)
+        reference.executescript(_ddl(version))
         if metadata:
-            from .db_guard import META
-            reference.execute(META)
+            from .db_guard import metadata_ddl
+            reference.execute(metadata_ddl(version))
         if _signature(db) != _signature(reference):
             raise SchemaError("Incompatible V2 structure; migration is not supported")
-        if db.execute("SELECT version FROM schema_migrations").fetchall() != [(1,)]:
+        if db.execute("SELECT version FROM schema_migrations ORDER BY version").fetchall() != ([(1,), (2,)] if version == 2 else [(1,)]):
             raise SchemaError("Unsupported V2 schema version")
         if db.execute("PRAGMA quick_check").fetchall() != [("ok",)]:
             raise SchemaError("Corrupt SQLite database")
@@ -54,6 +56,8 @@ class Storage:
         with inspection(self.path) as db:
             registered = bool(db.execute("SELECT 1 FROM sqlite_master WHERE name='dispatcher_metadata'").fetchone())
             _validate(db, metadata=registered)
+            if db.execute('SELECT max(version) FROM schema_migrations').fetchone()[0] != 2:
+                raise SchemaError('Explicit db upgrade required')
 
     @classmethod
     def bootstrap(cls, path):
@@ -69,8 +73,30 @@ class Storage:
         from .db_guard import connection
         with connection(path) as db:
             db.executescript(_ddl())
-            db.execute('INSERT INTO schema_migrations VALUES (1,?)', (utc_now(),))
+            db.executemany('INSERT INTO schema_migrations VALUES (?,?)', [(1, utc_now()), (2, utc_now())])
         return cls(path)
+
+    @staticmethod
+    def blocked_db(db, issue_id):
+        return bool(db.execute("""
+            WITH RECURSIVE affected(id) AS (
+                SELECT issue_id FROM issues WHERE issue_id=?
+                UNION SELECT issue_id FROM issues WHERE execution_group_id=(
+                    SELECT execution_group_id FROM issues WHERE issue_id=?)
+                UNION SELECT child_issue_id FROM issue_relations JOIN affected ON parent_issue_id=id
+            )
+            SELECT 1 FROM recovery_quarantine WHERE issue_id IN (SELECT id FROM affected)
+            UNION SELECT 1 FROM recovery_operations WHERE phase<>'completed'
+                AND issue_id IN (SELECT id FROM affected) LIMIT 1
+        """, (issue_id, issue_id)).fetchone())
+
+    def blocked(self, issue_id):
+        with self.connection() as db:
+            return self.blocked_db(db, issue_id)
+
+    def admit(self, issue_id):
+        if self.blocked(issue_id):
+            raise SchemaError('Issue recovery quarantine blocks side effects')
 
     def _secure_sidecars(self):
         for suffix in ('-wal', '-shm'):
@@ -118,7 +144,8 @@ class Storage:
         with self.connection() as db:
             return db.execute("SELECT * FROM issues WHERE issue_id=?", (issue_id,)).fetchone()
 
-    def _register(self, db: sqlite3.Connection, issue: IssueObservation, project_id: str,
+    @staticmethod
+    def _register(db: sqlite3.Connection, issue: IssueObservation, project_id: str,
                   correction_of: int | None) -> None:
         old = db.execute("SELECT * FROM issues WHERE issue_id=?", (issue.issue_id,)).fetchone()
         if old:
@@ -185,6 +212,8 @@ class Storage:
 
     def _transition(self, db: sqlite3.Connection, issue_id: int, expected: State,
                     target: State, reason: str) -> bool:
+        if self.blocked_db(db, issue_id):
+            return False
         if not isinstance(expected, State) or not isinstance(target, State):
             raise ValueError("Canonical State values required")
         if expected == target:
@@ -211,7 +240,7 @@ class Storage:
             return self._transition(db, issue_id, expected, target, reason)
 
     def commit_approval(self, issue_id: int, snapshot: ApprovedSnapshot,
-                        target: State, *, correction_of: int | None = None,
+                        target: State, *, approval_observed: bool = False, correction_of: int | None = None,
                         branches: tuple[str, str] | None = None,
                         readiness: Callable[[sqlite3.Connection], bool] | None = None) -> bool:
         """Store a complete, already fetched approval in one transaction.
@@ -244,6 +273,11 @@ class Storage:
                 raise ValueError("Approval YAML must contain a parameter mapping")
         with self.transaction() as db:
             row = db.execute("SELECT * FROM issues WHERE issue_id=?", (issue_id,)).fetchone()
+            if self.blocked_db(db, issue_id):
+                return False
+            reset = db.execute('SELECT * FROM recovery_approval_reset WHERE issue_id=?', (issue_id,)).fetchone()
+            if reset and (not reset['approval_absent_observed'] or not reset['completed_at'] or not approval_observed):
+                return False
             if not row or row['approved_at'] is not None:
                 return False
             if row['is_virtual'] or row['state'] != State.DISCOVERED:

@@ -76,11 +76,9 @@ WAL/SHM сначала сохраните аварийный набор файл
 replace сохраняет прежний основной файл; сбой питания после replace может оставить
 уже восстановленную БД с установленным барьером. Archive сохраняется.
 
-**После restore исполнение заблокировано постоянно в V2.4.1**, включая pending,
-running и старые approve. WARN сообщает о необходимости допуска; это не разрешение
-на запуск. Автоматической сверки GitHub, worktree, PR и внешних процессов, команды
-resume/reset и rebuild из GitHub здесь нет. Требуется отдельная проверяемая процедура
-допуска в V2.4.2. Не снимайте recovery_required ручным SQL ради запуска.
+**После restore исполнение заблокировано до полной внешней сверки V2.4.2**,
+включая Executor.recover, публикацию, изменяющий poll и cleanup. WARN не разрешает
+запуск. Не снимайте recovery_required ручным SQL; процедура допуска описана ниже.
 
 | Состояние | Действие |
 | --- | --- |
@@ -102,3 +100,85 @@ resume/reset и rebuild из GitHub здесь нет. Требуется отд
 восстанавливает. Он также не откатывает GitHub и удалённые git repositories.
 
 Отчёт реализации и проверок: [docs/v2.4.1-implementation.md](docs/v2.4.1-implementation.md).
+
+### V2.4.2: upgrade и reconciliation
+
+При переходе с зарегистрированной V2.4.1 остановите daemon и дождитесь завершения
+его исполнителей. При наличии SQLite sidecar сначала сохраните аварийный комплект,
+затем после доказанной остановки выполните checkpoint и закройте соединение.
+Все изменяющие recovery-команды требуют обе InstanceLock, отсутствия control
+socket и WAL/SHM. PID сам по себе не доказывает остановку.
+
+    codex-dispatcher --config config/dispatcher.yaml db upgrade
+    codex-dispatcher --config config/dispatcher.yaml db check
+
+Upgrade проверяет точный исторический DDL и UUID, создаёт проверенный 0600
+*.before-upgrade-UUID, затем транзакционно устанавливает version=2 и format_version=2.
+Recovery-флаг сохраняется. Повторный upgrade безопасен; обычный запуск старую схему
+не мигрирует. Новый bootstrap создаёт актуальную схему. Restore принимает только
+зарегистрированные backup схем 1/2 того же UUID, мигрируя историческую схему только
+в staging. Карантин и аудит из backup v2 сохраняются.
+
+После restore, при остановленном диспетчере:
+
+    codex-dispatcher --config config/dispatcher.yaml db recover --dry-run
+    codex-dispatcher --config config/dispatcher.yaml db recover
+    codex-dispatcher --config config/dispatcher.yaml db recovery status
+
+Dry-run читает приватную SQLite-копию, GitHub и Git, не создаёт lock-файлы, не
+обновляет refs/index и не пишет в SQLite/GitHub. Настоящий recover полностью
+собирает открытые и зарегистрированные закрытые Issues, все PR, отношения,
+approval snapshots, local/remote refs и worktree; повторяет проверки перед commit.
+Одна транзакция сохраняет session, карантины, допустимые переходы и снимает
+общий барьер. Ошибка обязательного GET, изменение наблюдений, неизвестный worktree,
+грязный основной checkout или недоказанная идентичность сохраняют общий запрет.
+Приватная диагностика отказа: workspace/diagnostics/recovery-errors.jsonl.
+Включённые debug API-метрики буферизуются; успешная изменяющая операция сохраняет
+их в debug_operations, dry-run не записывает их в SQLite.
+
+Локальный конфликт блокирует соответствующую Issue и зависимые контейнеры.
+Независимые задачи могут работать. Poll и повторный recover не снимают карантины.
+Непроверенные disabled/удалённые repositories изолируются persistent state-conflict
+для сохранённых Issues. Re-enable сам по себе не разрешает выполнение.
+Новые после backup Issues обнаруживаются в discovered с approval-uncertain;
+старому approve доверять нельзя.
+
+Административные решения (PROJECT — текущий project.id, ISSUE — номер в его
+текущем repository; глобальный GitHub ID проверяется повторно):
+
+    codex-dispatcher --config config/dispatcher.yaml db recovery accept PROJECT ISSUE
+    codex-dispatcher --config config/dispatcher.yaml db recovery cancel PROJECT ISSUE
+    codex-dispatcher --config config/dispatcher.yaml db recovery retry PROJECT ISSUE
+
+- accept требует доказанный PR: сохранённые ID/номер/Issue либо точное dispatcher
+  тело вместе с подтверждённым result SHA, плюс head/repository. Имя ветки
+  недостаточно. Устанавливает допустимый review/done/rejected с аудитом, без
+  фиктивных executions. Независимые неразрешённые причины остаются.
+- cancel допускает только разрешённый переход без опубликованного результата,
+  проверяет группу, пишет аудит и сохраняет неизвестные локальные артефакты.
+  Неразрешённые ветки/worktree/отношения остаются заблокированными.
+- retry — явное согласие отбросить принадлежащую Issue незавершённую локальную
+  работу. Требует открытой Issue, отсутствия PR/remote work branch/результата,
+  доказанной принадлежности worktree и согласованных зависимостей. Чужие пути,
+  неизвестные локальные ветки и shared correction groups не очищаются.
+
+Retry сохраняет operation_id и архив до удаления файлов, удаляет старую approve
+и наблюдает её отсутствие. Штатным git worktree remove удаляется только worktree
+с execution ID и UUID; условно удаляется исключительно внутренний local ref.
+Диагностика error_log сохраняется с отвязанным FK; активная executions удаляется,
+state_history сохраняется. Issue возвращается в discovered с очищенным approval.
+Диагностический GitHub comment содержит operation_id; перед каждым POST, включая
+повтор после неопределённого ответа, полностью читаются комментарии и проверяется
+маркер. Полученный comment_id сохраняется. Карантин снимается в последней
+транзакции только для разрешённых причин. Диагностические файлы вне принадлежащего
+worktree не удаляются.
+
+При прерывании повторите **ту же** команду retry: durable-фаза сохраняется, запуск
+до завершения запрещён. API error, изменившиеся предпосылки или новая публикация
+оставляют карантин. После завершения проверьте status: другие причины могут
+оставаться. Установите **новую** dispatcher:approve через GitHub только после
+завершения retry. Без неё discovered не запускается; прежний hash не разрешает
+выполнение.
+
+Консервативные отказы, ограничения и ручная приёмка:
+[docs/v2.4.2-implementation.md](docs/v2.4.2-implementation.md).

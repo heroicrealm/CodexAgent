@@ -1,5 +1,6 @@
 """State, groups, polling and scheduling. External calls never hold SQL locks."""
 import sqlite3
+from .storage import Storage
 from uuid import uuid4
 from .config import Config, Project
 from .github import GitHubError, POLL_ID
@@ -28,16 +29,18 @@ class GroupService:
     def __init__(self, storage, logger=None):
         self.storage, self.logger = storage, logger
 
-    def evaluate_db(self, db, issue_id, base_branch=None):
+    def evaluate_db(self, db, issue_id, base_branch=None, *, check_recovery=True):
         row = db.execute('SELECT * FROM issues WHERE issue_id=?', (issue_id,)).fetchone()
         if not row or row['is_virtual']:
             return Eligibility(False, ('virtual-or-missing',))
         root = db.execute('SELECT * FROM issues WHERE issue_id=?', (row['execution_group_id'],)).fetchone()
         base = base_branch or root['base_branch']
-        reasons = []
+        reasons = ['recovery-quarantine'] if check_recovery and Storage.blocked_db(db, issue_id) else []
         children = db.execute('SELECT i.* FROM issue_relations r JOIN issues i ON i.issue_id=r.child_issue_id '
                               'WHERE r.parent_issue_id=? AND i.is_virtual=0', (issue_id,)).fetchall()
         for child in children:
+            if Storage.blocked_db(db, child['issue_id']):
+                reasons.append('quarantined-child')
             prs = db.execute('SELECT * FROM pull_requests WHERE issue_id=?', (child['issue_id'],)).fetchall()
             if not child['is_ready'] and any(pr['status'] == 'open' for pr in prs):
                 reasons.append('child-ready-removed-with-open-pr')
@@ -84,6 +87,8 @@ class StateService:
         if target_state not in ALLOWED.get(expected_state, set()):
             raise ValueError('Forbidden state transition')
         with self.storage.transaction() as db:
+            if Storage.blocked_db(db, issue_id):
+                return False
             if target_state in TERMINAL:
                 return self._finish_group(db, issue_id, expected_state, target_state, reason)
             return self.storage._transition(db, issue_id, expected_state, target_state, reason)
@@ -122,6 +127,7 @@ class StateService:
             snapshot_hash(issue.title, issue.body, comment.body if comment else None),
             comment.id if comment else None, comment.body if comment else None)
         changed = self.storage.commit_approval(issue.issue_id, snapshot, State.PENDING,
+            approval_observed=self._labels(project)['approve'] in issue.labels,
             correction_of=correction, branches=branches,
             readiness=lambda db: self.groups.evaluate_db(db, issue.issue_id,
                 branches[0] if branches else None).eligible)
@@ -134,23 +140,35 @@ class StateService:
         with self.storage.transaction() as db:
             before = db.execute("SELECT count(*) FROM state_history").fetchone()[0]
             for issue in batch.issues:
+                if Storage.blocked_db(db, issue.issue_id):
+                    continue
                 old = db.execute('SELECT * FROM issues WHERE issue_id=?', (issue.issue_id,)).fetchone()
                 if labels['codex-ready'] in issue.labels:
                     if not old or old['is_virtual']:
                         self.storage._register(db, issue, project.id, None)
                         registered += 1
+                        if (not old and db.execute('SELECT 1 FROM recovery_sessions LIMIT 1').fetchone()
+                                and labels['approve'] in issue.labels):
+                            from .recovery import RecoveryStore
+                            RecoveryStore.quarantine(db, issue.issue_id, 'approval-uncertain',
+                                                     'New discovery after recovery with preexisting approve')
                 if db.execute('SELECT 1 FROM issues WHERE issue_id=?', (issue.issue_id,)).fetchone():
                     db.execute('UPDATE issues SET github_state=?,is_ready=?,is_approved=?,title=?,last_seen_at=?,updated_at=? WHERE issue_id=?',
                         (issue.github_state, int(labels['codex-ready'] in issue.labels), int(labels['approve'] in issue.labels),
                          issue.title, utc_now(), utc_now(), issue.issue_id))
             for child_id, parent in batch.parents.items():
                 child = db.execute('SELECT * FROM issues WHERE issue_id=?', (child_id,)).fetchone()
-                if not child or child['is_virtual']:
+                if not child or child['is_virtual'] or Storage.blocked_db(db, child_id):
                     continue
                 # Existing parent relations may change only before their execution.
-                db.execute("DELETE FROM issue_relations WHERE child_issue_id=? AND parent_issue_id IN "
-                    "(SELECT issue_id FROM issues WHERE state IS NULL OR state IN ('discovered','pending','awaiting-children'))",
-                    (child_id,))
+                mutable = db.execute("SELECT i.issue_id FROM issues i JOIN issue_relations r "
+                    "ON r.parent_issue_id=i.issue_id WHERE r.child_issue_id=? AND "
+                    "(i.state IS NULL OR i.state IN ('discovered','pending','awaiting-children'))",
+                    (child_id,)).fetchall()
+                for candidate in mutable:
+                    if not Storage.blocked_db(db, candidate['issue_id']):
+                        db.execute('DELETE FROM issue_relations WHERE child_issue_id=? AND parent_issue_id=?',
+                                   (child_id, candidate['issue_id']))
                 if parent:
                     existing = db.execute('SELECT * FROM issues WHERE issue_id=?', (parent.issue_id,)).fetchone()
                     if not existing:
@@ -160,11 +178,11 @@ class StateService:
                         existing = db.execute('SELECT * FROM issues WHERE issue_id=?', (parent.issue_id,)).fetchone()
                     if parent.repository.lower() != child['repository'].lower():
                         raise ValueError('Cross-repository parent is unsupported')
-                    if existing['state'] not in FROZEN:
+                    if existing['state'] not in FROZEN and not Storage.blocked_db(db, existing['issue_id']):
                         db.execute('INSERT OR IGNORE INTO issue_relations VALUES (?,?)', (parent.issue_id, child_id))
             for parent_id, children in batch.children.items():
                 parent = db.execute('SELECT * FROM issues WHERE issue_id=?', (parent_id,)).fetchone()
-                if not parent or parent['state'] in FROZEN:
+                if not parent or parent['state'] in FROZEN or Storage.blocked_db(db, parent_id):
                     continue
                 db.execute('DELETE FROM issue_relations WHERE parent_issue_id=?', (parent_id,))
                 for child in children:
@@ -180,6 +198,7 @@ class StateService:
         return self.config.effective_labels(project)
 
     def apply_pr(self, pr, *, recover=False):
+        self.storage.admit(pr.issue_id)
         with self.storage.transaction() as db:
             issue = db.execute('SELECT * FROM issues WHERE issue_id=?', (pr.issue_id,)).fetchone()
             root = db.execute('SELECT * FROM issues WHERE issue_id=?', (issue['execution_group_id'],)).fetchone() if issue else None
@@ -261,6 +280,8 @@ class PollService:
         return batch
 
     def poll_project(self, project):
+        with self.storage.connection():
+            pass  # global admission before any adapter calls
         token = POLL_ID.set('poll-' + uuid4().hex)
         try:
             return self._poll_project(project)
@@ -272,10 +293,11 @@ class PollService:
         result = self.state.apply_observation(project, batch)
         labels = self.config.effective_labels(project)
         for pr in batch.prs:
-            self.state.apply_pr(pr)
+            if not self.storage.blocked(pr.issue_id):
+                self.state.apply_pr(pr)
         for observation in sorted(batch.issues, key=lambda item: (labels['approve'] in item.labels, item.issue_id)):
             row = self.storage.issue(observation.issue_id)
-            if not row or row['is_virtual']:
+            if not row or row['is_virtual'] or self.storage.blocked(row['issue_id']):
                 continue
             commands = {key for key in ('approve', 'need-fix', 'cancelled', 'done') if labels[key] in observation.labels}
             # Terminal status labels are not incoming commands after completion.
@@ -327,7 +349,8 @@ class Scheduler:
     def _reserve(self, issue_id):
         with self.storage.transaction() as db:
             # One process slot; manual-running waits for a human without occupying it.
-            if db.execute("SELECT 1 FROM issues WHERE state IN ('preparing','running')").fetchone():
+            if any(not Storage.blocked_db(db, r['issue_id']) for r in
+                   db.execute("SELECT issue_id FROM issues WHERE state IN ('preparing','running')")):
                 return None
             self.state.refresh_db(db)
             row = db.execute('SELECT * FROM issues WHERE issue_id=?', (issue_id,)).fetchone()

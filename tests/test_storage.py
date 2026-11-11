@@ -21,9 +21,9 @@ def test_schema_and_reopen(store):
         assert db.execute('PRAGMA foreign_keys').fetchone()[0] == 1
         assert db.execute('PRAGMA journal_mode').fetchone()[0] == 'wal'
         assert db.execute('PRAGMA busy_timeout').fetchone()[0] == 5000
-        assert db.execute("SELECT count(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").fetchone()[0] == 8
-        assert db.execute("SELECT count(*) FROM sqlite_master WHERE type='index' AND name NOT LIKE 'sqlite_%'").fetchone()[0] == 11
-        assert db.execute('SELECT version FROM schema_migrations').fetchone()[0] == 1
+        assert db.execute("SELECT count(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").fetchone()[0] == 14
+        assert db.execute("SELECT count(*) FROM sqlite_master WHERE type='index' AND name NOT LIKE 'sqlite_%'").fetchone()[0] == 14
+        assert [r[0] for r in db.execute('SELECT version FROM schema_migrations ORDER BY version')] == [1, 2]
     assert Storage(store.path).issue(1)['title'] == 'title'
     assert store.issue(1)['created_at'].endswith('+00:00')
 
@@ -40,7 +40,7 @@ def test_reject_without_mutation(tmp_path, damage):
         s = Storage.bootstrap(path)
         with s.connection() as db:
             if damage == 'version':
-                db.execute('UPDATE schema_migrations SET version=2')
+                db.execute('UPDATE schema_migrations SET version=99 WHERE version=1')
             elif damage == 'index':
                 db.execute('DROP INDEX idx_issues_state')
             elif damage == 'trigger':
@@ -161,7 +161,7 @@ def test_group_origin_and_branches(store):
 
 def test_transaction_context_rolls_back(store):
     with pytest.raises(RuntimeError), store.transaction() as db:
-        db.execute("INSERT INTO schema_migrations VALUES (2,'test')")
+        db.execute("INSERT INTO schema_migrations VALUES (3,'test')")
         raise RuntimeError('rollback')
     with store.connection() as db:
-        assert db.execute('SELECT count(*) FROM schema_migrations').fetchone()[0] == 1
+        assert db.execute('SELECT count(*) FROM schema_migrations').fetchone()[0] == 2

@@ -252,7 +252,7 @@ def test_cleanup_locks_and_invalid_database(environment):
         with pytest.raises(AlreadyRunning):
             cleanup.orphans(apply=True)
     with store.connection() as db:
-        db.execute('UPDATE schema_migrations SET version=99')
+        db.execute('UPDATE schema_migrations SET version=99 WHERE version=1')
     with pytest.raises(Exception):
         cleanup.orphans(apply=True)
 
