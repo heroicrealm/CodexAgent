@@ -119,6 +119,7 @@ class Publisher:
         return next(p for p in self.config.projects if p.enabled and p.repository.lower() == issue['repository'].lower())
 
     def output(self, issue_id, body):
+        self.storage.admit(issue_id)
         with self._output_lock:
             issue = self.storage.issue(issue_id)
             if issue['output_body'] == OUTPUT_MARKER + '\n' + body:
@@ -139,6 +140,7 @@ class Publisher:
 
     def phase_output(self, issue_id):
         """Derive pending publication from existing SQLite facts; never read OUTPUT."""
+        self.storage.admit(issue_id)
         with self._output_lock:
             issue = self.storage.issue(issue_id)
             _, branch = self.storage.group_branches(issue_id)
@@ -190,6 +192,7 @@ class Publisher:
     def publish(self, execution_id):
         execution = self.storage.execution(execution_id)
         issue = self.storage.issue(execution['issue_id'])
+        self.storage.admit(issue['issue_id'])
         project = self.project(issue)
         if issue['state'] not in (State.RUNNING, State.ERROR, State.REVIEW, State.MANUAL_RUNNING):
             raise ValueError('Publication is not allowed in this state')
@@ -232,11 +235,14 @@ class Publisher:
             return self._send_final_error_report(issue_id)
 
     def _send_final_error_report(self, issue_id):
+        self.storage.admit(issue_id)
         issue = self.storage.issue(issue_id)
         if issue['error_report_sent']:
             return False
-        errors = self.storage.rows('SELECT id,execution_id,error_stage,error_code FROM error_log '
-                                   'WHERE issue_id=? ORDER BY id', (issue_id,))
+        errors = self.storage.rows('SELECT l.id,l.execution_id,l.error_stage,l.error_code FROM error_log l '
+                                   'WHERE l.issue_id=? AND NOT EXISTS (SELECT 1 FROM recovery_execution_archive a, '
+                                   'json_each(a.related_diagnostics) d WHERE a.issue_id=l.issue_id '
+                                   "AND json_extract(d.value,'$.id')=l.id) ORDER BY l.id", (issue_id,))
         attempts = [r for r in errors if r['error_code'] in
                     ('error_report_attempt', 'error_report_rejected', 'error_report_uncertain')]
         if attempts and attempts[-1]['error_code'] != 'error_report_rejected':
@@ -269,6 +275,7 @@ class Publisher:
     def fail(self, execution_id, code='execution_failed', exc=None, stage=None):
         execution = self.storage.execution(execution_id)
         issue = self.storage.issue(execution['issue_id'])
+        self.storage.admit(issue['issue_id'])
         stage = stage or code.split('_')[0]
         exc = exc or OperationError('Execution interrupted; original exception unavailable')
         diagnostic_code = getattr(exc, 'code', None) or code
@@ -299,6 +306,8 @@ class Publisher:
 
     def reconcile(self, project):
         for issue in self.storage.rows('SELECT * FROM issues WHERE lower(repository)=? AND is_virtual=0', (project.repository.lower(),)):
+            if self.storage.blocked(issue['issue_id']):
+                continue
             if issue['approved_at']:
                 try:
                     self.phase_output(issue['issue_id'])
@@ -321,6 +330,7 @@ class Executor:
     def prepare(self, execution_id):
         execution = self.storage.execution(execution_id)
         issue = self.storage.issue(execution['issue_id'])
+        self.storage.admit(issue['issue_id'])
         if self.runner.cancelled.is_set():
             raise RuntimeError('Execution interrupted')
         if issue['state'] != State.PREPARING or execution['codex_started_at']:
@@ -350,6 +360,7 @@ class Executor:
     def run_once(self, execution_id):
         execution = self.storage.execution(execution_id)
         issue = self.storage.issue(execution['issue_id'])
+        self.storage.admit(issue['issue_id'])
         if execution['codex_started_at']:
             raise ValueError('Codex attempt already consumed')
         if issue['state'] != State.PREPARING or not execution['worktree_path']:
@@ -398,7 +409,10 @@ class Executor:
         # Runtime lock must be held: no old Codex process may remain alive.
         for execution in self.storage.rows("SELECT e.* FROM executions e JOIN issues i ON i.issue_id=e.issue_id "
                                             "WHERE i.state IN ('preparing','running')"):
+            if self.storage.blocked(execution['issue_id']):
+                continue
             issue = self.storage.issue(execution['issue_id'])
+            self.storage.admit(issue['issue_id'])
             if not any(p.enabled and p.repository.lower() == issue['repository'].lower() for p in self.config.projects):
                 continue
             project = self.publisher.project(issue)

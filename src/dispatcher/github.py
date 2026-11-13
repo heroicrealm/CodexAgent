@@ -95,6 +95,9 @@ class GitHubAdapter:
     def issue(self, project: Project, number: int, poll_id=None):
         value = self.request('GET', f'repos/{project.repository}/issues/{number}', poll_id=poll_id,
                              route='/repos/{owner}/{repo}/issues/{number}')
+        repository = value.get('repository_url', '').split('/repos/')[-1]
+        if repository and repository.casefold() != project.repository.casefold():
+            raise ValueError('GitHub repository identity mismatch')
         if 'pull_request' in value:
             raise ValueError('correction_for must reference an Issue, not a PR')
         return self.issue_observation(value, project.repository)

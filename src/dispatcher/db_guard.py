@@ -8,12 +8,41 @@ import tempfile
 import uuid
 from .storage import SchemaError, _validate
 
-META = '''CREATE TABLE dispatcher_metadata (
+META_V1 = '''CREATE TABLE dispatcher_metadata (
     singleton INTEGER PRIMARY KEY CHECK(singleton=1),
     format_version INTEGER NOT NULL CHECK(format_version=1),
     instance_id TEXT NOT NULL,
     recovery_required INTEGER NOT NULL CHECK(recovery_required IN (0,1))
 )'''
+
+
+def metadata_ddl(version):
+    return META_V1.replace('format_version=1', f'format_version={version}')
+
+
+META = metadata_ddl(2)
+
+
+def migrate(db):
+    """Caller owns a transaction; executescript would implicitly commit."""
+    if validate(db)[1] == 2:
+        return
+    from importlib.resources import files
+    statement = ''
+    for line in files('dispatcher').joinpath('recovery_schema.sql').read_text().splitlines(True):
+        statement += line
+        if sqlite3.complete_statement(statement):
+            db.execute(statement)
+            statement = ''
+    if statement.strip():
+        raise SchemaError('Incomplete migration DDL')
+    db.execute('ALTER TABLE dispatcher_metadata RENAME TO old_metadata')
+    db.execute(META)
+    db.execute('INSERT INTO dispatcher_metadata SELECT singleton,2,instance_id,recovery_required FROM old_metadata')
+    db.execute('DROP TABLE old_metadata')
+    from .models import utc_now
+    db.execute('INSERT INTO schema_migrations VALUES (2,?)', (utc_now(),))
+    validate(db)
 
 
 @contextmanager
@@ -84,11 +113,21 @@ def validate(db, *, legacy=False):
     ):
         if db.execute(query).fetchone():
             raise SchemaError('Logical inconsistency: repository or execution identity')
+    if db.execute('SELECT max(version) FROM schema_migrations').fetchone()[0] == 2:
+        for table in ('recovery_execution_archive', 'recovery_approval_reset'):
+            if db.execute('SELECT 1 FROM ' + table + ' a JOIN recovery_operations o '
+                          'ON o.operation_id=a.operation_id WHERE a.issue_id<>o.issue_id').fetchone():
+                raise SchemaError('Recovery operation identity mismatch')
+        if db.execute("SELECT 1 FROM recovery_operations o WHERE phase<>'completed' AND NOT EXISTS "
+                      "(SELECT 1 FROM recovery_quarantine q WHERE q.issue_id=o.issue_id)").fetchone():
+            raise SchemaError('Active recovery operation has no quarantine')
     if legacy:
         return None
     rows = db.execute('SELECT singleton,format_version,instance_id,recovery_required FROM dispatcher_metadata').fetchall()
-    if len(rows) != 1 or rows[0][0:2] != (1, 1) or rows[0][3] not in (0, 1):
+    if len(rows) != 1 or (rows[0][0] != 1 or rows[0][1] not in (1, 2)) or rows[0][3] not in (0, 1):
         raise SchemaError('Invalid dispatcher metadata')
+    if rows[0][1] != db.execute('SELECT max(version) FROM schema_migrations').fetchone()[0]:
+        raise SchemaError('Metadata and migration version mismatch')
     try:
         uuid.UUID(rows[0][2])
     except (ValueError, TypeError) as exc:
@@ -108,6 +147,8 @@ def check(config, *, execution=False, path=None):
             or not identity.is_file() or identity.stat().st_mode & 0o077
             or identity.read_text().strip() != meta[2]):
         raise SchemaError('Workspace identity mismatch; inspect configuration or use db bind')
+    if execution and meta[1] != 2:
+        raise SchemaError('Explicit db upgrade required')
     if execution and meta[3]:
         raise SchemaError('Recovery admission blocked: external reconciliation required (V2.4.2)')
     return meta
@@ -124,7 +165,7 @@ def bind(config, identity):
         os.fsync(stream.fileno())
 
 
-def backup(source, destination):
+def backup(source, destination, *, private_source=False):
     source = safe_path(source)
     destination = Path(destination).absolute()
     if any(p.is_symlink() for p in destination.parents):
@@ -132,7 +173,15 @@ def backup(source, destination):
     fd = os.open(destination, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     os.close(fd)
     try:
-        with connection(source.as_uri() + '?mode=ro', uri=True) as src:
+        # A read-only WAL connection cannot perform last-client WAL cleanup,
+        # even when it created the sidecars itself. Let SQLite's writable close
+        # acquire the required locks and clean up only when no clients remain.
+        # Never issue a checkpoint or delete shared sidecars ourselves.
+        # Restore inputs must instead be read solely through a private copy
+        # (including WAL); immutable=1 would silently ignore committed WAL data.
+        reader = (inspection(source) if private_source else
+                  connection(source.as_uri() + '?mode=rw', uri=True))
+        with reader as src:
             with connection(destination) as dst:
                 src.backup(dst)
                 # Both legacy and registered snapshots are supported.
@@ -169,7 +218,7 @@ def maintain(config, command, argument=None):
             with connection(config.database) as db:
                 db.execute('BEGIN IMMEDIATE')
                 db.execute(META)
-                db.execute('INSERT INTO dispatcher_metadata VALUES (1,1,?,0)', (identity,))
+                db.execute('INSERT INTO dispatcher_metadata VALUES (1,2,?,0)', (identity,))
                 bind(config, identity)
         elif command == 'register':
             with inspection(config.database) as db:
@@ -180,42 +229,51 @@ def maintain(config, command, argument=None):
             identity = str(uuid.uuid4())
             with connection(config.database) as db:
                 db.execute('BEGIN IMMEDIATE')
-                db.execute(META)
-                db.execute('INSERT INTO dispatcher_metadata VALUES (1,1,?,0)', (identity,))
+                version = db.execute('SELECT max(version) FROM schema_migrations').fetchone()[0]
+                db.execute(metadata_ddl(version))
+                db.execute('INSERT INTO dispatcher_metadata VALUES (1,?,?,0)', (version, identity))
+                migrate(db)
                 bind(config, identity)
         elif command == 'bind':
             with inspection(config.database) as db:
                 meta = validate(db)
             bind(config, meta[2])
+        elif command == 'upgrade':
+            meta = check(config)
+            quiescent(config)
+            if meta[1] == 2:
+                return 'PASS upgrade; already current'
+            backup(config.database, config.database.with_name(config.database.name + '.before-upgrade-' + uuid.uuid4().hex))
+            with connection(config.database) as db:
+                db.execute('PRAGMA foreign_keys=ON')
+                db.execute('BEGIN IMMEDIATE')
+                migrate(db)
         elif command == 'restore':
             check(config)
             check(config, path=argument)
-            # Existing unknown or corrupt state cannot prove executor quiescence.
-            # Fail closed rather than guessing whether an external executor lives.
+            # Pre-launch reservations are historical, not live process evidence.
+            # Launched executions lack durable proof of supervisor/child shutdown.
             with inspection(config.database) as db:
                 validate(db)
-                if db.execute("SELECT 1 FROM executions WHERE status IN ('reserved','preparing','executing','publishing')").fetchone():
-                    raise SchemaError('Executor stop cannot be proven; restore refused')
-            if (config.workspace / '.control.sock').exists():
-                raise SchemaError('Control socket exists; verify service shutdown')
+                if db.execute("SELECT 1 FROM executions WHERE "
+                              "(status IN ('reserved','preparing') AND codex_started_at IS NOT NULL) "
+                              "OR status IN ('executing','publishing')").fetchone():
+                    raise SchemaError('Executor stop cannot be proven for launched execution; '
+                                      'durable shutdown evidence unavailable; restore refused')
+            quiescent(config)
             path = safe_path(config.database)
-            for suffix in ('-wal', '-shm'):
-                if Path(str(path) + suffix).exists():
-                    raise SchemaError('Working WAL/SHM present; checkpoint after shutdown before restore')
             old = path.with_name(path.name + '.before-restore-' + uuid.uuid4().hex)
             backup(path, old)
-            # A read-only Backup API connection to a WAL-mode main file may
-            # create empty sidecars. No pre-existing sidecar was allowed above.
-            wal = Path(str(path) + '-wal')
-            if wal.exists() and wal.stat().st_size:
-                raise SchemaError('WAL appeared during archival; restore refused')
-            for suffix in ('-wal', '-shm'):
-                Path(str(path) + suffix).unlink(missing_ok=True)
+            # Fail closed if another client appeared during archival or SQLite
+            # could not clean up. Never delete another connection's sidecars.
+            quiescent(config)
             staging_area = tempfile.mkdtemp(prefix='.restore-', dir=path.parent)
             staging = Path(staging_area) / 'db'
             try:
-                backup(argument, staging)
+                backup(argument, staging, private_source=True)
                 with connection(staging) as db:
+                    db.execute('BEGIN IMMEDIATE')
+                    migrate(db)
                     db.execute('UPDATE dispatcher_metadata SET recovery_required=1')
                 check(config, path=staging)
                 with open(staging, 'rb') as stream:
@@ -231,3 +289,14 @@ def maintain(config, command, argument=None):
         else:
             raise SchemaError('Unknown maintenance command')
     return 'PASS ' + command + ('; recovery admission BLOCKED' if command == 'restore' else '')
+
+
+def quiescent(config):
+    """Inherited locks exclude managed children; never guess liveness from PIDs."""
+    control = config.workspace / '.control.sock'
+    if control.exists() or control.is_symlink():
+        raise SchemaError('Control socket exists; verify service shutdown')
+    path = safe_path(config.database)
+    for suffix in ('-wal', '-shm'):
+        if Path(str(path) + suffix).exists():
+            raise SchemaError('Working WAL/SHM present; checkpoint after shutdown')

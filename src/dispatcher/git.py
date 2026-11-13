@@ -134,7 +134,15 @@ class Git:
         return bool(confirmed and self.run(path, 'rev-parse', 'HEAD') != confirmed)
 
     def worktrees(self, project):
-        raw = self.run(self.checkout(project, create=False), 'worktree', 'list', '--porcelain', '-z')
+        # Preserve machine-format delimiters and path whitespace verbatim.
+        result = self.run(self.checkout(project, create=False), 'worktree', 'list',
+                          '--porcelain', '-z', check=False)
+        if result.returncode:
+            raise GitError('Worktree enumeration failed', returncode=result.returncode,
+                           operation='git.worktree', code='git_worktree_failed')
+        raw = result.stdout
+        if not raw.endswith('\0\0'):
+            raise GitError('Incomplete worktree enumeration')
         entries, current = [], {}
         for item in raw.split('\0'):
             if not item:
@@ -143,9 +151,16 @@ class Git:
                     current = {}
             else:
                 key, _, value = item.partition(' ')
+                if key in current:
+                    raise GitError('Ambiguous worktree enumeration')
                 current[key] = value
         if current:
             entries.append(current)
+        paths = [entry.get('worktree') for entry in entries]
+        if (not entries or any(not path or not Path(path).is_absolute() for path in paths)
+                or len(set(paths)) != len(paths)
+                or any(not entry.get('HEAD') and 'bare' not in entry for entry in entries)):
+            raise GitError('Ambiguous worktree enumeration')
         return entries
 
     def safe_worktree(self, project, path, *, refresh=True):
@@ -192,3 +207,60 @@ class Git:
             raise GitError('Branch changed since the confirmed result; retained')
         # Conditional deletion refuses a concurrent change to the confirmed tip.
         self.run(checkout, 'push', 'origin', f'--force-with-lease=refs/heads/{branch}:{tip}', '--delete', branch)
+
+    def recovery_cleanup_plan(self, project, execution, local):
+        """Identify only the unique worktree created for this execution."""
+        if not execution or not execution['worktree_path']:
+            return None
+        path = Path(execution['worktree_path']).absolute()
+        if any(p.is_symlink() for p in (path, *path.parents)):
+            raise GitError('Symlink retry path refused')
+        area = self.area(project)
+        match = re.fullmatch(r'e-([0-9]+)-([0-9a-f]{32})', path.name)
+        if (not path.is_relative_to(area) or path.parent != area or not match or
+                int(match[1]) != execution['execution_id']):
+            raise GitError('Retry worktree ownership unproven')
+        branch = 'refs/heads/dispatcher-v2/' + path.name[2:]
+        if branch in local['remote']:
+            raise GitError('Internal execution branch was published')
+        tree = next((t for t in local['trees'][1:] if Path(t['worktree']).absolute() == path), None)
+        if tree:
+            if tree.get('branch') != branch or 'locked' in tree or 'prunable' in tree:
+                raise GitError('Retry worktree branch ownership unproven')
+            if tree['HEAD'] != execution['initial_commit']:
+                for tip in set(local['remote'].values()):
+                    result = self.run(path, 'merge-base', '--is-ancestor', tree['HEAD'], tip, check=False)
+                    if result.returncode != 1:
+                        raise GitError('Remote reachability is present or uncertain')
+            return {'path': str(path), 'branch': branch, 'head': tree['HEAD']}
+        if path.exists():
+            raise GitError('Unregistered retry worktree retained')
+        refs = dict(line.split() for line in local['refs'].splitlines())
+        if branch in refs:
+            return {'path': str(path), 'branch': branch, 'head': refs[branch]}
+        return None
+
+    def recovery_remove(self, project, plan):
+        if not plan:
+            return
+        checkout = self.checkout(project, create=False)
+        path, branch = Path(plan['path']), plan['branch']
+        trees = self.worktrees(project)
+        tree = next((t for t in trees if Path(t['worktree']).absolute() == path), None)
+        if tree:
+            if (tree is trees[0] or tree.get('branch') != branch or tree.get('HEAD') != plan['head']
+                    or 'locked' in tree or 'prunable' in tree
+                    or any(p.is_symlink() for p in (path, *path.parents))):
+                raise GitError('Retry cleanup identity changed')
+            # Explicit administrative discard of this owned worktree, including dirty files.
+            self.run(checkout, 'worktree', 'remove', '--force', str(path))
+        elif path.exists():
+            raise GitError('Retry path is no longer a registered worktree')
+        if any(t.get('branch') == branch for t in self.worktrees(project)):
+            raise GitError('Retry branch is used elsewhere')
+        ref = self.run(checkout, 'show-ref', '--verify', '--hash', branch, check=False)
+        if ref.returncode == 0:
+            if ref.stdout.strip() != plan['head']:
+                raise GitError('Retry branch changed')
+            # Compare-and-delete only this exclusively local internal ref.
+            self.run(checkout, 'update-ref', '-d', branch, plan['head'])

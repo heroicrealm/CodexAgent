@@ -66,7 +66,7 @@ def test_invalid_unchanged(config, tmp_path, damage):
     else:
         with connection(config.database) as db:
             if damage == 'version':
-                db.execute('UPDATE schema_migrations SET version=99')
+                db.execute('UPDATE schema_migrations SET version=99 WHERE version=1')
             elif damage == 'index':
                 db.execute('DROP INDEX idx_issues_state')
             else:
@@ -256,3 +256,234 @@ def test_cli_missing_check_exit_and_no_files(tmp_path, monkeypatch, capsys):
     assert result.value.code == 1
     assert 'FAIL' in capsys.readouterr().err
     assert tree(tmp_path) == before
+
+
+@pytest.mark.parametrize('status', ['reserved', 'preparing'])
+def test_restore_stopped_prelaunch_history(config, tmp_path, status):
+    maintain(config, 'bootstrap')
+    snapshot = tmp_path / 'snapshot'
+    maintain(config, 'backup', snapshot)
+    store = Storage(config.database)
+    store.register_issue(IssueObservation(1, 'owner/repo', 1, 'x'), 'p')
+    with store.transaction() as db:
+        db.execute("UPDATE issues SET state='preparing' WHERE issue_id=1")
+        db.execute('INSERT INTO executions(issue_id,status,started_at) VALUES(1,?,?)', (status, 'now'))
+    artifact = config.workspace / 'retained-result'
+    artifact.write_text('unpublished')
+    for _ in range(2):
+        assert 'BLOCKED' in maintain(config, 'restore', snapshot)
+        assert check(config)[3] == 1
+        assert artifact.read_text() == 'unpublished'
+    archives = list(tmp_path.glob('db.before-restore-*'))
+    assert len(archives) == 2
+    assert any(_archived_status(p) == status for p in archives)
+
+
+def _archived_status(path):
+    with inspection(path) as db:
+        row = db.execute('SELECT status FROM executions').fetchone()
+        return row[0] if row else None
+
+
+@pytest.mark.parametrize('status', ['preparing', 'executing', 'publishing'])
+def test_restore_unknown_launched_executor_preserves_db(config, tmp_path, status):
+    maintain(config, 'bootstrap')
+    snapshot = tmp_path / 'snapshot'
+    maintain(config, 'backup', snapshot)
+    store = Storage(config.database)
+    store.register_issue(IssueObservation(1, 'owner/repo', 1, 'x'), 'p')
+    with store.transaction() as db:
+        db.execute("INSERT INTO executions(issue_id,status,started_at,codex_started_at) VALUES(1,?,'now','now')", (status,))
+    before = config.database.read_bytes()
+    with pytest.raises(SchemaError, match='stop'):
+        maintain(config, 'restore', snapshot)
+    assert config.database.read_bytes() == before
+    assert not list(tmp_path.glob('db.before-restore-*'))
+
+
+def test_restore_dangling_control_socket_refused(config, tmp_path):
+    maintain(config, 'bootstrap')
+    snapshot = tmp_path / 'snapshot'
+    maintain(config, 'backup', snapshot)
+    (config.workspace / '.control.sock').symlink_to(tmp_path / 'absent')
+    before = config.database.read_bytes()
+    with pytest.raises(SchemaError, match='socket'):
+        maintain(config, 'restore', snapshot)
+    assert config.database.read_bytes() == before
+
+
+def test_restore_inherited_worker_lock(config, tmp_path):
+    import subprocess
+    import sys
+    maintain(config, 'bootstrap')
+    snapshot = tmp_path / 'snapshot'
+    maintain(config, 'backup', snapshot)
+    with InstanceLock(config) as lock:
+        child = subprocess.Popen([sys.executable, '-c', 'import sys; sys.stdin.read()'],
+                                 stdin=subprocess.PIPE, pass_fds=lock.fds)
+    try:
+        before = config.database.read_bytes()
+        with pytest.raises(AlreadyRunning):
+            maintain(config, 'restore', snapshot)
+        assert config.database.read_bytes() == before
+    finally:
+        child.communicate(timeout=5)
+
+
+def assert_no_sidecars(path):
+    assert not Path(str(path) + '-wal').exists()
+    assert not Path(str(path) + '-shm').exists()
+
+
+def test_offline_wal_backup_restore_without_checkpoint(config, tmp_path):
+    maintain(config, 'bootstrap')
+    with connection(config.database) as db:
+        assert db.execute('PRAGMA journal_mode=WAL').fetchone() == ('wal',)
+    assert_no_sidecars(config.database)
+    for number in range(2):
+        snapshot = tmp_path / f'snapshot-{number}'
+        assert maintain(config, 'backup', snapshot) == 'PASS backup verified'
+        assert_no_sidecars(config.database)
+        assert_no_sidecars(snapshot)
+        before = tree(tmp_path)
+        # check() must not write into the backup directory either.
+        check(config, path=snapshot)
+        assert tree(tmp_path) == before
+        contents = snapshot.read_bytes()
+        assert 'BLOCKED' in maintain(config, 'restore', snapshot)
+        assert snapshot.read_bytes() == contents
+        assert_no_sidecars(snapshot)
+        assert_no_sidecars(config.database)
+        assert check(config)[3] == 1
+        for archive in tmp_path.glob('db.before-restore-*'):
+            assert_no_sidecars(archive)
+            with inspection(archive) as db:
+                validate(db)
+
+
+def test_readonly_wal_close_reproduction(tmp_path):
+    """A closed connection can leave sidecars; writable SQLite close owns cleanup."""
+    path = tmp_path / 'wal-db'
+    with connection(path) as db:
+        db.execute('PRAGMA journal_mode=WAL')
+        db.execute('CREATE TABLE example(value)')
+    assert_no_sidecars(path)
+    with connection(path.as_uri() + '?mode=ro', uri=True) as src:
+        with connection(':memory:') as dst:
+            src.backup(dst)
+    assert Path(str(path) + '-wal').stat().st_size == 0
+    assert Path(str(path) + '-shm').exists()
+    with connection(path.as_uri() + '?mode=rw', uri=True) as db:
+        db.execute('SELECT * FROM example').fetchall()
+    assert_no_sidecars(path)
+
+
+def test_online_backup_preserves_wal_and_uncommitted_transaction(config, tmp_path):
+    maintain(config, 'bootstrap')
+    with connection(config.database) as writer:
+        writer.execute('PRAGMA journal_mode=WAL')
+        writer.execute('PRAGMA wal_autocheckpoint=0')
+        writer.execute("INSERT INTO debug_operations(created_at,level,component,operation,result) VALUES('now','api','test','committed','ok')")
+        writer.commit()
+        writer.execute("UPDATE debug_operations SET operation='uncommitted'")
+        sidecars = {suffix: Path(str(config.database) + suffix)
+                    for suffix in ('-wal', '-shm')}
+        wal_before = sidecars['-wal'].read_bytes()
+        inodes = {suffix: p.stat().st_ino for suffix, p in sidecars.items()}
+        snapshot = tmp_path / 'online'
+        maintain(config, 'backup', snapshot)
+        assert sidecars['-wal'].read_bytes() == wal_before
+        assert {suffix: p.stat().st_ino for suffix, p in sidecars.items()} == inodes
+        with inspection(snapshot) as db:
+            validate(db)
+            assert db.execute('SELECT operation FROM debug_operations').fetchall() == [('committed',)]
+        writer.commit()
+        assert writer.execute('SELECT operation FROM debug_operations').fetchall() == [('uncommitted',)]
+    assert_no_sidecars(config.database)
+
+
+def test_restore_backup_with_committed_wal_is_untouched(config, tmp_path):
+    maintain(config, 'bootstrap')
+    snapshot = tmp_path / 'snapshot'
+    maintain(config, 'backup', snapshot)
+    with connection(snapshot) as writer:
+        writer.execute('PRAGMA journal_mode=WAL')
+        writer.execute('PRAGMA wal_autocheckpoint=0')
+        writer.execute("INSERT INTO debug_operations(created_at,level,component,operation,result) VALUES('now','api','test','in-wal','ok')")
+        writer.commit()
+        before = {p.name: p.read_bytes() for p in tmp_path.glob('snapshot*')}
+        maintain(config, 'restore', snapshot)
+        assert {p.name: p.read_bytes() for p in tmp_path.glob('snapshot*')} == before
+        with inspection(config.database) as db:
+            assert db.execute('SELECT operation FROM debug_operations').fetchall() == [('in-wal',)]
+        assert_no_sidecars(config.database)
+
+
+@pytest.mark.parametrize('after_copy', [False, True])
+def test_restore_staging_failure_preserves_sources(config, tmp_path, monkeypatch, after_copy):
+    import dispatcher.db_guard as guard
+    maintain(config, 'bootstrap')
+    snapshot = tmp_path / 'snapshot'
+    maintain(config, 'backup', snapshot)
+    before = config.database.read_bytes(), snapshot.read_bytes()
+    original = guard.backup
+
+    def failing_backup(source, destination, **kwargs):
+        if kwargs.get('private_source'):
+            if after_copy:
+                original(source, destination, **kwargs)
+            raise OSError('staging failure')
+        return original(source, destination, **kwargs)
+
+    monkeypatch.setattr(guard, 'backup', failing_backup)
+    with pytest.raises(OSError, match='staging failure'):
+        maintain(config, 'restore', snapshot)
+    assert (config.database.read_bytes(), snapshot.read_bytes()) == before
+    assert not list(tmp_path.glob('.restore-*'))
+    assert list(tmp_path.glob('db.before-restore-*'))
+    assert_no_sidecars(config.database)
+    assert_no_sidecars(snapshot)
+
+
+def test_cli_wal_backup_restore_separate_processes(config, tmp_path):
+    import subprocess
+    import sys
+    maintain(config, 'bootstrap')
+    with connection(config.database) as db:
+        db.execute('PRAGMA journal_mode=WAL')
+    settings = tmp_path / 'config.yaml'
+    settings.write_text(f'dispatcher:\n  workspace: {config.workspace}\n  database: {config.database}\nprojects: []\n')
+    snapshot = tmp_path / 'cli-snapshot'
+    for command in ('backup', 'restore'):
+        result = subprocess.run(
+            [sys.executable, '-m', 'dispatcher', '--config', str(settings),
+             'db', command, str(snapshot)], capture_output=True, text=True,
+            env={**os.environ, 'PYTHONPATH': str(Path(__file__).resolve().parents[1] / 'src')},
+            timeout=15,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert 'PASS' in result.stdout
+        assert_no_sidecars(config.database)
+        assert_no_sidecars(snapshot)
+    assert check(config)[3] == 1
+
+
+def test_restore_sidecar_appearing_during_archive_is_preserved(config, tmp_path, monkeypatch):
+    import dispatcher.db_guard as guard
+    maintain(config, 'bootstrap')
+    snapshot = tmp_path / 'snapshot'
+    maintain(config, 'backup', snapshot)
+    before = config.database.read_bytes()
+    original = guard.backup
+    sidecar = Path(str(config.database) + '-wal')
+
+    def archive_with_new_sidecar(source, destination, **kwargs):
+        original(source, destination, **kwargs)
+        sidecar.touch()
+
+    monkeypatch.setattr(guard, 'backup', archive_with_new_sidecar)
+    with pytest.raises(SchemaError, match='WAL/SHM'):
+        maintain(config, 'restore', snapshot)
+    assert sidecar.exists()
+    assert config.database.read_bytes() == before
+    assert not list(tmp_path.glob('.restore-*'))
