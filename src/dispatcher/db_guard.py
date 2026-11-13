@@ -165,7 +165,7 @@ def bind(config, identity):
         os.fsync(stream.fileno())
 
 
-def backup(source, destination):
+def backup(source, destination, *, private_source=False):
     source = safe_path(source)
     destination = Path(destination).absolute()
     if any(p.is_symlink() for p in destination.parents):
@@ -173,7 +173,15 @@ def backup(source, destination):
     fd = os.open(destination, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     os.close(fd)
     try:
-        with connection(source.as_uri() + '?mode=ro', uri=True) as src:
+        # A read-only WAL connection cannot perform last-client WAL cleanup,
+        # even when it created the sidecars itself. Let SQLite's writable close
+        # acquire the required locks and clean up only when no clients remain.
+        # Never issue a checkpoint or delete shared sidecars ourselves.
+        # Restore inputs must instead be read solely through a private copy
+        # (including WAL); immutable=1 would silently ignore committed WAL data.
+        reader = (inspection(source) if private_source else
+                  connection(source.as_uri() + '?mode=rw', uri=True))
+        with reader as src:
             with connection(destination) as dst:
                 src.backup(dst)
                 # Both legacy and registered snapshots are supported.
@@ -256,17 +264,13 @@ def maintain(config, command, argument=None):
             path = safe_path(config.database)
             old = path.with_name(path.name + '.before-restore-' + uuid.uuid4().hex)
             backup(path, old)
-            # A read-only Backup API connection to a WAL-mode main file may
-            # create empty sidecars. No pre-existing sidecar was allowed above.
-            wal = Path(str(path) + '-wal')
-            if wal.exists() and wal.stat().st_size:
-                raise SchemaError('WAL appeared during archival; restore refused')
-            for suffix in ('-wal', '-shm'):
-                Path(str(path) + suffix).unlink(missing_ok=True)
+            # Fail closed if another client appeared during archival or SQLite
+            # could not clean up. Never delete another connection's sidecars.
+            quiescent(config)
             staging_area = tempfile.mkdtemp(prefix='.restore-', dir=path.parent)
             staging = Path(staging_area) / 'db'
             try:
-                backup(argument, staging)
+                backup(argument, staging, private_source=True)
                 with connection(staging) as db:
                     db.execute('BEGIN IMMEDIATE')
                     migrate(db)
