@@ -27,10 +27,12 @@ def main():
         maintenance.add_parser(name).add_argument('path', type=Path)
     recover = maintenance.add_parser('recover')
     recover.add_argument('--dry-run', action='store_true')
+    recover.add_argument('--json', action='store_true')
     recovery = maintenance.add_parser('recovery').add_subparsers(dest='recovery_command', required=True)
-    recovery.add_parser('status')
+    recovery.add_parser('status').add_argument('--json', action='store_true')
     for name in ('accept', 'retry', 'cancel'):
         sub = recovery.add_parser(name)
+        sub.add_argument('--json', action='store_true')
         sub.add_argument('project')
         sub.add_argument('issue', type=int)
     args = parser.parse_args()
@@ -53,9 +55,14 @@ def main():
                 else:
                     operation = service.command(args.recovery_command, args.project, args.issue)
                     status = service.status()
+                    target = next(o for o in status['operations'] if o['operation_id'] == operation)
                     result = {'operation_id': operation, 'recovery_required': status['recovery_required'],
-                              'quarantine': status['quarantine']}
-                print(json.dumps(result, ensure_ascii=False))
+                              'quarantine': status['quarantine'],
+                              **{k: target[k] for k in ('issue_id', 'repository', 'issue_number', 'action', 'phase')}}
+                from .recovery_output import render_recovery
+                admission = service.status() if args.db_command == 'recover' and not args.json else None
+                render_recovery(result, mode='recover' if args.db_command == 'recover' else args.recovery_command,
+                                as_json=args.json, dry_run=getattr(args, 'dry_run', False), status=admission)
             else:
                 print(maintain(config, args.db_command, getattr(args, 'path', None)))
         except (SchemaError, OSError, RuntimeError, ValueError, sqlite3.DatabaseError) as exc:

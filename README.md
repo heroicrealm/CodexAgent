@@ -125,6 +125,53 @@ Recovery-флаг сохраняется. Повторный upgrade безоп�
     codex-dispatcher --config config/dispatcher.yaml db recover
     codex-dispatcher --config config/dispatcher.yaml db recovery status
 
+Начиная с V2.4.2, эти recovery-команды по умолчанию показывают Rich-таблицы
+с repository и обычным номером Issue. Несколько причин карантина объединяются
+в одну строку Issue. Например (синтетические данные):
+
+```text
+╭──────────────────────────────────────────────────────────────────╮
+│ CODEX DISPATCHER · RECOVERY                                      │
+╰──────────────────────────────────────────────────────────────────╯
+Database version: 2
+Recovery required: NO
+Global admission: READY
+Quarantined issues: 1
+Unfinished operations: 0
+                       QUARANTINED ISSUES
+┏━━━━━━━━━━━━┳━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━┓
+┃ Repository ┃ Issue ┃ Reason(s)           ┃
+┡━━━━━━━━━━━━╇━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━┩
+│ owner/repo │ #7    │ execution-uncertain │
+│            │       │ local-worktree      │
+└────────────┴───────┴─────────────────────┘
+No recovery operations
+```
+
+`DRY RUN / NO CHANGES` обозначает только план; `RECOVERY APPLIED` — применение.
+Сводка показывает текущий глобальный допуск отдельно от индивидуального карантина:
+`Recovery required: NO` не означает отсутствие карантинных Issues. Пустые разделы
+явно показывают `No quarantined issues` и `No recovery operations`.
+При pipe/перенаправлении и `NO_COLOR=1` ANSI-коды отключены, длинные ячейки
+переносятся по ширине терминала.
+
+**Машинным потребителям обязательно добавить `--json`**: default-вывод изменён
+с JSON на таблицу. Каждая команда возвращает один JSON-документ без цветов;
+прежние поля и типы сохранены, добавлены `repository` и `issue_number` вместе
+с сохранённым глобальным `issue_id`. В результатах административных решений
+также доступны `action` и `phase`. Полные operation ID, comment ID и даты операций
+доступны в JSON статуса.
+
+    codex-dispatcher --config config/dispatcher.yaml db recover --dry-run --json
+    codex-dispatcher --config config/dispatcher.yaml db recover --json
+    codex-dispatcher --config config/dispatcher.yaml db recovery status --json
+    codex-dispatcher --config config/dispatcher.yaml db recovery accept PROJECT ISSUE --json
+    codex-dispatcher --config config/dispatcher.yaml db recovery retry PROJECT ISSUE --json
+    codex-dispatcher --config config/dispatcher.yaml db recovery cancel PROJECT ISSUE --json
+
+Зависимость `rich>=13` устанавливается стандартной командой `pip install -e .`
+(для тестов — `pip install -e '.[test]'`).
+
 Dry-run читает приватную SQLite-копию, GitHub и Git, не создаёт lock-файлы, не
 обновляет refs/index и не пишет в SQLite/GitHub. Настоящий recover полностью
 собирает открытые и зарегистрированные закрытые Issues, все PR, отношения,

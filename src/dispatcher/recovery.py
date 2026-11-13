@@ -147,10 +147,18 @@ class Recovery:
         if meta[1] != 2:
             return {'format_version': meta[1], 'recovery_required': bool(meta[3]),
                     'upgrade_required': True, 'quarantine': [], 'operations': []}
-        data = self.store.snapshot()
-        return {'format_version': meta[1], 'recovery_required': bool(meta[3]), 'quarantine': data['recovery_quarantine'],
-                'operations': [{k: v for k, v in o.items() if k != 'details'}
-                               for o in data['recovery_operations']]}
+        # Read-only joins restore Issue identity without GitHub or schema changes.
+        with inspection(self.config.database) as db:
+            db.row_factory = sqlite3.Row
+            quarantine = [dict(r) for r in db.execute(
+                'SELECT q.*,lower(i.repository) AS repository,i.issue_number '
+                'FROM recovery_quarantine q JOIN issues i ON i.issue_id=q.issue_id')]
+            operations = [dict(r) for r in db.execute(
+                'SELECT o.operation_id,o.issue_id,o.action,o.phase,o.started_at,o.updated_at,'
+                'o.github_comment_id,lower(i.repository) AS repository,i.issue_number '
+                'FROM recovery_operations o JOIN issues i ON i.issue_id=o.issue_id')]
+        return {'format_version': meta[1], 'recovery_required': bool(meta[3]),
+                'quarantine': quarantine, 'operations': operations}
 
     def local(self, project):
         """No fetch, clone, staging, index refresh or other Git mutations."""
@@ -402,7 +410,8 @@ class Recovery:
             plan = self.plan(data, facts)
             return data, facts, plan
         if dry_run:
-            return self.public_plan(analyze()[2])
+            data, facts, plan = analyze()
+            return self.public_plan(plan, data, facts)
         with InstanceLock(self.config):
             data, facts, plan = analyze()
             # Re-read critical external facts outside the committing transaction.
@@ -439,11 +448,18 @@ class Recovery:
                         target = 'pending' if groups.evaluate_db(db, row['issue_id']).eligible else 'awaiting-children'
                         self.store.transition(db, row, target)
                 db.execute('UPDATE dispatcher_metadata SET recovery_required=0')
-            return self.public_plan(plan)
+            return self.public_plan(plan, data, facts)
 
     @staticmethod
-    def public_plan(plan):
-        return [{'issue_id': p['issue_id'], 'reasons': p['reasons'], 'target': p['target']} for p in plan]
+    def public_plan(plan, data, facts):
+        identities = {i['issue_id']: i for i in data['issues']}
+        for external in facts.values():
+            if external:
+                for issue_id, details in external['issues'].items():
+                    identities.setdefault(issue_id, details['issue'])
+        return [{'issue_id': p['issue_id'], 'reasons': p['reasons'], 'target': p['target'],
+                 'repository': identities[p['issue_id']]['repository'].casefold(),
+                 'issue_number': identities[p['issue_id']]['issue_number']} for p in plan]
 
     def apply_result(self, db, issue, pr, target, operation=None):
         if pr:

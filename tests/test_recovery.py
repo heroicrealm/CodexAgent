@@ -201,7 +201,8 @@ def test_recover_dry_run_readonly_and_atomic_release(env):
     barrier(config)
     before = config.database.read_bytes()
     planned = service.recover(dry_run=True)
-    assert planned == [{'issue_id': 1, 'reasons': [], 'target': 'discovered'}]
+    assert planned == [{'issue_id': 1, 'reasons': [], 'target': 'discovered',
+                        'repository': 'owner/repo', 'issue_number': 1}]
     assert config.database.read_bytes() == before
     assert check(config)[3] == 1
     assert all(m == 'GET' for m, _ in http.calls)
@@ -706,7 +707,7 @@ def test_recover_cli_dry_run_and_status_do_not_construct_runtime(env, monkeypatc
     config_file.write_text('dispatcher:\n  workspace: workspace\n  database: db\nprojects: []\n')
     monkeypatch.setattr('dispatcher.__main__.Runtime', lambda *a: pytest.fail('runtime created'))
     monkeypatch.setattr('sys.argv', ['codex-dispatcher', '--config', str(config_file),
-                                   'db', 'recovery', 'status'])
+                                   'db', 'recovery', 'status', '--json'])
     from dispatcher.__main__ import main
     main()
     assert json.loads(capsys.readouterr().out)['format_version'] == 2
@@ -811,3 +812,37 @@ def test_incomplete_comment_pagination_keeps_global_barrier(env):
     assert check(config)[3] == 1
     assert not rows(config, 'SELECT * FROM recovery_sessions')
     assert not rows(config, 'SELECT * FROM recovery_events')
+
+
+def test_display_identity_uses_sqlite_and_new_github_observation(env):
+    config, store, http, gh, localgit, service = env
+    with store.transaction() as db:
+        db.execute('UPDATE issues SET issue_number=41 WHERE issue_id=1')
+    http.issues = {41: dict(http.issue(41), id=1), 42: dict(http.issue(42), id=987654321)}
+    planned = service.recover(dry_run=True)
+    assert [(p['issue_id'], p['repository'], p['issue_number']) for p in planned] == [
+        (1, 'owner/repo', 41), (987654321, 'owner/repo', 42)]
+    assert store.issue(987654321) is None
+    service.recover()
+    assert store.issue(987654321)['issue_number'] == 42
+
+
+def test_status_join_keeps_equal_numbers_in_distinct_repositories(env):
+    config, store, http, gh, localgit, service = env
+    store.register_issue(IssueObservation(987654321, 'Other/Repo', 1, 'Other issue'), 'other')
+    quarantine(config, issue_id=1)
+    quarantine(config, 'local-worktree', issue_id=1)
+    quarantine(config, issue_id=987654321)
+    with RecoveryStore(config).transaction() as db:
+        for op, issue_id, phase in [('first', 1, 'completed'), ('second', 987654321, 'archived')]:
+            db.execute('INSERT INTO recovery_operations VALUES (?,?,?,?,?,?,?,?)',
+                       (op, issue_id, 'retry', phase, 'before', 'after', None, '{}'))
+    before = config.database.read_bytes()
+    result = service.status()
+    assert not http.calls
+    assert config.database.read_bytes() == before
+    assert {(q['issue_id'], q['repository'], q['issue_number']) for q in result['quarantine']} == {
+        (1, 'owner/repo', 1), (987654321, 'other/repo', 1)}
+    assert [(o['issue_id'], o['repository'], o['issue_number'], o['phase']) for o in result['operations']] == [
+        (1, 'owner/repo', 1, 'completed'), (987654321, 'other/repo', 1, 'archived')]
+    assert all('details' not in o for o in result['operations'])
