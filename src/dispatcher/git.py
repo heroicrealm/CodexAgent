@@ -134,7 +134,15 @@ class Git:
         return bool(confirmed and self.run(path, 'rev-parse', 'HEAD') != confirmed)
 
     def worktrees(self, project):
-        raw = self.run(self.checkout(project, create=False), 'worktree', 'list', '--porcelain', '-z')
+        # Preserve machine-format delimiters and path whitespace verbatim.
+        result = self.run(self.checkout(project, create=False), 'worktree', 'list',
+                          '--porcelain', '-z', check=False)
+        if result.returncode:
+            raise GitError('Worktree enumeration failed', returncode=result.returncode,
+                           operation='git.worktree', code='git_worktree_failed')
+        raw = result.stdout
+        if not raw.endswith('\0\0'):
+            raise GitError('Incomplete worktree enumeration')
         entries, current = [], {}
         for item in raw.split('\0'):
             if not item:
@@ -143,9 +151,16 @@ class Git:
                     current = {}
             else:
                 key, _, value = item.partition(' ')
+                if key in current:
+                    raise GitError('Ambiguous worktree enumeration')
                 current[key] = value
         if current:
             entries.append(current)
+        paths = [entry.get('worktree') for entry in entries]
+        if (not entries or any(not path or not Path(path).is_absolute() for path in paths)
+                or len(set(paths)) != len(paths)
+                or any(not entry.get('HEAD') and 'bare' not in entry for entry in entries)):
+            raise GitError('Ambiguous worktree enumeration')
         return entries
 
     def safe_worktree(self, project, path, *, refresh=True):

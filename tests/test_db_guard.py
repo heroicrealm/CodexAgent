@@ -256,3 +256,75 @@ def test_cli_missing_check_exit_and_no_files(tmp_path, monkeypatch, capsys):
     assert result.value.code == 1
     assert 'FAIL' in capsys.readouterr().err
     assert tree(tmp_path) == before
+
+
+@pytest.mark.parametrize('status', ['reserved', 'preparing'])
+def test_restore_stopped_prelaunch_history(config, tmp_path, status):
+    maintain(config, 'bootstrap')
+    snapshot = tmp_path / 'snapshot'
+    maintain(config, 'backup', snapshot)
+    store = Storage(config.database)
+    store.register_issue(IssueObservation(1, 'owner/repo', 1, 'x'), 'p')
+    with store.transaction() as db:
+        db.execute("UPDATE issues SET state='preparing' WHERE issue_id=1")
+        db.execute('INSERT INTO executions(issue_id,status,started_at) VALUES(1,?,?)', (status, 'now'))
+    artifact = config.workspace / 'retained-result'
+    artifact.write_text('unpublished')
+    for _ in range(2):
+        assert 'BLOCKED' in maintain(config, 'restore', snapshot)
+        assert check(config)[3] == 1
+        assert artifact.read_text() == 'unpublished'
+    archives = list(tmp_path.glob('db.before-restore-*'))
+    assert len(archives) == 2
+    assert any(_archived_status(p) == status for p in archives)
+
+
+def _archived_status(path):
+    with inspection(path) as db:
+        row = db.execute('SELECT status FROM executions').fetchone()
+        return row[0] if row else None
+
+
+@pytest.mark.parametrize('status', ['preparing', 'executing', 'publishing'])
+def test_restore_unknown_launched_executor_preserves_db(config, tmp_path, status):
+    maintain(config, 'bootstrap')
+    snapshot = tmp_path / 'snapshot'
+    maintain(config, 'backup', snapshot)
+    store = Storage(config.database)
+    store.register_issue(IssueObservation(1, 'owner/repo', 1, 'x'), 'p')
+    with store.transaction() as db:
+        db.execute("INSERT INTO executions(issue_id,status,started_at,codex_started_at) VALUES(1,?,'now','now')", (status,))
+    before = config.database.read_bytes()
+    with pytest.raises(SchemaError, match='stop'):
+        maintain(config, 'restore', snapshot)
+    assert config.database.read_bytes() == before
+    assert not list(tmp_path.glob('db.before-restore-*'))
+
+
+def test_restore_dangling_control_socket_refused(config, tmp_path):
+    maintain(config, 'bootstrap')
+    snapshot = tmp_path / 'snapshot'
+    maintain(config, 'backup', snapshot)
+    (config.workspace / '.control.sock').symlink_to(tmp_path / 'absent')
+    before = config.database.read_bytes()
+    with pytest.raises(SchemaError, match='socket'):
+        maintain(config, 'restore', snapshot)
+    assert config.database.read_bytes() == before
+
+
+def test_restore_inherited_worker_lock(config, tmp_path):
+    import subprocess
+    import sys
+    maintain(config, 'bootstrap')
+    snapshot = tmp_path / 'snapshot'
+    maintain(config, 'backup', snapshot)
+    with InstanceLock(config) as lock:
+        child = subprocess.Popen([sys.executable, '-c', 'import sys; sys.stdin.read()'],
+                                 stdin=subprocess.PIPE, pass_fds=lock.fds)
+    try:
+        before = config.database.read_bytes()
+        with pytest.raises(AlreadyRunning):
+            maintain(config, 'restore', snapshot)
+        assert config.database.read_bytes() == before
+    finally:
+        child.communicate(timeout=5)

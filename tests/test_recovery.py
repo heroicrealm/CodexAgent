@@ -846,3 +846,127 @@ def test_status_join_keeps_equal_numbers_in_distinct_repositories(env):
     assert [(o['issue_id'], o['repository'], o['issue_number'], o['phase']) for o in result['operations']] == [
         (1, 'owner/repo', 1, 'completed'), (987654321, 'other/repo', 1, 'archived')]
     assert all('details' not in o for o in result['operations'])
+
+
+@pytest.mark.parametrize('count', [2, 3])
+def test_worktree_enumeration_raw_stability(env, count):
+    config, store, http, gh, adapter, service = env
+    project = config.projects[0]
+    paths = []
+    for number in range(1, count):
+        path, _ = adapter.prepare(project, number, 'main', 'unused')
+        (path / 'local-result').write_text('unpublished')
+        paths.append(str(path))
+    checkout = project.checkout
+    before = git('-C', checkout, 'for-each-ref')
+    registrations = checkout / '.git' / 'worktrees'
+    registered_before = {str(p): p.read_bytes() for p in registrations.rglob('*') if p.is_file()}
+    previous = None
+    for _ in range(12):
+        args = ['git', '-C', str(checkout), 'worktree', 'list', '--porcelain', '-z']
+        raw = subprocess.run(args, capture_output=True, check=True)
+        assert raw.stderr == b''
+        shell = subprocess.run(['bash', '--noprofile', '--norc', '-c', 'exec "$@"',
+                                'bash', *args], capture_output=True, check=True)
+        cwd = subprocess.run(['git', *args[3:]], cwd=checkout, capture_output=True, check=True)
+        assert shell.stdout == cwd.stdout == raw.stdout
+        assert shell.stderr == cwd.stderr == b''
+        assert raw.stdout.count(b'worktree ') == count
+        assert previous is None or previous == raw.stdout
+        previous = raw.stdout
+        command = adapter.command(args, 'worktree')
+        assert command.returncode == 0 and command.stderr == ''
+        assert command.stdout.encode() == raw.stdout
+        assert adapter.run(checkout, 'worktree', 'list', '--porcelain', '-z').encode() == raw.stdout
+        plain = subprocess.run(args[:-1], capture_output=True, check=True)
+        assert plain.stdout.count(b'worktree ') == count
+        listed = adapter.worktrees(project)
+        assert len(listed) == count
+        assert {t['worktree'] for t in listed[1:]} == set(paths)
+    assert git('-C', checkout, 'for-each-ref') == before
+    assert {str(p): p.read_bytes() for p in registrations.rglob('*') if p.is_file()} == registered_before
+    for path in paths:
+        assert (Path(path) / 'local-result').read_text() == 'unpublished'
+
+
+@pytest.mark.parametrize('damage', ['truncated', 'duplicate-field', 'duplicate-path', 'failure'])
+def test_worktree_ambiguous_enumeration_refused(env, monkeypatch, damage):
+    config, _, _, _, adapter, _ = env
+    path = str(config.projects[0].checkout)
+    record = f'worktree {path}\0HEAD {"a" * 40}\0branch refs/heads/main\0\0'
+    raw = {'truncated': record[:-1], 'duplicate-field': record.replace('HEAD ', 'HEAD x\0HEAD '),
+           'duplicate-path': record * 2, 'failure': record}[damage]
+    original = adapter.run
+    def run(directory, *args, **kwargs):
+        if args[:2] == ('worktree', 'list'):
+            return subprocess.CompletedProcess([], int(damage == 'failure'), raw, '')
+        return original(directory, *args, **kwargs)
+    monkeypatch.setattr(adapter, 'run', run)
+    with pytest.raises(GitError):
+        adapter.worktrees(config.projects[0])
+
+
+def test_restore_older_snapshot_unknown_worktree_keeps_barrier(env, tmp_path):
+    config, store, http, gh, adapter, service = env
+    snapshot = tmp_path / 'old-snapshot'
+    maintain(config, 'backup', snapshot)
+    path, sha = adapter.prepare(config.projects[0], 1, 'main', 'unused')
+    (path / 'unpublished').write_text('retain')
+    refs = git('-C', config.projects[0].checkout, 'for-each-ref')
+    with connection(config.database) as db:
+        assert db.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchone()[0] == 0
+    maintain(config, 'restore', snapshot)
+    calls = list(http.calls)
+    for _ in range(2):
+        with pytest.raises(SchemaError, match='Unknown worktree'):
+            service.recover()
+        assert check(config)[3] == 1
+        assert (path / 'unpublished').read_text() == 'retain'
+        assert git('-C', config.projects[0].checkout, 'for-each-ref') == refs
+        assert http.calls == calls
+
+
+@pytest.mark.parametrize('conflict', ['branch', 'locked', 'prunable', 'foreign', 'symlink', 'changed-head'])
+def test_cleanup_registration_conflicts_preserve_artifacts(env, conflict):
+    config, store, _, _, adapter, service = env
+    execution = dict(active(env))
+    project = config.projects[0]
+    path = Path(execution['worktree_path'])
+    local = service.local(project)
+    if conflict == 'changed-head':
+        plan = adapter.recovery_cleanup_plan(project, execution, local)
+        git('-C', path, 'add', '.')
+        git('-C', path, 'commit', '-m', 'changed after planning')
+        with pytest.raises(GitError, match='identity changed'):
+            adapter.recovery_remove(project, plan)
+    else:
+        if conflict == 'branch':
+            git('-C', path, 'switch', '-c', 'foreign')
+        elif conflict == 'locked':
+            git('-C', project.checkout, 'worktree', 'lock', path)
+        elif conflict == 'prunable':
+            moved = path.with_name('retained-directory')
+            path.rename(moved)
+        elif conflict == 'foreign':
+            execution['worktree_path'] = str(project.checkout)
+        elif conflict == 'symlink':
+            moved = path.with_name('retained-directory')
+            path.rename(moved)
+            path.symlink_to(moved, target_is_directory=True)
+        with pytest.raises((GitError, SchemaError)):
+            local = service.local(project)
+            adapter.recovery_cleanup_plan(project, execution, local)
+    retained = moved if conflict in ('prunable', 'symlink') else path
+    assert (retained / 'unfinished').read_text() == 'local work to discard'
+
+
+def test_cleanup_positive_unique_owned_dirty_worktree(env):
+    config, store, _, _, adapter, service = env
+    execution = active(env)
+    project = config.projects[0]
+    extra, _ = adapter.prepare(project, 2, 'main', 'unused')
+    (extra / 'retained').write_text('other work')
+    plan = adapter.recovery_cleanup_plan(project, execution, service.local(project))
+    adapter.recovery_remove(project, plan)
+    assert not Path(execution['worktree_path']).exists()
+    assert (extra / 'retained').read_text() == 'other work'

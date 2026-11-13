@@ -243,18 +243,17 @@ def maintain(config, command, argument=None):
         elif command == 'restore':
             check(config)
             check(config, path=argument)
-            # Existing unknown or corrupt state cannot prove executor quiescence.
-            # Fail closed rather than guessing whether an external executor lives.
+            # Pre-launch reservations are historical, not live process evidence.
+            # Launched executions lack durable proof of supervisor/child shutdown.
             with inspection(config.database) as db:
                 validate(db)
-                if db.execute("SELECT 1 FROM executions WHERE status IN ('reserved','preparing','executing','publishing')").fetchone():
-                    raise SchemaError('Executor stop cannot be proven; restore refused')
-            if (config.workspace / '.control.sock').exists():
-                raise SchemaError('Control socket exists; verify service shutdown')
+                if db.execute("SELECT 1 FROM executions WHERE "
+                              "(status IN ('reserved','preparing') AND codex_started_at IS NOT NULL) "
+                              "OR status IN ('executing','publishing')").fetchone():
+                    raise SchemaError('Executor stop cannot be proven for launched execution; '
+                                      'durable shutdown evidence unavailable; restore refused')
+            quiescent(config)
             path = safe_path(config.database)
-            for suffix in ('-wal', '-shm'):
-                if Path(str(path) + suffix).exists():
-                    raise SchemaError('Working WAL/SHM present; checkpoint after shutdown before restore')
             old = path.with_name(path.name + '.before-restore-' + uuid.uuid4().hex)
             backup(path, old)
             # A read-only Backup API connection to a WAL-mode main file may
