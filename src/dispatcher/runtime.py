@@ -84,7 +84,17 @@ class Runtime:
                 with ThreadPoolExecutor(max_workers=1) as pool:
                     future = None
                     next_poll = 0
+                    last_poll_at = next_poll_at = None
+                    published = 0
                     while not self.stopping or (future and not future.done()):
+                        if time.monotonic() - published >= 1:
+                            from .monitoring import publish_metadata
+                            try:
+                                publish_metadata(self.config, last_poll_at, next_poll_at)
+                            except OSError:
+                                # Monitoring is advisory and must not stop execution.
+                                pass
+                            published = time.monotonic()
                         if future and future.done():
                             future.result()
                             future = None
@@ -113,6 +123,9 @@ class Runtime:
                             self.logger.cleanup()
                             if not future:
                                 self.cleanup.known()
+                            from datetime import datetime, timezone, timedelta
+                            last_poll_at = datetime.now(timezone.utc).isoformat()
+                            next_poll_at = (datetime.now(timezone.utc) + timedelta(seconds=self.config.poll_interval)).isoformat()
                             next_poll = time.monotonic() + self.config.poll_interval
                             with self._gate:
                                 if poll_ok and not future and not self.stopping:

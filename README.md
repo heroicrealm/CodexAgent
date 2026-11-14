@@ -2,8 +2,111 @@
 
 Python 3.11+, установка: `pip install -e '.[test]'`.
 Конфигурация: `config/config.example.yaml`.
-Все команды принимают `--config /path/to/config.yaml` перед подкомандой.
+`--config /path/to/config.yaml` перед подкомандой необязателен. Без него используется
+абсолютный `$XDG_CONFIG_HOME/codex-dispatcher/config.yaml`, иначе
+`~/.config/codex-dispatcher/config.yaml`. CWD, репозиторий исходников и `/etc` не
+просматриваются. `worktree-cleanup` использует тот же resolver.
+Обязательный `dispatcher.root_path` — абсолютный каталог данных; относительные
+`database`, `workspace`, `project.checkout` отсчитываются от него. Старые конфиги
+нужно явно обновить; автоматической миграции путей нет.
 V1 не используется и не мигрируется.
+
+
+## CLI мониторинга и проектов V2.4.3
+
+```sh
+codex-dispatcher status                  # Rich; --json для одного JSON-документа
+codex-dispatcher queue --project Playground --state review
+codex-dispatcher queue --all --json      # также закрытые и архивные записи
+codex-dispatcher show Playground 123
+codex-dispatcher show Playground 123 -v  # Timeline, execution, diagnostics
+codex-dispatcher project list
+codex-dispatcher project show Playground
+codex-dispatcher project add Playground OWNER/REPOSITORY --base-branch main
+codex-dispatcher project disable Playground
+codex-dispatcher project enable Playground
+codex-dispatcher project remove Playground
+codex-dispatcher project remove Playground --dry-run
+```
+
+`show` принимает номер Issue внутри репозитория. `queue` по умолчанию показывает
+только открытые реальные Issue из конфигурации, группирует по project.id;
+`--state` выносит состояние в заголовок. Возраст вычисляется по фактическому
+переходу в `state_history`, а не по обновлениям poll. В JSON полные Title,
+идентификаторы, исходные timestamps и точный возраст в секундах; Rich обрезает
+длинные ячейки таблиц, но переносит полный текст финального ответа.
+
+Мониторинг читает проверенную приватную копию main+WAL, проверяет схему,
+целостность и UUID маркера, работает при Recovery barrier. Git, GitHub и poll
+не вызываются. Несогласованный снимок при конкурентной записи даёт отказ;
+повторите чтение. При повреждении БД `status` выводит диагностику и exit 1.
+
+RUNNING требует двух занятых instance locks, control socket и свежей (до 10 с)
+локальной `.monitor.json`, PID с совпадающим временем старта Linux `/proc` и UUID.
+Свободные locks и доказанное отсутствие живого daemon означают STOPPED, в том
+числе при подтверждённо устаревшем control socket после аварийного завершения;
+при неоднозначности — UNKNOWN.
+Долгий poll может временно давать UNKNOWN. Строка running/preparing в SQLite
+без этих свидетельств помечается unverified; manual-running не занимает слот.
+Last/Next poll доступны только при проверенных свежих данных daemon.
+
+`show` читает результат только из `workspace/results/<execution_id>.txt` текущего
+исполнения. Стандартный `codex exec` пишет в stdout финальный ответ; для `--json`
+JSONL выбирается последнее `item.completed` типа `agent_message`. Исходник не
+меняется, прежний OUTPUT не подставляется. Произвольные пользовательские форматы
+обёрток Codex CLI не разбираются автоматически.
+
+Только `project add` выполняет сетевые чтения: авторизованный `gh api GET /repos/...`
+и SSH `git ls-remote` тем же способом, что clone диспетчера. Настройте отдельно
+`gh auth login` и SSH-доступ Git. Ошибка API/сети/Git или явный запрет pull/push,
+archived/disabled repo, выключенные Issues запрещают add до изменения YAML.
+Непроверяемые без записи token-specific полномочия Issues/PR/labels дают WARN.
+Тестовые объекты GitHub не создаются.
+
+Изменения проектов атомарны (flock, проверка полного YAML, временный файл 0600,
+fsync, replace), сохраняют остальные параметры. Комментарии и форматирование YAML
+могут измениться. После любой изменяющей команды: **Restart dispatcher to apply
+changes**. Работающий daemon продолжает использовать прежнюю конфигурацию.
+Для новой установки создавайте конфиг и каталоги с ограниченными правами:
+
+```sh
+umask 077
+mkdir -p ~/.config/codex-dispatcher
+cp config/config.example.yaml ~/.config/codex-dispatcher/config.yaml
+# отредактируйте абсолютный root_path, затем db bootstrap
+```
+
+`project remove ID --dry-run` показывает проверенный локальный план,
+краткую Rich-карточку: количества строк, результатов, worktree/веток, checkout,
+диагностики и полные blockers, без внутренних rowid/хешей/metadata. Чтение не меняет SQLite/WAL/SHM,
+не создаёт lockfiles/backup и не обращается к GitHub. `Ready: YES` означает,
+что локальные проверки пройдены; destructive запуск требует остановленного daemon,
+свободных InstanceLock, DB Guard/Recovery admission и ввода полного ID в TTY.
+Проверенный stale `.control.sock` после crash не мешает удалению: нужны
+ECONNREFUSED, отсутствие живого kernel owner в `/proc/net/unix`, безопасный тип,
+владелец и стабильная идентичность socket, отсутствие противоречивого живого PID.
+Оба lock удерживаются до завершения; socket сохраняется, поэтому гонка не может
+привести к удалению нового socket сервера. Dry-run ничего не очищает.
+Неопределённость, listener, занятые/inherited lock, WAL/SHM и Recovery блокируют
+удаление. Общая защита `db restore` остаётся прежней: любой socket запрещён.
+
+`project remove ID` удаляет локальную историю, включая Recovery audit,
+результаты, принадлежащие проекту управляемые worktree и checkout. Общие Recovery
+summary очищаются выборочно. Неоднозначные ссылки/сиротские файлы, dirty или shared
+Git-ресурсы и внешний checkout блокируют операцию. GitHub не меняется; сетевых
+Git-команд в purge нет. Для сохранения истории используйте `project disable ID`, для возврата — `project enable ID`. `--force` отсутствует.
+
+Временный проверенный SQLite backup и приватный журнал находятся в
+`<root_path>/backups/purge/`. **После успеха оба автоматически удаляются. При
+ошибке сохраняются**, команда сообщает фазу и пути. Повторный запуск проверяет и
+показывает старые backup, не создавая новые: необходимо восстановление по журналу
+и штатная Recovery reconciliation. Исходный YAML сохранён в `original_config`.
+Не удаляйте failed backup: после восстановления явно перенесите файлы попытки в
+собственный архив вне `backups/purge`, затем повторите purge. Backup восстанавливает
+SQLite, а не удалённые результаты/Git checkout; файловые фазы сверяются с планом.
+Явные архивы `db backup` purge не удаляет. После успешного purge repository можно
+снова добавить. Подробности и ручные сценарии:
+[отчёт и сценарий V2.4.3.E](docs/v2.4.3e-implementation.md).
 
 Первый запуск:
 
@@ -39,8 +142,11 @@ UUID экземпляра хранится в dispatcher_metadata и `.dispatche
 существующий маркер команда не заменяет. Копия UUID не является защитой от намеренного
 клонирования установки. Не запускайте два клона одновременно.
 
-Проекты связываются по owner/name без учёта регистра. Переименование project.id,
-enabled: false, удаление и возвращение проекта не удаляют его данные. Runtime выбирает новые задачи
+Проекты связываются по owner/name без учёта регистра. Переименование project.id
+не поддерживается. `project disable` сохраняет историю, а `project remove ID`
+полностью удаляет локальные данные после точного подтверждения имени.
+`project add` отклоняет репозиторий с сохранённой локальной историей,
+но разрешает повторную регистрацию после успешного удаления. Runtime выбирает новые задачи
 только из текущих repositories и после успешного poll. Замена repository у прежнего
 id не переносит старые задачи. `project_id` в прежних строках остаётся историческим.
 
@@ -257,3 +363,6 @@ retry, accept и автоматическая сверка проверены р
 
 - [Отчёт о приёмке V2.4.2](docs/v2.4.2-acceptance-report.md)
 - [Анализ и исправление WAL/SHM](docs/v2.4.2-wal-shm-fix-report.md)
+
+В `show -v` поля Push/PR/Comment publication выводятся как Yes/No/N/A;
+нулевой exit code остаётся 0. `show --json` сохраняет исходные 1/0/null.

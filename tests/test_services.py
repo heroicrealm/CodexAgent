@@ -658,3 +658,34 @@ def test_repository_identity_survives_project_rename_and_return(app):
     assert poll.collect(other).prs == ()
     assert scheduler.next(repositories={'owner/different'}) is None
     assert scheduler.next(repositories={'owner/new'}).issue_id == 1
+
+
+@pytest.mark.parametrize('terminal', ['done', 'cancelled'])
+def test_close_sync_and_crash_retry(app, terminal, monkeypatch):
+    config, store, api, gh, groups, state, publisher, poll = app
+    for number in (1, 2):
+        api.issues[number] = issue(number)
+        store.register_issue(IssueObservation(number, 'owner/new', number, f'Task {number}'), 'p')
+    with store.transaction() as db:
+        db.execute('UPDATE issues SET state=?', (terminal,))
+    original = gh.close_issue
+    def interrupted(*args):
+        original(*args)
+        raise RuntimeError('crash after remote success')
+    monkeypatch.setattr(gh, 'close_issue', interrupted)
+    with pytest.raises(RuntimeError):
+        publisher.reconcile(config.projects[0])
+    assert api.issues[1]['state'] == 'closed'
+    assert store.issue(1)['github_state'] == 'open'
+    monkeypatch.setattr(gh, 'close_issue', original)
+    api.fail = lambda method, endpoint, payload: method == 'PATCH'
+    with pytest.raises(GitHubError):
+        publisher.reconcile(config.projects[0])
+    assert store.issue(1)['github_state'] == 'open'
+    api.fail = None
+    publisher.reconcile(config.projects[0])
+    assert all(store.issue(n)['github_state'] == 'closed' for n in (1, 2))
+    before = len(api.calls)
+    publisher.reconcile(config.projects[0])
+    assert len(api.calls) == before
+    assert not store.rows("SELECT * FROM issues WHERE github_state='open'")
