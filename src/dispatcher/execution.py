@@ -317,6 +317,8 @@ class Publisher:
             if issue['state'] in (State.DONE, State.CANCELLED) and issue['issue_id'] not in self._closed:
                 self.github.sync_labels(project, issue['issue_number'], issue['state'])
                 self.github.close_issue(project, issue['issue_number'], issue['state'])
+                with self.storage.connection() as db:
+                    db.execute("UPDATE issues SET github_state='closed' WHERE issue_id=?", (issue['issue_id'],))
                 self._closed.add(issue['issue_id'])
             elif issue['state'] == State.ERROR:
                 self.send_final_error_report(issue['issue_id'])

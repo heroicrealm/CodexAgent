@@ -70,6 +70,9 @@ def validate_remote(repository, transport=None, run=None):
 
 
 def mutate(path, action, name, *, repository=None, base_branch='main', checkout=None):
+    if action == 'remove':
+        from .purge import execute
+        return execute(load_config(path), name, path)
     warning = None
     with edit(path) as (config, data):
         entries = data.setdefault('projects', [])
@@ -90,10 +93,7 @@ def mutate(path, action, name, *, repository=None, base_branch='main', checkout=
         else:
             project(config, name)
             entry = next(e for e in entries if e['id'] == name)
-            if action == 'remove':
-                entries.remove(entry)
-            else:
-                entry['enabled'] = action == 'enable'
+            entry['enabled'] = action == 'enable'
     return warning
 
 

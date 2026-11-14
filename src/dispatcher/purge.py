@@ -468,8 +468,13 @@ def execute(config, name, config_path, *, stdin=None, output=print, checkpoint=l
         raise ValueError('Purge refused: ' + '; '.join(initial['blockers']))
     if not stdin.isatty():
         raise ValueError('Purge requires an interactive terminal')
+    output(f'Project: {name}\nRepository: {project(config, name).repository}\nWARNING: irreversible deletion of ALL local project data; GitHub is unchanged.')
     output(f'Type full project.id ({name}) to permanently purge local history:')
-    if stdin.readline().rstrip('\r\n') != name:
+    try:
+        confirmation = stdin.readline().rstrip('\r\n')
+    except KeyboardInterrupt:
+        raise ValueError('Removal cancelled') from None
+    if confirmation != name:
         raise ValueError('Purge confirmation mismatch')
     backup = None
     journal = journal_path(config, name)

@@ -30,11 +30,19 @@ def main():
     projects = commands.add_parser('project').add_subparsers(dest='project_command', required=True)
     projects.add_parser('list')
     for action in ('show', 'enable', 'disable', 'remove', 'add'):
-        sub = projects.add_parser(action)
+        descriptions = {
+            'remove': 'Permanently delete ALL local project data; exact ID confirmation required',
+            'disable': 'Pause servicing and preserve all history',
+            'enable': 'Resume servicing',
+        }
+        sub = projects.add_parser(
+            action, help=descriptions.get(action),
+            description=('Permanently delete ALL local project data. GitHub is unchanged. '
+                         'Requires stopped daemon and exact project ID in a terminal.')
+            if action == 'remove' else None)
         sub.add_argument('project')
         if action == 'remove':
-            sub.add_argument('--purge', action='store_true')
-            sub.add_argument('--dry-run', action='store_true')
+            sub.add_argument('--dry-run', action='store_true', help='Show verified plan without any changes')
         if action == 'add':
             sub.add_argument('repository')
             sub.add_argument('--base-branch', default='main')
@@ -89,16 +97,14 @@ def main():
                               [[n, v['id'], v['repository'], 'enabled' if v['enabled'] else 'disabled'] for n, v in enumerate(values, 1)])
                     else:
                         Console().print(Panel(Text(json.dumps(values[0], ensure_ascii=False, indent=2))))
-                elif action == 'remove' and args.purge:
+                elif action == 'remove':
                     from .purge import plan, execute
                     if args.dry_run:
                         value = plan(config, args.project)
-                        Console().print(Panel(Text(json.dumps(value, ensure_ascii=False, indent=2)), title='Purge plan'))
+                        Console().print(Panel(Text(json.dumps(value, ensure_ascii=False, indent=2)), title='Local removal plan'))
                     else:
                         execute(config, args.project, resolve_config(args.config))
                 else:
-                    if getattr(args, 'dry_run', False):
-                        raise ValueError('--dry-run requires --purge')
                     warning = mutate(resolve_config(args.config), action, args.project,
                         repository=getattr(args, 'repository', None), base_branch=getattr(args, 'base_branch', 'main'),
                         checkout=getattr(args, 'checkout', None))
@@ -145,11 +151,15 @@ def main():
             parser.exit(1, f'FAIL {exc}\n')
         return
     if args.command == 'stop':
-        with socket.socket(socket.AF_UNIX) as connection:
-            connection.settimeout(5)
-            connection.connect(str(config.workspace.resolve() / '.control.sock'))
-            connection.sendall(b'force' if args.force else b'stop')
-            print(connection.recv(32).decode())
+        try:
+            with socket.socket(socket.AF_UNIX) as connection:
+                connection.settimeout(5)
+                connection.connect(str(config.workspace.resolve() / '.control.sock'))
+                connection.sendall(b'force' if args.force else b'stop')
+                print(connection.recv(32).decode())
+        except OSError as exc:
+            from .monitoring import daemon
+            print(f"Daemon: {daemon(config)['state']}; control unavailable: {exc}")
         return
     from .db_guard import check
     from .storage import SchemaError

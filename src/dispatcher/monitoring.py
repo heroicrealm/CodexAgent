@@ -1,11 +1,13 @@
 """Local snapshot queries. Never construct Runtime or writable Storage."""
-from contextlib import contextmanager
+from contextlib import contextmanager, ExitStack
 from datetime import datetime, timezone
 from pathlib import Path
 import fcntl
 import json
 import os
 import sqlite3
+import socket
+import errno
 from .db_guard import inspection, validate, marker
 from .storage import SchemaError
 
@@ -54,30 +56,42 @@ def process_token(pid):
 def daemon(config):
     paths = (config.database.resolve().with_suffix('.lock'), config.workspace.resolve() / '.dispatcher-v2.lock')
     locked = []
-    try:
-        for path in paths:
-            if any(p.is_symlink() for p in (path, *path.parents)):
-                return {'state': 'UNKNOWN', 'diagnostic': 'Unsafe lock path'}
-            if not path.exists():
-                locked.append(False)
-                continue
-            with path.open('rb') as stream:
+    with ExitStack() as stack:
+        try:
+            for path in paths:
+                if any(p.is_symlink() for p in (path, *path.parents)):
+                    return {'state': 'UNKNOWN', 'diagnostic': 'Unsafe lock path'}
+                if not path.exists():
+                    locked.append(False)
+                    continue
+                stream = stack.enter_context(path.open('rb'))
                 try:
                     fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
                     locked.append(False)
                 except BlockingIOError:
                     locked.append(True)
-        sock = config.workspace / '.control.sock'
-        if not any(locked) and not sock.exists():
-            return {'state': 'STOPPED'}
-        meta = json.loads((config.workspace / '.monitor.json').read_text())
-        if (all(locked) and sock.is_socket() and meta['instance_id'] == marker(config).read_text().strip()
-                and type(meta['pid']) is int and meta['pid'] > 0
-                and process_token(meta['pid']) == meta['process_token']
-                and 0 <= (datetime.now(timezone.utc) - datetime.fromisoformat(meta['updated_at'])).total_seconds() < 10):
-            return {**meta, 'state': 'RUNNING'}
-    except (OSError, ValueError, TypeError, KeyError, IndexError):
-        pass
+            sock = config.workspace / '.control.sock'
+            if sock.is_symlink():
+                return {'state': 'UNKNOWN', 'diagnostic': 'Unsafe socket path'}
+            if not any(locked):
+                if not sock.exists():
+                    return {'state': 'STOPPED'}
+                with socket.socket(socket.AF_UNIX) as probe:
+                    probe.settimeout(0.2)
+                    try:
+                        probe.connect(str(sock))
+                    except OSError as exc:
+                        if exc.errno in (errno.ENOENT, errno.ECONNREFUSED):
+                            return {'state': 'STOPPED'}
+                return {'state': 'UNKNOWN', 'diagnostic': 'Control socket may have a live owner'}
+            meta = json.loads((config.workspace / '.monitor.json').read_text())
+            if (all(locked) and sock.is_socket() and meta['instance_id'] == marker(config).read_text().strip()
+                    and type(meta['pid']) is int and meta['pid'] > 0
+                    and process_token(meta['pid']) == meta['process_token']
+                    and 0 <= (datetime.now(timezone.utc) - datetime.fromisoformat(meta['updated_at'])).total_seconds() < 10):
+                return {**meta, 'state': 'RUNNING'}
+        except (OSError, ValueError, TypeError, KeyError, IndexError):
+            pass
     return {'state': 'UNKNOWN', 'diagnostic': 'No fresh, verified daemon evidence'}
 
 

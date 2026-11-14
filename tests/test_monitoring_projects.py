@@ -260,12 +260,13 @@ def test_project_remove_history_duplicate_and_add(instance, monkeypatch):
         with pytest.raises(ValueError):
             mutate(path, 'add', name, repository=repo)
         assert path.read_bytes() == before
-    mutate(path, 'remove', 'p')
-    assert store.issue(1)
-    before = path.read_bytes()
-    with pytest.raises(ValueError, match='retained local history'):
-        mutate(path, 'add', 'renamed', repository='owner/repo')
-    assert path.read_bytes() == before
+    from dispatcher.purge import execute
+    terminal = StringIO('p\n')
+    terminal.isatty = lambda: True
+    execute(load_config(path), 'p', path, stdin=terminal)
+    assert store.issue(1) is None
+    monkeypatch.setattr('dispatcher.projects.validate_remote', lambda *a: 'WARN test')
+    mutate(path, 'add', 'renamed', repository='owner/repo')
     monkeypatch.setattr('dispatcher.projects.validate_remote', lambda *a: 'WARN test')
     assert mutate(path, 'add', 'new', repository='owner/new') == 'WARN test'
     assert load_config(path).projects[-1].id == 'new'
@@ -311,7 +312,7 @@ def test_purge_inventory_read_only_and_refusal(instance, monkeypatch, tmp_path, 
     assert inventory['executable'] is True and not inventory['blockers']
     assert files(tmp_path) == before
     from dispatcher.__main__ import main
-    for flags in (['--purge', '--dry-run'], ['--purge']):
+    for flags in (['--dry-run'], []):
         monkeypatch.setattr('sys.argv', ['codex-dispatcher', '--config', str(path), 'project', 'remove', 'p', *flags])
         if '--dry-run' in flags:
             main()
@@ -433,3 +434,122 @@ def test_cli_restart_notice(instance, monkeypatch, capsys):
     monkeypatch.setattr('sys.argv', ['codex-dispatcher', '--config', str(path), 'project', 'disable', 'p'])
     main()
     assert 'Restart dispatcher to apply changes' in capsys.readouterr().out
+
+
+def test_stale_socket_stop_and_live_owner(instance, monkeypatch, capsys):
+    config, _, path = instance
+    address = config.workspace / '.control.sock'
+    with socket.socket(socket.AF_UNIX) as server:
+        server.bind(str(address))
+        server.listen()
+        assert daemon(config)['state'] == 'UNKNOWN'
+    assert address.exists()
+    assert daemon(config)['state'] == 'STOPPED'
+    with InstanceLock(config):
+        assert daemon(config)['state'] == 'UNKNOWN'
+    from dispatcher.__main__ import main
+    monkeypatch.setattr('sys.argv', ['codex-dispatcher', '--config', str(path), 'stop'])
+    main()
+    assert 'STOPPED' in capsys.readouterr().out
+    assert address.exists()
+    address.unlink()
+    main()
+    assert 'STOPPED' in capsys.readouterr().out
+
+
+@pytest.mark.parametrize('tz,expected', [('UTC', '2026-01-01 23:30:00'), ('Europe/Moscow', '2026-01-02 02:30:00')])
+def test_local_timestamps(tz, expected, monkeypatch):
+    import time
+    from dispatcher.monitoring_output import local_time
+    old = os.environ.get('TZ')
+    try:
+        monkeypatch.setenv('TZ', tz)
+        time.tzset()
+        assert local_time('2026-01-01T23:30:00.123+00:00') == expected
+        assert local_time(None) == 'N/A'
+    finally:
+        if old is None:
+            monkeypatch.delenv('TZ')
+        else:
+            monkeypatch.setenv('TZ', old)
+        time.tzset()
+
+
+def test_obsolete_remove_argument(instance, monkeypatch):
+    _, _, path = instance
+    from dispatcher.__main__ import main
+    before = files(path.parent)
+    monkeypatch.setattr('sys.argv', ['codex-dispatcher', '--config', str(path), 'project', 'remove', 'p', '--purge'])
+    with pytest.raises(SystemExit) as error:
+        main()
+    assert error.value.code == 2
+    assert files(path.parent) == before
+
+
+def test_verbose_tables_literal_text(instance):
+    config, store, _ = instance
+    register(store, state='error')
+    store.record_error(1, 'test', 'publish', '[red]literal[/red]')
+    with store.transaction() as db:
+        db.execute("INSERT INTO executions(issue_id,status,started_at) VALUES(1,'failed','2026-01-01T23:30:00+00:00')")
+    stream = StringIO()
+    render('show', show(config, 'p', 1), verbose=True, console=Console(file=stream, width=120))
+    output = stream.getvalue()
+    for value in ('Base branch:', 'Work branch:', 'Timeline', 'Event / Transition', 'Parameter', 'Diagnostics', '[red]literal[/red]'):
+        assert value in output
+    assert 'Branches:' not in output
+
+
+def test_state_palette():
+    from dispatcher.monitoring_output import colored
+    for value, style in [('pending', 'yellow'), ('running', 'cyan'), ('need-fix', 'dark_orange'), ('done', 'green'), ('error', 'red')]:
+        assert colored(value).style == style
+
+
+def test_publisher_close_status_counts(instance):
+    from dispatcher.execution import Publisher
+    config, store, _ = instance
+    register(store, 1, 'done')
+    register(store, 2, 'cancelled')
+    register(store, 3)
+    calls = []
+    gh = SimpleNamespace(sync_labels=lambda *a: None, close_issue=lambda *a: calls.append(a))
+    publisher = Publisher(config, store, gh, None, None)
+    assert status(config)['projects'][0]['open'] == 3
+    publisher.reconcile(config.projects[0])
+    counts = status(config)['projects'][0]
+    assert counts['open'] == counts['discovered'] == 1
+    with snapshot(config) as (db, _):
+        assert len(queue_db(db, config, all_records=True)) == 3
+    publisher.reconcile(config.projects[0])
+    assert len(calls) == 2
+
+
+def test_cli_remove_full_path(instance, monkeypatch, capsys):
+    config, store, path = instance
+    register(store)
+    terminal = StringIO('p\n')
+    terminal.isatty = lambda: True
+    monkeypatch.setattr('sys.stdin', terminal)
+    monkeypatch.setattr(subprocess, 'run', lambda *a, **k: pytest.fail('network or git called'))
+    from dispatcher.__main__ import main
+    monkeypatch.setattr('sys.argv', ['codex-dispatcher', '--config', str(path), 'project', 'remove', 'p'])
+    main()
+    assert 'PASS' in capsys.readouterr().out
+    assert store.issue(1) is None
+    assert [p.id for p in load_config(path).projects] == ['empty']
+    assert list((path.parent / 'backups/purge').iterdir()) == []
+
+
+@pytest.mark.parametrize('failure', [TimeoutError('timeout'), ConnectionRefusedError(111, 'refused')])
+def test_stop_control_errors(instance, monkeypatch, capsys, failure):
+    _, _, path = instance
+    def fail(*a):
+        raise failure
+    monkeypatch.setattr(socket.socket, 'connect', fail)
+    from dispatcher.__main__ import main
+    monkeypatch.setattr('sys.argv', ['codex-dispatcher', '--config', str(path), 'stop'])
+    main()
+    output = capsys.readouterr().out
+    assert 'control unavailable' in output
+    assert 'Traceback' not in output

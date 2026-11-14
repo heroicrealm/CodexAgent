@@ -26,7 +26,7 @@ codex-dispatcher project add Playground OWNER/REPOSITORY --base-branch main
 codex-dispatcher project disable Playground
 codex-dispatcher project enable Playground
 codex-dispatcher project remove Playground
-codex-dispatcher project remove Playground --purge --dry-run
+codex-dispatcher project remove Playground --dry-run
 ```
 
 `show` принимает номер Issue внутри репозитория. `queue` по умолчанию показывает
@@ -74,17 +74,17 @@ cp config/config.example.yaml ~/.config/codex-dispatcher/config.yaml
 # отредактируйте абсолютный root_path, затем db bootstrap
 ```
 
-`project remove ID --purge --dry-run` показывает проверенный локальный план,
+`project remove ID --dry-run` показывает проверенный локальный план,
 количества строк, файлы, worktree/refs и blockers. Чтение не меняет SQLite/WAL/SHM,
 не создаёт lockfiles/backup и не обращается к GitHub. `executable: true` означает,
 что локальные проверки пройдены; destructive запуск требует остановленного daemon,
 свободных InstanceLock, DB Guard/Recovery admission и ввода полного ID в TTY.
 
-`project remove ID --purge` удаляет локальную историю, включая Recovery audit,
+`project remove ID` удаляет локальную историю, включая Recovery audit,
 результаты, принадлежащие проекту управляемые worktree и checkout. Общие Recovery
 summary очищаются выборочно. Неоднозначные ссылки/сиротские файлы, dirty или shared
 Git-ресурсы и внешний checkout блокируют операцию. GitHub не меняется; сетевых
-Git-команд в purge нет. Обычный remove меняет только YAML. `--force` отсутствует.
+Git-команд в purge нет. Для сохранения истории используйте `project disable ID`, для возврата — `project enable ID`. `--force` отсутствует.
 
 Временный проверенный SQLite backup и приватный журнал находятся в
 `<root_path>/backups/purge/`. **После успеха оба автоматически удаляются. При
@@ -96,7 +96,7 @@ Git-команд в purge нет. Обычный remove меняет тольк�
 SQLite, а не удалённые результаты/Git checkout; файловые фазы сверяются с планом.
 Явные архивы `db backup` purge не удаляет. После успешного purge repository можно
 снова добавить. Подробности и ручные сценарии:
-[отчёт V2.4.3.C](docs/v2.4.3c-implementation.md).
+[отчёт и сценарий V2.4.3.D](docs/v2.4.3d-implementation.md).
 
 Первый запуск:
 
