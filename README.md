@@ -74,16 +74,29 @@ cp config/config.example.yaml ~/.config/codex-dispatcher/config.yaml
 # отредактируйте абсолютный root_path, затем db bootstrap
 ```
 
-**Purge пока заблокирован, этап не готов к полной приёмке.** `--purge --dry-run`
-показывает только read-only inventory SQLite и кандидатов файлов/worktree/refs,
-с `executable: false`; это не подтверждение принадлежности и не план разрешённого
-удаления. `--purge` без dry-run отказывает до любых изменений, backup или удаления
-YAML. Recovery audit защищён append-only триггерами и FK; для полного удаления
-нужно отдельно согласовать политику его сохранения/удаления. Триггеры и DB Guard
-не обходятся. Пользовательские checkout, данные других проектов, GitHub и вся
-локальная история сохраняются. Нет `--force`. Повторный add удалённого обычным
-remove репозитория с историей остаётся запрещённым. Подробности и ручные сценарии:
-[отчёт V2.4.3](docs/v2.4.3-implementation.md).
+`project remove ID --purge --dry-run` показывает проверенный локальный план,
+количества строк, файлы, worktree/refs и blockers. Чтение не меняет SQLite/WAL/SHM,
+не создаёт lockfiles/backup и не обращается к GitHub. `executable: true` означает,
+что локальные проверки пройдены; destructive запуск требует остановленного daemon,
+свободных InstanceLock, DB Guard/Recovery admission и ввода полного ID в TTY.
+
+`project remove ID --purge` удаляет локальную историю, включая Recovery audit,
+результаты, принадлежащие проекту управляемые worktree и checkout. Общие Recovery
+summary очищаются выборочно. Неоднозначные ссылки/сиротские файлы, dirty или shared
+Git-ресурсы и внешний checkout блокируют операцию. GitHub не меняется; сетевых
+Git-команд в purge нет. Обычный remove меняет только YAML. `--force` отсутствует.
+
+Временный проверенный SQLite backup и приватный журнал находятся в
+`<root_path>/backups/purge/`. **После успеха оба автоматически удаляются. При
+ошибке сохраняются**, команда сообщает фазу и пути. Повторный запуск проверяет и
+показывает старые backup, не создавая новые: необходимо восстановление по журналу
+и штатная Recovery reconciliation. Исходный YAML сохранён в `original_config`.
+Не удаляйте failed backup: после восстановления явно перенесите файлы попытки в
+собственный архив вне `backups/purge`, затем повторите purge. Backup восстанавливает
+SQLite, а не удалённые результаты/Git checkout; файловые фазы сверяются с планом.
+Явные архивы `db backup` purge не удаляет. После успешного purge repository можно
+снова добавить. Подробности и ручные сценарии:
+[отчёт V2.4.3.C](docs/v2.4.3c-implementation.md).
 
 Первый запуск:
 
