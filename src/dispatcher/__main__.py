@@ -90,11 +90,12 @@ def main():
                     else:
                         Console().print(Panel(Text(json.dumps(values[0], ensure_ascii=False, indent=2))))
                 elif action == 'remove' and args.purge:
-                    from .purge import plan
-                    value = plan(config, args.project)
-                    Console().print(Panel(Text(json.dumps(value, ensure_ascii=False, indent=2)), title='Purge inventory · BLOCKED'))
-                    if not args.dry_run:
-                        raise ValueError('Purge refused: ' + '; '.join(value['blockers']))
+                    from .purge import plan, execute
+                    if args.dry_run:
+                        value = plan(config, args.project)
+                        Console().print(Panel(Text(json.dumps(value, ensure_ascii=False, indent=2)), title='Purge plan'))
+                    else:
+                        execute(config, args.project, resolve_config(args.config))
                 else:
                     if getattr(args, 'dry_run', False):
                         raise ValueError('--dry-run requires --purge')

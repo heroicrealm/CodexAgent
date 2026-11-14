@@ -308,7 +308,7 @@ def test_purge_inventory_read_only_and_refusal(instance, monkeypatch, tmp_path, 
     monkeypatch.setattr(subprocess, 'run', lambda *a, **k: pytest.fail('external call'))
     inventory = plan(config, 'p')
     assert inventory['counts']['issues'] == 1
-    assert inventory['executable'] is False and inventory['blockers']
+    assert inventory['executable'] is True and not inventory['blockers']
     assert files(tmp_path) == before
     from dispatcher.__main__ import main
     for flags in (['--purge', '--dry-run'], ['--purge']):
@@ -395,7 +395,7 @@ def test_recovery_audit_inventory_preserved(instance, tmp_path):
     before = files(tmp_path)
     inventory = plan(config, 'p')
     assert inventory['counts']['recovery_events'] == 1
-    assert 'append-only' in inventory['blockers'][0]
+    assert inventory['executable'] and not inventory['blockers']
     assert files(tmp_path) == before
 
 
