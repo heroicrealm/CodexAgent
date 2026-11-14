@@ -101,7 +101,8 @@ def main():
                     from .purge import plan, execute
                     if args.dry_run:
                         value = plan(config, args.project)
-                        Console().print(Panel(Text(json.dumps(value, ensure_ascii=False, indent=2)), title='Local removal plan'))
+                        from .monitoring_output import render_removal_plan
+                        render_removal_plan(value)
                     else:
                         execute(config, args.project, resolve_config(args.config))
                 else:

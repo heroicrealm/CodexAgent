@@ -308,6 +308,70 @@ def inspect_attempts(config, area):
     return found, status
 
 
+def control_admission(config):
+    """Read-only removal admission; never unlink a socket (including replacements).
+
+    Execution calls this while owning BOTH InstanceLock descriptors. A managed
+    listener/executor cannot start until those descriptors are released.
+    Restore deliberately continues using the stricter db_guard.quiescent.
+    """
+    import errno
+    import socket
+    import stat
+    control = safe(config.workspace / '.control.sock')
+    # Even free locks must not override contradictory evidence of a live PID.
+    monitor = safe(config.workspace / '.monitor.json')
+    if monitor.exists():
+        meta = json.loads(monitor.read_text())
+        if not isinstance(meta, dict):
+            raise ValueError('Uncertain daemon process identity')
+        pid = meta.get('pid')
+        if type(pid) is not int or pid <= 0:
+            raise ValueError('Uncertain daemon process identity')
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            pass
+        else:
+            raise ValueError('Daemon process identity still live or reused')
+    try:
+        before = control.lstat()
+    except FileNotFoundError:
+        return {'state': 'absent'}
+    if not stat.S_ISSOCK(before.st_mode) or before.st_uid != os.getuid():
+        raise ValueError('Unsafe control socket type/owner')
+    with socket.socket(socket.AF_UNIX) as probe:
+        probe.settimeout(0.2)
+        try:
+            probe.connect(str(control))
+        except OSError as exc:
+            if exc.errno != errno.ECONNREFUSED:
+                raise ValueError('Control listener absence not proven') from exc
+        else:
+            raise ValueError('Active control socket listener')
+    # Linux exposes bound-but-not-listening owners too: ECONNREFUSED alone
+    # cannot distinguish a leftover from a server between bind() and listen().
+    # Missing/unreadable kernel evidence fails closed through the caller.
+    for line in Path('/proc/net/unix').read_text().splitlines()[1:]:
+        fields = line.split(maxsplit=7)
+        if len(fields) == 8 and fields[7] == str(control):
+            raise ValueError('Control socket still has a live kernel owner')
+    after = control.lstat()
+    identity = lambda st: (st.st_dev, st.st_ino, st.st_mode, st.st_uid, st.st_ctime_ns)
+    if identity(before) != identity(after):
+        raise ValueError('Control socket changed during inspection')
+    return {'state': 'stale', 'identity': list(identity(after)),
+            'action': 'Preserve stale socket; removal holds both instance locks'}
+
+
+def removal_quiescent(config):
+    control_admission(config)
+    path = db_guard.safe_path(config.database)
+    for suffix in ('-wal', '-shm'):
+        if Path(str(path) + suffix).exists():
+            raise ValueError('Working WAL/SHM present; checkpoint after shutdown')
+
+
 def plan(config, name):
     # YAML may already have committed when an interruption leaves the backup behind.
     if not any(p.id == name for p in config.projects):
@@ -342,6 +406,11 @@ def plan(config, name):
     state = daemon(config)
     if state['state'] != 'STOPPED' or (config.workspace / '.control.sock').is_symlink():
         blockers.append('Daemon shutdown not proven')
+    control = {'state': 'unsafe'}
+    try:
+        control = control_admission(config)
+    except (ValueError, OSError, TypeError) as exc:
+        blockers.append(f'Control admission: {exc}')
     for suffix in ('-wal', '-shm'):
         if Path(str(config.database) + suffix).exists():
             blockers.append('Working SQLite sidecars present')
@@ -351,6 +420,8 @@ def plan(config, name):
         blockers.append('Prior purge backup/journal present; restore configuration from journal.original_config if needed, use db restore BACKUP and reconcile Recovery; explicitly archive failed-attempt files outside backups/purge before retry: ' + ', '.join(leftovers))
     return dict(project=name, repository=p.repository, counts={t: len(v) for t, v in selected.items()},
                 rows=selected, database_fingerprint=fingerprint(rows), session_updates=updates, **artifacts, daemon=state,
+                control=control, managed_checkout=Path(artifacts['checkout']).exists() and not artifacts['external_checkout_preserved'],
+                database='OK', recovery='BLOCKED' if meta[3] or any('recovery' in b.lower() for b in blockers) else 'READY',
                 metadata=list(meta), previous_attempts=leftovers, previous_attempt_status=attempt_status, executable=not blockers, blockers=blockers)
 
 
@@ -463,12 +534,15 @@ def execute(config, name, config_path, *, stdin=None, output=print, checkpoint=l
     import shutil
     stdin = stdin or sys.stdin
     initial = plan(config, name)
-    output(json.dumps(initial, ensure_ascii=False, indent=2))
+    from .monitoring_output import removal_plan_text, render_removal_plan
+    if output is print:
+        render_removal_plan(initial, dry_run=False)
+    else:
+        output(removal_plan_text(initial, dry_run=False))
     if not initial['executable']:
         raise ValueError('Purge refused: ' + '; '.join(initial['blockers']))
     if not stdin.isatty():
         raise ValueError('Purge requires an interactive terminal')
-    output(f'Project: {name}\nRepository: {project(config, name).repository}\nWARNING: irreversible deletion of ALL local project data; GitHub is unchanged.')
     output(f'Type full project.id ({name}) to permanently purge local history:')
     try:
         confirmation = stdin.readline().rstrip('\r\n')
@@ -482,7 +556,7 @@ def execute(config, name, config_path, *, stdin=None, output=print, checkpoint=l
     try:
         with InstanceLock(config):
             db_guard.check(config, execution=True)
-            db_guard.quiescent(config)
+            removal_quiescent(config)
             # plan() observes our own locks as UNKNOWN; compare excluding daemon only.
             current = plan(config, name)
             current['daemon'] = initial['daemon']

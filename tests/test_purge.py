@@ -395,8 +395,13 @@ def test_retry_after_yaml_commit_discloses_backup(instance):
         execute(current, 'p', instance[2], stdin=Terminal('p\n'), output=lambda s: None)
 
 
-def test_dry_run_live_wal_bytes_unchanged(instance, tmp_path):
+@pytest.mark.parametrize('stale_socket', [False, True])
+def test_dry_run_live_wal_bytes_unchanged(instance, tmp_path, stale_socket):
+    import socket
     config = seed(instance)
+    if stale_socket:
+        with socket.socket(socket.AF_UNIX) as server:
+            server.bind(str(config.workspace / '.control.sock'))
     with connection(config.database) as writer:
         writer.execute('PRAGMA journal_mode=WAL')
         writer.execute("UPDATE issues SET title='committed in WAL' WHERE issue_id=1")
@@ -446,3 +451,191 @@ def test_git_dry_run_index_and_paths_unchanged(instance, tmp_path):
     assert files(tmp_path) == before
     assert set(tmp_path.rglob('*')) == paths
     assert {str(p): p.stat().st_mtime_ns for p in tmp_path.rglob('*') if p.is_file()} == stats
+
+
+def test_stale_socket_dry_run_and_removal(instance, tmp_path):
+    import socket
+    from dispatcher.db_guard import quiescent, maintain
+    from dispatcher.storage import SchemaError
+    config = seed(instance)
+    control = config.workspace / '.control.sock'
+    with socket.socket(socket.AF_UNIX) as server:
+        server.bind(str(control))
+    before, paths = files(tmp_path), set(tmp_path.rglob('*'))
+    identity = control.lstat()
+    inventory = plan(config, 'p')
+    assert inventory['executable'] and inventory['control']['state'] == 'stale'
+    assert files(tmp_path) == before and set(tmp_path.rglob('*')) == paths
+    # Restore and the global guard remain strict, including with free locks.
+    with pytest.raises(SchemaError, match='Control socket'):
+        quiescent(config)
+    backup = tmp_path / 'restore.sqlite'
+    maintain(config, 'backup', backup)
+    with pytest.raises(SchemaError, match='Control socket'):
+        maintain(config, 'restore', backup)
+    run(instance)
+    assert control.lstat() == identity  # no unlink TOCTOU, even on success
+    check(config, execution=True)
+    assert [p.id for p in load_config(instance[2]).projects] == ['empty']
+
+
+@pytest.mark.parametrize('kind', ['listener', 'locked-listener', 'bound-owner', 'lock-only', 'file', 'symlink', 'pid-reuse', 'live-pid', 'bad-metadata', 'pid-without-socket'])
+def test_control_unsafe_no_mutation(instance, tmp_path, kind):
+    import socket
+    from contextlib import ExitStack
+    from dispatcher.locking import InstanceLock
+    from dispatcher.monitoring import publish_metadata
+    config = load_config(instance[2])
+    control = config.workspace / '.control.sock'
+    with ExitStack() as stack:
+        if kind in ('listener', 'locked-listener', 'bound-owner', 'pid-reuse', 'live-pid', 'bad-metadata'):
+            server = stack.enter_context(socket.socket(socket.AF_UNIX))
+            server.bind(str(control))
+            if kind in ('listener', 'locked-listener'):
+                server.listen()
+            elif kind != 'bound-owner':
+                server.close()
+                publish_metadata(config)
+                if kind == 'pid-reuse':
+                    meta = config.workspace / '.monitor.json'
+                    value = json.loads(meta.read_text())
+                    value['process_token'] = 'wrong-starttime'
+                    meta.write_text(json.dumps(value))
+                elif kind == 'bad-metadata':
+                    (config.workspace / '.monitor.json').write_text('[]')
+        elif kind == 'file':
+            control.write_text('preserve')
+        elif kind == 'symlink':
+            control.symlink_to(tmp_path / 'other')
+        if kind == 'pid-without-socket':
+            publish_metadata(config)
+        if kind in ('lock-only', 'locked-listener'):
+            stack.enter_context(InstanceLock(config))
+        before, paths = files(tmp_path), set(tmp_path.rglob('*'))
+        assert not plan(config, 'p')['executable']
+        with pytest.raises(ValueError, match='Purge refused'):
+            run(instance)
+        assert files(tmp_path) == before and set(tmp_path.rglob('*')) == paths
+
+
+def test_socket_replaced_after_confirmation_preserved(instance):
+    import socket
+    config = load_config(instance[2])
+    control = config.workspace / '.control.sock'
+    with socket.socket(socket.AF_UNIX) as old:
+        old.bind(str(control))
+    class ReplacingTerminal(Terminal):
+        def readline(self):
+            control.unlink()
+            replacement.bind(str(control))
+            replacement.listen()
+            return 'p\n'
+    with socket.socket(socket.AF_UNIX) as replacement:
+        with pytest.raises(ValueError, match='Active control'):
+            execute(config, 'p', instance[2], stdin=ReplacingTerminal(), output=lambda s: None)
+        assert control.is_socket()
+        with socket.socket(socket.AF_UNIX) as client:
+            client.connect(str(control))
+    assert not (config.root_path / 'backups').exists()
+
+
+def test_socket_replacement_during_probe_refused(instance, monkeypatch):
+    import socket
+    from dispatcher.purge import control_admission
+    config = load_config(instance[2])
+    control = config.workspace / '.control.sock'
+    with socket.socket(socket.AF_UNIX) as old:
+        old.bind(str(control))
+    original = socket.socket.connect
+    with socket.socket(socket.AF_UNIX) as replacement:
+        def race(probe, path):
+            try:
+                return original(probe, path)
+            finally:
+                control.unlink()
+                replacement.bind(str(control))
+                replacement.listen()
+        monkeypatch.setattr(socket.socket, 'connect', race)
+        with pytest.raises(ValueError, match='changed during inspection|live kernel owner'):
+            control_admission(config)
+        assert control.is_socket()
+
+
+@pytest.mark.parametrize('width', [80, 120])
+@pytest.mark.parametrize('color', [False, True])
+def test_removal_renderer_compact_literal_and_immutable(instance, monkeypatch, width, color):
+    import copy
+    from rich.console import Console
+    from dispatcher.monitoring_output import render_removal_plan
+    config = seed(instance)
+    data = plan(config, 'p')
+    data['project'] = '[red]проект[/red]' + 'длинный' * 8
+    data['blockers'] = ['[red]literal[/red] unsafe socket identity']
+    data['executable'] = False
+    before = copy.deepcopy(data)
+    if color:
+        monkeypatch.setenv('NO_COLOR', '1')
+    output = StringIO()
+    render_removal_plan(data, console=Console(file=output, width=width, force_terminal=color))
+    text = output.getvalue()
+    for value in ('DRY RUN', 'Ready: NO', 'SQLite records', 'Codex results', '[red]literal[/red]', 'unsafe socket identity'):
+        assert value in text
+    for value in ('database_fingerprint', 'rowid', 'metadata', '\x1b[31m'):
+        assert value not in text
+    assert data == before
+
+
+def test_cli_removal_dry_run_readonly(instance, monkeypatch, capsys, tmp_path):
+    from dispatcher.__main__ import main
+    config = seed(instance)
+    before, paths = files(tmp_path), set(tmp_path.rglob('*'))
+    monkeypatch.setattr('sys.argv', ['codex-dispatcher', '--config', str(instance[2]), 'project', 'remove', 'p', '--dry-run'])
+    main()
+    output = capsys.readouterr().out
+    assert 'DRY RUN' in output and 'Ready: YES' in output
+    assert 'database_fingerprint' not in output and 'Type full' not in output
+    assert files(tmp_path) == before and set(tmp_path.rglob('*')) == paths
+
+
+def test_stale_socket_dead_metadata_and_inherited_lock(instance):
+    import socket
+    import sys
+    from dispatcher.monitoring import publish_metadata
+    from dispatcher.locking import InstanceLock
+    config = load_config(instance[2])
+    control = config.workspace / '.control.sock'
+    with socket.socket(socket.AF_UNIX) as server:
+        server.bind(str(control))
+    # A real exited PID gives durable local absence rather than a guessed PID.
+    process = subprocess.Popen([sys.executable, '-c', 'pass'])
+    process.wait()
+    publish_metadata(config)
+    meta_path = config.workspace / '.monitor.json'
+    meta = json.loads(meta_path.read_text())
+    meta.update(pid=process.pid, updated_at='2000-01-01T00:00:00+00:00')
+    meta_path.write_text(json.dumps(meta))
+    assert plan(config, 'p')['executable']
+    with InstanceLock(config) as lock:
+        child = subprocess.Popen([sys.executable, '-c', 'import sys; sys.stdin.read()'],
+                                 pass_fds=lock.fds, stdin=subprocess.PIPE)
+    try:
+        assert not plan(config, 'p')['executable']
+        with pytest.raises(ValueError, match='Purge refused'):
+            run(instance)
+    finally:
+        child.communicate()
+    run(instance)
+    assert control.is_socket()
+
+
+def test_uncertain_socket_error_refused(instance, monkeypatch):
+    import socket
+    config = load_config(instance[2])
+    with socket.socket(socket.AF_UNIX) as server:
+        server.bind(str(config.workspace / '.control.sock'))
+    def timeout(*args):
+        raise TimeoutError('uncertain listener')
+    monkeypatch.setattr(socket.socket, 'connect', timeout)
+    assert not plan(config, 'p')['executable']
+    with pytest.raises(ValueError, match='Purge refused'):
+        run(instance)

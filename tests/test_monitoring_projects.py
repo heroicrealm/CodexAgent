@@ -553,3 +553,38 @@ def test_stop_control_errors(instance, monkeypatch, capsys, failure):
     output = capsys.readouterr().out
     assert 'control unavailable' in output
     assert 'Traceback' not in output
+
+
+@pytest.mark.parametrize('value,expected', [(1, 'Yes'), (0, 'No'), (None, 'N/A'), (True, 'Yes'), (False, 'No'), ('missing', 'N/A')])
+@pytest.mark.parametrize('terminal', [False, True])
+def test_publication_human_and_json(instance, monkeypatch, capsys, value, expected, terminal):
+    import re
+    config, store, _ = instance
+    register(store)
+    with store.transaction() as db:
+        db.execute("INSERT INTO executions(issue_id,status,started_at,exit_code) VALUES(1,'completed','now',0)")
+    data = show(config, 'p', 1)
+    fields = ('push_completed', 'pr_published', 'comment_published')
+    for field in fields:
+        if value == 'missing':
+            data['executions'][0].pop(field, None)
+        else:
+            data['executions'][0][field] = value
+    monkeypatch.setenv('NO_COLOR', '1')
+    stream = StringIO()
+    render('show', data, verbose=True, console=Console(file=stream, width=80, force_terminal=terminal))
+    output = stream.getvalue()
+    for label in ('Push publication', 'PR publication', 'Comment publication'):
+        assert re.search(label + r'\s*│\s*' + expected, output)
+    assert re.search(r'Exit code\s*│\s*0', output)
+    assert '\x1b[' not in output
+    render('show', data, verbose=True, as_json=True)
+    raw = capsys.readouterr().out
+    parsed = json.loads(raw)
+    for field in fields:
+        if value == 'missing':
+            assert field not in parsed['executions'][0]
+        else:
+            actual = parsed['executions'][0][field]
+            assert actual == value and type(actual) is type(value)
+    assert parsed == data and '\x1b[' not in raw

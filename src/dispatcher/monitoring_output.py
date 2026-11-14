@@ -204,10 +204,12 @@ def render(command, data, *, as_json=False, console=None, config=None, state=Non
             for execution in compact_errors(d['executions']):
                 rows = []
                 for key, label in fields:
-                    if key not in execution:
+                    if key not in execution and key not in ('push_completed', 'pr_published', 'comment_published'):
                         continue
-                    value = execution[key]
-                    if key.endswith('_at'):
+                    value = execution.get(key)
+                    if key in ('push_completed', 'pr_published', 'comment_published'):
+                        value = 'N/A' if value is None else ('Yes' if value else 'No')
+                    elif key.endswith('_at'):
                         value = local_time(value)
                     elif value is None or value == '':
                         value = 'N/A'
@@ -223,3 +225,36 @@ def render(command, data, *, as_json=False, console=None, config=None, state=Non
             if d['recovery_quarantine']:
                 table(c, ['Time', 'Reason', 'Details'], [
                     [local_time(r.get('created_at')), r.get('reason_code'), human_details(r.get('details'))] for r in d['recovery_quarantine']])
+
+
+def render_removal_plan(data, *, dry_run=True, console=None):
+    """Presentation only: the exact execution plan remains untouched."""
+    c = console or Console()
+    c.print(Panel(labeled([
+        ('Repository', data.get('repository', 'N/A')),
+        ('Mode', 'DRY RUN' if dry_run else 'PERMANENT REMOVAL'),
+        ('Daemon', colored(data.get('daemon', {}).get('state', 'UNKNOWN'))),
+        ('Database', colored(data.get('database', 'UNKNOWN'))),
+        ('Recovery', colored(data.get('recovery', 'UNKNOWN'))),
+        ('Ready', Text('YES' if data['executable'] else 'NO', style='green' if data['executable'] else 'red')),
+    ]), title=Text('PROJECT REMOVAL · ' + data['project'])))
+    table(c, ['Local data to delete', 'Count'], [
+        ['SQLite records', sum(data['counts'].values())],
+        ['Codex results', len(data.get('results', []))],
+        ['Managed worktrees', len(data.get('worktrees', []))],
+        ['Local branches', len(data.get('working_refs', []))],
+        ['Managed checkout', 'Yes' if data.get('managed_checkout') else 'No'],
+        ['Diagnostic files', len(data.get('diagnostics', []))],
+    ])
+    c.print(labeled([('Blockers', '; '.join(data['blockers']) or 'none')]))
+    if data.get('control', {}).get('state') == 'stale':
+        c.print(Text('Stale control socket: verified leftover; preserved under instance locks.'))
+    c.print(Text('WARNING: This permanently deletes ALL local project data.', style='yellow'))
+    c.print(Text('GitHub Issues, PRs and remote branches are not modified.'))
+
+
+def removal_plan_text(data, *, dry_run=True):
+    from io import StringIO
+    stream = StringIO()
+    render_removal_plan(data, dry_run=dry_run, console=Console(file=stream))
+    return stream.getvalue().rstrip()

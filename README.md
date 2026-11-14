@@ -75,10 +75,18 @@ cp config/config.example.yaml ~/.config/codex-dispatcher/config.yaml
 ```
 
 `project remove ID --dry-run` показывает проверенный локальный план,
-количества строк, файлы, worktree/refs и blockers. Чтение не меняет SQLite/WAL/SHM,
-не создаёт lockfiles/backup и не обращается к GitHub. `executable: true` означает,
+краткую Rich-карточку: количества строк, результатов, worktree/веток, checkout,
+диагностики и полные blockers, без внутренних rowid/хешей/metadata. Чтение не меняет SQLite/WAL/SHM,
+не создаёт lockfiles/backup и не обращается к GitHub. `Ready: YES` означает,
 что локальные проверки пройдены; destructive запуск требует остановленного daemon,
 свободных InstanceLock, DB Guard/Recovery admission и ввода полного ID в TTY.
+Проверенный stale `.control.sock` после crash не мешает удалению: нужны
+ECONNREFUSED, отсутствие живого kernel owner в `/proc/net/unix`, безопасный тип,
+владелец и стабильная идентичность socket, отсутствие противоречивого живого PID.
+Оба lock удерживаются до завершения; socket сохраняется, поэтому гонка не может
+привести к удалению нового socket сервера. Dry-run ничего не очищает.
+Неопределённость, listener, занятые/inherited lock, WAL/SHM и Recovery блокируют
+удаление. Общая защита `db restore` остаётся прежней: любой socket запрещён.
 
 `project remove ID` удаляет локальную историю, включая Recovery audit,
 результаты, принадлежащие проекту управляемые worktree и checkout. Общие Recovery
@@ -96,7 +104,7 @@ Git-команд в purge нет. Для сохранения истории и�
 SQLite, а не удалённые результаты/Git checkout; файловые фазы сверяются с планом.
 Явные архивы `db backup` purge не удаляет. После успешного purge repository можно
 снова добавить. Подробности и ручные сценарии:
-[отчёт и сценарий V2.4.3.D](docs/v2.4.3d-implementation.md).
+[отчёт и сценарий V2.4.3.E](docs/v2.4.3e-implementation.md).
 
 Первый запуск:
 
@@ -351,3 +359,6 @@ retry, accept и автоматическая сверка проверены р
 
 - [Отчёт о приёмке V2.4.2](docs/v2.4.2-acceptance-report.md)
 - [Анализ и исправление WAL/SHM](docs/v2.4.2-wal-shm-fix-report.md)
+
+В `show -v` поля Push/PR/Comment publication выводятся как Yes/No/N/A;
+нулевой exit code остаётся 0. `show --json` сохраняет исходные 1/0/null.
