@@ -76,7 +76,7 @@ def main():
     if args.command in ('status', 'queue', 'show', 'project'):
         try:
             from . import monitoring as queries
-            from .monitoring_output import render, table
+            from .monitoring_output import human_console, render, table
             if args.command == 'status':
                 data = queries.status(config)
             elif args.command == 'queue':
@@ -86,17 +86,16 @@ def main():
                 data = queries.show(config, args.project, args.issue)
             else:
                 from .projects import inspect_projects, mutate
-                from rich.console import Console
                 from rich.panel import Panel
                 from rich.text import Text
                 action = args.project_command
                 if action in ('list', 'show'):
                     values = inspect_projects(config, getattr(args, 'project', None))
                     if action == 'list':
-                        table(Console(), ['№', 'Project ID', 'Repository', 'Status'],
+                        table(human_console(), ['№', 'Project ID', 'Repository', 'Status'],
                               [[n, v['id'], v['repository'], 'enabled' if v['enabled'] else 'disabled'] for n, v in enumerate(values, 1)])
                     else:
-                        Console().print(Panel(Text(json.dumps(values[0], ensure_ascii=False, indent=2))))
+                        human_console().print(Panel(Text(json.dumps(values[0], ensure_ascii=False, indent=2))))
                 elif action == 'remove':
                     from .purge import plan, execute
                     if args.dry_run:

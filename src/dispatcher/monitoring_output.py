@@ -1,5 +1,6 @@
 """Rich human screens and lossless JSON documents."""
 import json
+import os
 from datetime import datetime, timezone
 from rich.console import Console
 from rich.panel import Panel
@@ -13,6 +14,17 @@ PALETTE.update(dict.fromkeys(('running', 'manual-running'), 'cyan'))
 PALETTE.update(dict.fromkeys(('review', 'done', 'RUNNING', 'OK', 'READY', 'enabled'), 'green'))
 PALETTE.update(dict.fromkeys(('rejected', 'error', 'STOPPED', 'BLOCKED', 'disabled'), 'red'))
 PALETTE['need-fix'] = 'dark_orange'
+
+
+def human_console(console=None):
+    """NO_COLOR disables all ANSI styling, including Rich's bold headers."""
+    c = console or Console()
+    if 'NO_COLOR' in os.environ or c.no_color:
+        # Rich's no_color removes colors only, retaining bold/dim attributes.
+        # Keep the caller's console unchanged, including its terminal settings.
+        return Console(file=c.file, width=c.width, height=c.height,
+                       color_system=None, force_terminal=False, highlight=False)
+    return c
 
 
 def colored(value):
@@ -106,7 +118,7 @@ def render(command, data, *, as_json=False, console=None, config=None, state=Non
     if as_json:
         print(json.dumps(data, ensure_ascii=False))
         return
-    c = console or Console()
+    c = human_console(console)
     if command == 'status':
         active = data['executing']
         execution = 'IDLE'
@@ -229,7 +241,7 @@ def render(command, data, *, as_json=False, console=None, config=None, state=Non
 
 def render_removal_plan(data, *, dry_run=True, console=None):
     """Presentation only: the exact execution plan remains untouched."""
-    c = console or Console()
+    c = human_console(console)
     c.print(Panel(labeled([
         ('Repository', data.get('repository', 'N/A')),
         ('Mode', 'DRY RUN' if dry_run else 'PERMANENT REMOVAL'),

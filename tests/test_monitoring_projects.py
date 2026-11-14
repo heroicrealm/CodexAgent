@@ -556,11 +556,18 @@ def test_stop_control_errors(instance, monkeypatch, capsys, failure):
 
 
 @pytest.mark.parametrize('value,expected', [(1, 'Yes'), (0, 'No'), (None, 'N/A'), (True, 'Yes'), (False, 'No'), ('missing', 'N/A')])
-@pytest.mark.parametrize('terminal', [False, True])
-def test_publication_human_and_json(instance, monkeypatch, capsys, value, expected, terminal):
+@pytest.mark.parametrize('is_tty,force_terminal', [
+    pytest.param(True, None, id='terminal'),
+    pytest.param(False, True, id='forced-terminal'),
+    pytest.param(False, None, id='redirected'),
+])
+@pytest.mark.parametrize('no_color', [False, True], ids=['color', 'NO_COLOR'])
+@pytest.mark.parametrize('injected_console', [False, True], ids=['default-console', 'injected-console'])
+def test_publication_human_and_json(instance, monkeypatch, capsys, value, expected,
+                                    is_tty, force_terminal, no_color, injected_console):
     import re
     config, store, _ = instance
-    register(store)
+    register(store, state='pending')
     with store.transaction() as db:
         db.execute("INSERT INTO executions(issue_id,status,started_at,exit_code) VALUES(1,'completed','now',0)")
     data = show(config, 'p', 1)
@@ -570,14 +577,32 @@ def test_publication_human_and_json(instance, monkeypatch, capsys, value, expect
             data['executions'][0].pop(field, None)
         else:
             data['executions'][0][field] = value
-    monkeypatch.setenv('NO_COLOR', '1')
+    # Keep the host's TERM=dumb and color overrides from masking regressions.
+    monkeypatch.setenv('TERM', 'xterm-256color')
+    for variable in ('NO_COLOR', 'FORCE_COLOR', 'TTY_COMPATIBLE', 'TTY_INTERACTIVE'):
+        monkeypatch.delenv(variable, raising=False)
+    if no_color:
+        monkeypatch.setenv('NO_COLOR', '1')
     stream = StringIO()
-    render('show', data, verbose=True, console=Console(file=stream, width=80, force_terminal=terminal))
+    stream.isatty = lambda: is_tty
+    console = Console(file=stream, width=80, force_terminal=force_terminal)
+    if injected_console:
+        render('show', data, verbose=True, console=console)
+    else:
+        from dispatcher import monitoring_output
+        monkeypatch.setattr(monitoring_output, 'Console',
+                            lambda **kwargs: Console(**kwargs) if kwargs else console)
+        render('show', data, verbose=True)
     output = stream.getvalue()
+    ansi_expected = not no_color and (is_tty or force_terminal)
+    assert ('\x1b[' in output) == bool(ansi_expected)
+    if ansi_expected:
+        assert '\x1b[1m' in output  # Table headers remain bold.
+        assert '\x1b[33m' in output  # Pending state remains yellow.
+    plain_output = re.sub(r'\x1b\[[0-9;]*m', '', output)
     for label in ('Push publication', 'PR publication', 'Comment publication'):
-        assert re.search(label + r'\s*│\s*' + expected, output)
-    assert re.search(r'Exit code\s*│\s*0', output)
-    assert '\x1b[' not in output
+        assert re.search(label + r'\s*│\s*' + expected, plain_output)
+    assert re.search(r'Exit code\s*│\s*0', plain_output)
     render('show', data, verbose=True, as_json=True)
     raw = capsys.readouterr().out
     parsed = json.loads(raw)
