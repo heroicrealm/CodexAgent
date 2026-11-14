@@ -247,7 +247,7 @@ def test_disabled_project_preserves_data_without_external_calls(config):
 
 def test_cli_missing_check_exit_and_no_files(tmp_path, monkeypatch, capsys):
     config_file = tmp_path / 'config.yaml'
-    config_file.write_text('dispatcher:\n  workspace: workspace\n  database: state/db\nprojects: []\n')
+    config_file.write_text(f'dispatcher:\n  root_path: {tmp_path}\n  workspace: workspace\n  database: state/db\nprojects: []\n')
     before = tree(tmp_path)
     monkeypatch.setattr('sys.argv', ['codex-dispatcher', '--config', str(config_file), 'db', 'check'])
     from dispatcher.__main__ import main
@@ -452,7 +452,7 @@ def test_cli_wal_backup_restore_separate_processes(config, tmp_path):
     with connection(config.database) as db:
         db.execute('PRAGMA journal_mode=WAL')
     settings = tmp_path / 'config.yaml'
-    settings.write_text(f'dispatcher:\n  workspace: {config.workspace}\n  database: {config.database}\nprojects: []\n')
+    settings.write_text(f'dispatcher:\n  root_path: {tmp_path}\n  workspace: {config.workspace}\n  database: {config.database}\nprojects: []\n')
     snapshot = tmp_path / 'cli-snapshot'
     for command in ('backup', 'restore'):
         result = subprocess.run(

@@ -8,11 +8,14 @@ from ..storage import Storage
 
 def main():
     parser = argparse.ArgumentParser(description='Inspect V2 orphan worktrees; dry-run by default')
-    parser.add_argument('--config', type=Path, required=True)
+    parser.add_argument('--config', type=Path)
     parser.add_argument('--project')
     parser.add_argument('--apply', action='store_true')
     args = parser.parse_args()
-    config = load_config(args.config)
+    try:
+        config = load_config(args.config)
+    except (ValueError, OSError, TypeError, __import__('yaml').YAMLError) as exc:
+        parser.exit(1, f'FAIL configuration: {exc}\n')
     if not config.database.is_file() or not config.database.stat().st_size:
         parser.error('Existing V2 SQLite required')
     if args.project and args.project not in {p.id for p in config.projects}:

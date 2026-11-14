@@ -39,18 +39,27 @@ class GroupService:
         children = db.execute('SELECT i.* FROM issue_relations r JOIN issues i ON i.issue_id=r.child_issue_id '
                               'WHERE r.parent_issue_id=? AND i.is_virtual=0', (issue_id,)).fetchall()
         for child in children:
-            if Storage.blocked_db(db, child['issue_id']):
-                reasons.append('quarantined-child')
-            prs = db.execute('SELECT * FROM pull_requests WHERE issue_id=?', (child['issue_id'],)).fetchall()
-            if not child['is_ready'] and any(pr['status'] == 'open' for pr in prs):
-                reasons.append('child-ready-removed-with-open-pr')
-            if any(pr['status'] == 'merged' and base and pr['base_branch'] != base for pr in prs):
-                reasons.append('child-merge-target-conflict')
-            # Registration and the tracked relation define the dependency;
-            # is_ready only records the currently observed GitHub label.
-            if child['state'] not in TERMINAL:
-                reasons.append('unfinished-child')
+            reasons.extend(self.child_reasons_db(db, child, base))
         return Eligibility(not reasons, tuple(sorted(set(reasons))))
+
+    @staticmethod
+    def child_reasons_db(db, child, base):
+        reasons = []
+        if Storage.blocked_db(db, child['issue_id']):
+            reasons.append('quarantined-child')
+        prs = db.execute('SELECT * FROM pull_requests WHERE issue_id=?', (child['issue_id'],)).fetchall()
+        if not child['is_ready'] and any(pr['status'] == 'open' for pr in prs):
+            reasons.append('child-ready-removed-with-open-pr')
+        if any(pr['status'] == 'merged' and base and pr['base_branch'] != base for pr in prs):
+            reasons.append('child-merge-target-conflict')
+        if child['state'] not in TERMINAL:
+            reasons.append('unfinished-child')
+        return reasons
+
+    def blocking_children_db(self, db, issue_id):
+        root = db.execute('SELECT r.base_branch FROM issues i JOIN issues r ON r.issue_id=i.execution_group_id WHERE i.issue_id=?', (issue_id,)).fetchone()
+        children = db.execute('SELECT i.* FROM issue_relations r JOIN issues i ON i.issue_id=r.child_issue_id WHERE r.parent_issue_id=? AND i.is_virtual=0', (issue_id,)).fetchall()
+        return [dict(c) for c in children if self.child_reasons_db(db, c, root['base_branch'] if root else None)]
 
     def evaluate(self, issue_id):
         with self.storage.connection() as db:

@@ -173,7 +173,7 @@ def test_path_set_difference_visible(repository, tmp_path, monkeypatch):
 def test_cli_success(repository, tmp_path, capsys):
     _, project = repository
     cfg = tmp_path / 'config.yaml'
-    cfg.write_text('projects:\n  - id: example\n    repository: example/test\n    checkout: ' +
+    cfg.write_text(f'dispatcher:\n  root_path: {tmp_path}\nprojects:\n  - id: example\n    repository: example/test\n    checkout: ' +
                    str(project.checkout) + '\n')
     assert main(['--config', str(cfg), '--project', 'example', '--repeat', '1']) == 0
     report = json.loads(capsys.readouterr().out)

@@ -1,9 +1,10 @@
-# V2 config example. Paths are relative to this file.
+# V2 config example. Relative paths resolve from dispatcher.root_path.
 # Configure a NEW V2 test repository before integration testing.
 # Projects inherit dispatcher.labels; individual labels may be overridden per project.
 dispatcher:
-  workspace: ../workspace-v2
-  database: ../runtime-v2/dispatcher.sqlite3
+  root_path: /home/user/codex-dispatcher
+  workspace: workspace
+  database: runtime/dispatcher.sqlite3
   poll_interval: 30
   codex_command: ["codex", "exec", "--sandbox", "workspace-write", "-"]
   debug:
@@ -29,7 +30,7 @@ dispatcher:
 #   - id: test-project
 #     repository: owner/new-v2-test
 #     base_branch: main
-#     checkout: ../workspace-v2/repos/test-project # optional; otherwise cloned here
+#     checkout: workspace/repos/test-project # optional; otherwise cloned here
 #     labels:
 #       codex-ready: "custom-ready"
 #       review: "custom-review"

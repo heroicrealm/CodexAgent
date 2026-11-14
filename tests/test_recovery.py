@@ -704,7 +704,7 @@ def test_missing_execution_error_message_is_retained_privately(env):
 def test_recover_cli_dry_run_and_status_do_not_construct_runtime(env, monkeypatch, capsys):
     config, store, http, gh, localgit, service = env
     config_file = config.database.parent / 'dispatcher.yaml'
-    config_file.write_text('dispatcher:\n  workspace: workspace\n  database: db\nprojects: []\n')
+    config_file.write_text(f'dispatcher:\n  root_path: {config.database.parent}\n  workspace: workspace\n  database: db\nprojects: []\n')
     monkeypatch.setattr('dispatcher.__main__.Runtime', lambda *a: pytest.fail('runtime created'))
     monkeypatch.setattr('sys.argv', ['codex-dispatcher', '--config', str(config_file),
                                    'db', 'recovery', 'status', '--json'])
