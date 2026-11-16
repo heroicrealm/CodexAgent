@@ -6,6 +6,7 @@ import re
 import traceback
 
 REASONS = {
+    'git_transport_invalid': 'Managed Git requires the expected HTTPS origin; see docs/v2.5.1-https.md.',
     'no_changes_for_pr': 'Codex completed successfully but made no file changes. PR was not created.',
     'git_diff_failed': 'Git diff failed.',
     'base_branch_not_found': 'The remote base branch was not found.',

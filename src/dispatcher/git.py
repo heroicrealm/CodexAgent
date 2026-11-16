@@ -1,11 +1,53 @@
 """Conservative Git/worktree operations. No force push, rebase or force removal."""
 from pathlib import Path
+import os
 import re
 import subprocess
 from uuid import uuid4
 from .error_diagnostics import OperationError
 from .input import branch_name
 from .config import is_v1_path
+
+
+NETWORK_OPERATIONS = {'clone', 'fetch', 'push', 'ls-remote'}
+
+
+def https_url(repository):
+    if not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', repository):
+        raise ValueError('Invalid GitHub repository identity')
+    return f'https://github.com/{repository}.git'
+
+
+def git_environment():
+    # Keep HOME/PATH and gh's own auth environment. Never persist credentials.
+    env = {key: value for key, value in os.environ.items()
+           if not key.startswith(('GIT_TRACE', 'GIT_CONFIG_KEY_', 'GIT_CONFIG_VALUE_'))
+           and key not in {'GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR',
+                           'GIT_CONFIG_PARAMETERS', 'GIT_CONFIG_COUNT', 'GIT_CURL_VERBOSE'}}
+    env.update(GIT_TERMINAL_PROMPT='0', GIT_ASKPASS='/bin/false',
+               SSH_ASKPASS='/bin/false', GCM_INTERACTIVE='Never',
+               GH_PROMPT_DISABLED='1', GIT_ALLOW_PROTOCOL='https')
+    return env
+
+
+def network_args(args):
+    # Reset inherited helpers: only gh may provide HTTPS credentials. Empty
+    # helper resets the chain, so credential-store cannot receive a token.
+    return [args[0], '-c', 'credential.helper=',
+            '-c', 'credential.https://github.com.helper=',
+            '-c', 'credential.https://github.com.helper=!gh auth git-credential',
+            '-c', 'http.followRedirects=false', '-c', 'fetch.recurseSubmodules=false',
+            '-c', 'push.recurseSubmodules=no', *args[1:]]
+
+
+def redact_credentials(value):
+    if value is None:
+        return None
+    if isinstance(value, bytes):
+        return redact_credentials(value.decode('utf-8', errors='replace')).encode()
+    value = re.sub(r'(?i)(https?://)[^/\s@]+@', r'\1[redacted]@', value)
+    value = re.sub(r'(?i)(authorization\s*:[^\r\n]*)', 'Authorization: [redacted]', value)
+    return re.sub(r'\b(?:gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+)\b', '[redacted]', value)
 
 
 class GitError(OperationError):
@@ -18,19 +60,58 @@ class Git:
 
     def command(self, args, operation):
         try:
-            return subprocess.run(args, capture_output=True, text=True, timeout=120)
+            result = subprocess.run(network_args(args) if operation in NETWORK_OPERATIONS else args,
+                                  capture_output=True, text=True, timeout=120,
+                                  env=git_environment(), stdin=subprocess.DEVNULL)
+            if operation in NETWORK_OPERATIONS:
+                result.stdout = redact_credentials(result.stdout)
+                result.stderr = redact_credentials(result.stderr)
+            return result
         except (OSError, subprocess.SubprocessError) as exc:
+            if operation in NETWORK_OPERATIONS:
+                for field in ('stdout', 'stderr'):
+                    if hasattr(exc, field):
+                        setattr(exc, field, redact_credentials(getattr(exc, field)))
             raise GitError('Git command could not complete', code=f'git_{operation}_failed',
                 operation='git.' + operation, stdout=getattr(exc, 'stdout', None),
                 stderr=getattr(exc, 'stderr', None)) from exc
 
     def run(self, directory, *args, check=True):
+        if args[0] in NETWORK_OPERATIONS:
+            self.verify_remote(directory)
         result = self.command(['git', '-C', str(directory), *args], args[0])
         if check and result.returncode:
             # Never expose raw stderr (may contain credentials or task data).
             raise GitError(f'Git {args[0]} failed', code=f'git_{args[0]}_failed',
                            operation=f'git.{args[0]}', stdout=result.stdout, stderr=result.stderr, returncode=result.returncode)
         return result.stdout.strip() if check else result
+
+    def check_rewrites(self, directory):
+        result = self.run(directory, 'config', '--get-regexp',
+                          r'^url\..*\.(insteadof|pushinsteadof)$', check=False)
+        if result.returncode != 1:
+            raise GitError('Git URL rewrites must be removed for managed HTTPS operations',
+                           code='git_transport_invalid', operation='git.remote')
+
+    def verify_remote(self, directory, project=None):
+        common = Path(self.run(directory, 'rev-parse', '--path-format=absolute', '--git-common-dir')).resolve()
+        matches = []
+        for candidate in self.config.projects:
+            checkout = (candidate.checkout or self.config.workspace / 'repos' / candidate.id).resolve()
+            if checkout.is_dir():
+                expected = Path(self.run(checkout, 'rev-parse', '--path-format=absolute', '--git-common-dir')).resolve()
+                if common == expected:
+                    matches.append(candidate)
+        if len(matches) != 1 or (project is not None and matches[0] != project):
+            raise GitError('Managed checkout identity is unproven', code='git_transport_invalid')
+        self.check_rewrites(directory)
+        expected = https_url(matches[0].repository).casefold()
+        for options in ((), ('--push',)):
+            urls = self.run(directory, 'remote', 'get-url', *options, '--all', 'origin').splitlines()
+            if len(urls) != 1 or urls[0].casefold() != expected:
+                raise GitError('Managed origin requires the expected credential-free HTTPS fetch/push URL; '
+                               'see docs/v2.5.1-https.md for explicit SSH migration',
+                               code='git_transport_invalid', operation='git.remote')
 
     def checkout(self, project, *, create=True):
         path = (project.checkout or self.config.workspace / 'repos' / project.id).resolve()
@@ -40,7 +121,8 @@ class Git:
             if not create:
                 raise GitError("V2 checkout is missing")
             path.parent.mkdir(parents=True, exist_ok=True)
-            result = self.command(['git', 'clone', f'git@github.com:{project.repository}.git', str(path)], 'clone')
+            self.check_rewrites(path.parent)
+            result = self.command(['git', 'clone', https_url(project.repository), str(path)], 'clone')
             if result.returncode:
                 raise GitError('Git clone failed', code='git_clone_failed', operation='git.clone',
                                stdout=result.stdout, stderr=result.stderr, returncode=result.returncode)
@@ -84,6 +166,7 @@ class Git:
         return self.run(checkout, 'rev-parse', ref)
 
     def commit_push(self, project, path, work):
+        self.verify_remote(path, project=project)
         self.run(path, 'add', '--all')
         if self.diff_changed(path, '--cached'):
             self.run(path, 'commit', '-m', 'Dispatcher task result')

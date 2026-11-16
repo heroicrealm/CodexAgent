@@ -48,6 +48,7 @@ def edit(path):
 
 def validate_remote(repository, transport=None, run=None):
     from .github import GhTransport
+    from .git import https_url, git_environment, network_args
     transport = transport or GhTransport()
     run = run or subprocess.run
     try:
@@ -59,11 +60,18 @@ def validate_remote(repository, transport=None, run=None):
         permissions = info.get('permissions', {})
         if permissions.get('pull') is False or permissions.get('push') is False:
             raise ValueError('Insufficient repository read/write permissions')
-        result = run(['git', 'ls-remote', f'git@github.com:{repository}.git'], capture_output=True,
-                     text=True, timeout=60, env={**os.environ, 'GIT_TERMINAL_PROMPT': '0',
-                                               'GIT_SSH_COMMAND': 'ssh -oBatchMode=yes'})
+        rewrites = run(['git', 'config', '--get-regexp',
+                        r'^url\..*\.(insteadof|pushinsteadof)$'],
+                       capture_output=True, text=True, timeout=60,
+                       env=git_environment(), stdin=subprocess.DEVNULL)
+        if rewrites.returncode != 1:
+            raise ValueError('Git URL rewrites must be removed for HTTPS access verification')
+        result = run(network_args(['git', 'ls-remote', https_url(repository)]),
+                     capture_output=True, text=True, timeout=60,
+                     env=git_environment(), stdin=subprocess.DEVNULL)
         if result.returncode:
-            raise ValueError('Git remote access failed (SSH authentication is independent of gh API)')
+            raise ValueError('Git remote HTTPS access failed; configure gh auth setup-git; '
+                             'API access does not prove Git push authorization')
     except (OSError, subprocess.SubprocessError) as exc:
         raise ValueError('Repository access verification failed') from exc
     return 'WARN: API repository permissions checked where available; token-specific Issues/PR/labels write permissions cannot be proven without writes'

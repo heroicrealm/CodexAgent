@@ -57,8 +57,9 @@ JSONL выбирается последнее `item.completed` типа `agent_m
 обёрток Codex CLI не разбираются автоматически.
 
 Только `project add` выполняет сетевые чтения: авторизованный `gh api GET /repos/...`
-и SSH `git ls-remote` тем же способом, что clone диспетчера. Настройте отдельно
-`gh auth login` и SSH-доступ Git. Ошибка API/сети/Git или явный запрет pull/push,
+и HTTPS `git ls-remote` тем же способом, что clone диспетчера. Выполните вручную
+`gh auth login` и `gh auth setup-git`. SSH remote требует явного перевода;
+[процедура и ручная приёмка V2.5.1](docs/v2.5.1-https.md). Ошибка API/сети/Git или явный запрет pull/push,
 archived/disabled repo, выключенные Issues запрещают add до изменения YAML.
 Непроверяемые без записи token-specific полномочия Issues/PR/labels дают WARN.
 Тестовые объекты GitHub не создаются.

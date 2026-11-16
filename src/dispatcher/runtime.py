@@ -37,6 +37,11 @@ class Runtime:
         self.stopping = False
         self._gate = threading.Lock()
 
+    def _signal_stop(self, *_):
+        # Python handlers run on the main thread, possibly inside _gate.
+        # Never acquire a lock from a signal handler or escalate repeated signals.
+        self.stopping = True
+
     def stop(self, force=False):
         with self._gate:
             self.stopping = True
@@ -62,6 +67,17 @@ class Runtime:
                     pass
 
     def run(self, *, once=False):
+        previous = {}
+        try:
+            if threading.current_thread() is threading.main_thread():
+                for sig in (signal.SIGINT, signal.SIGTERM):
+                    previous[sig] = signal.signal(sig, self._signal_stop)
+            self._run(once=once)
+        finally:
+            for sig, handler in previous.items():
+                signal.signal(sig, handler)
+
+    def _run(self, *, once=False):
         with InstanceLock(self.config) as lock:
             from .db_guard import check
             check(self.config, execution=True)
@@ -77,16 +93,13 @@ class Runtime:
             done = threading.Event()
             control = threading.Thread(target=self._control, args=(server, done))
             control.start()
-            previous = {}
             try:
-                for sig in ((signal.SIGINT, signal.SIGTERM) if threading.current_thread() is threading.main_thread() else ()):
-                    previous[sig] = signal.signal(sig, lambda *_: self.stop())
                 with ThreadPoolExecutor(max_workers=1) as pool:
                     future = None
                     next_poll = 0
                     last_poll_at = next_poll_at = None
                     published = 0
-                    while not self.stopping or (future and not future.done()):
+                    while not self.stopping or future:
                         if time.monotonic() - published >= 1:
                             from .monitoring import publish_metadata
                             try:
@@ -141,5 +154,3 @@ class Runtime:
                 server.close()
                 control.join(timeout=2)
                 Path(address).unlink(missing_ok=True)
-                for sig, handler in previous.items():
-                    signal.signal(sig, handler)

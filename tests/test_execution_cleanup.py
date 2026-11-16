@@ -8,7 +8,7 @@ from dispatcher.cleanup import Cleanup
 from dispatcher.config import Config, Project
 from dispatcher.diagnostics import DiagnosticLogger
 from dispatcher.execution import Executor, ProcessRunner, Publisher
-from dispatcher.git import Git
+from local_git import LocalGit as Git
 from dispatcher.github import GitHubAdapter, GitHubError
 from dispatcher.locking import AlreadyRunning, InstanceLock
 from dispatcher.models import State
@@ -397,7 +397,7 @@ with InstanceLock(config) as lease:
     print(runner._process.pid,flush=True)
     worker.join()
 '''
-    env = {**os.environ, 'PYTHONPATH': str(Path('src').resolve())}
+    env = {**os.environ, 'PYTHONPATH': os.pathsep.join(str(Path(p).resolve()) for p in ('src', 'tests'))}
     parent = subprocess.Popen([sys.executable, '-c', script, str(config.workspace), str(config.database)],
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
     supervisor_pid = int(parent.stdout.readline())
@@ -446,8 +446,10 @@ def test_cli_orphan_dryrun_and_apply(environment):
     conf_path = config.database.parent / 'config.yaml'
     conf_path.write_text(yaml.safe_dump({'dispatcher': {'root_path': str(config.database.parent), 'workspace': str(config.workspace), 'database': str(config.database)},
         'projects': [{'id': 'p', 'repository': 'owner/new', 'checkout': str(config.projects[0].checkout)}]}))
-    args = [sys.executable, '-m', 'dispatcher.tools.worktree_cleanup', '--config', str(conf_path)]
-    env = {**os.environ, 'PYTHONPATH': str(Path('src').resolve())}
+    args = [sys.executable, '-c',
+            'from local_git import LocalGit; import dispatcher.tools.worktree_cleanup as cli; '
+            'cli.Git = LocalGit; cli.main()', '--config', str(conf_path)]
+    env = {**os.environ, 'PYTHONPATH': os.pathsep.join(str(Path(p).resolve()) for p in ('src', 'tests'))}
     dry = subprocess.run(args, capture_output=True, text=True, check=True, env=env)
     assert 'safe=1' in dry.stdout and 'removed=0' in dry.stdout and path.exists()
     applied = subprocess.run([*args, '--apply'], capture_output=True, text=True, check=True, env=env)
