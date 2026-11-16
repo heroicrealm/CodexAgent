@@ -15,7 +15,7 @@ python3 -m venv "$bootstrap/venv" || { echo 'Install python3-venv and python3-pi
 "$bootstrap/venv/bin/python" -m pip install --quiet 'PyYAML>=6' 'packaging>=23'
 cat > "$bootstrap/distribution.py" <<'PYTHON_DISTRIBUTION'
 ''' + source + '''PYTHON_DISTRIBUTION
-"$bootstrap/venv/bin/python" "$bootstrap/distribution.py" ''' + argument + '\n'
+"$bootstrap/venv/bin/python" "$bootstrap/distribution.py" ''' + argument + ' --script-path "$0"\n'
     path = Path(name)
     if '--check' in sys.argv:
         assert path.read_text() == text, f'Stale {name}'

@@ -1,4 +1,5 @@
 import argparse
+from importlib import metadata
 from pathlib import Path
 import socket
 import json
@@ -6,8 +7,19 @@ from .config import load_config, resolve_config, validate_schema, CONFIG_SCHEMA_
 from .runtime import Runtime
 
 
+class PackageVersion(argparse.Action):
+    def __call__(self, parser, namespace, values, option_string=None):
+        try:
+            value = metadata.version('codex-dispatcher-v2')
+        except metadata.PackageNotFoundError:
+            parser.exit(1, 'FAIL: codex-dispatcher-v2 package metadata unavailable\n')
+        print(f'Codex Dispatcher {value}')
+        parser.exit(0)
+
+
 def main():
     parser = argparse.ArgumentParser(description='Codex Task Dispatcher V2')
+    parser.add_argument('--version', nargs=0, action=PackageVersion)
     parser.add_argument('--config', type=Path)
     parser.add_argument('--config-schema-version', action='version', version=str(CONFIG_SCHEMA_VERSION))
     commands = parser.add_subparsers(dest='command', required=True)

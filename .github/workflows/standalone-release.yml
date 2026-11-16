@@ -21,14 +21,15 @@ jobs:
       - run: python -m venv /tmp/dispatcher-wheel
       - run: /tmp/dispatcher-wheel/bin/pip install dist/*.whl
       - run: /tmp/dispatcher-wheel/bin/codex-dispatcher --help
+      - run: /tmp/dispatcher-wheel/bin/codex-dispatcher --version
       - run: cd /tmp && /tmp/dispatcher-wheel/bin/python "$GITHUB_WORKSPACE/scripts/smoke-wheel.py"
       - run: python -m pip download --dest /tmp/wheelhouse dist/*.whl
       - run: python scripts/smoke-install.py dist/*.whl /tmp/wheelhouse
       - name: Prepare reviewed release bundle (no tag or publication)
         run: |
-          cp install-standalone.sh uninstall-standalone.sh config/config.example.yaml docs/releases/v2.5.2.post1.md dist/
+          cp install-standalone.sh uninstall-standalone.sh config/config.example.yaml docs/releases/v2.5.2.post2.md dist/
           cd dist
-          sha256sum *.whl *.sh config.example.yaml v2.5.2.post1.md > SHA256SUMS
+          sha256sum *.whl *.sh config.example.yaml v2.5.2.post2.md > SHA256SUMS
       - uses: actions/upload-artifact@v4
         with:
           name: standalone-release-candidate

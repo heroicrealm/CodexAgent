@@ -1,4 +1,4 @@
-dispatcher_version: "2.5.2.post1"
+dispatcher_version: "2.5.2.post2"
 config_schema_version: 1
 
 # V2 config example. Relative paths resolve from dispatcher.root_path.
