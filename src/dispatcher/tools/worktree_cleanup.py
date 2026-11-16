@@ -1,7 +1,7 @@
 import argparse
 from pathlib import Path
 from ..cleanup import Cleanup
-from ..config import load_config
+from ..config import load_config, validate_schema
 from ..git import Git
 from ..storage import Storage
 
@@ -13,6 +13,8 @@ def main():
     parser.add_argument('--apply', action='store_true')
     args = parser.parse_args()
     try:
+        if args.apply:
+            validate_schema(args.config)
         config = load_config(args.config)
     except (ValueError, OSError, TypeError, __import__('yaml').YAMLError) as exc:
         parser.exit(1, f'FAIL configuration: {exc}\n')

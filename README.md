@@ -367,3 +367,7 @@ retry, accept и автоматическая сверка проверены р
 
 В `show -v` поля Push/PR/Comment publication выводятся как Yes/No/N/A;
 нулевой exit code остаётся 0. `show --json` сохраняет исходные 1/0/null.
+
+### Поставка V2.5.2 для WSL2
+
+[Установка, обновление и удаление в WSL2](docs/wsl2.md) · [Регламент сборки и публикации Release](docs/releasing.md) · [Release notes 2.5.2](docs/releases/v2.5.2.md).

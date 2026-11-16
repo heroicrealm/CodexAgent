@@ -1,0 +1,35 @@
+name: WSL distribution artifacts
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  wheel:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install build '.[test]'
+      - run: python scripts/embed-wsl.py --check
+      - run: sh -n install-wsl.sh && sh -n uninstall-wsl.sh
+      - run: python -m pytest -q
+      - run: python -m build --wheel
+      - run: python -m venv /tmp/dispatcher-wheel
+      - run: /tmp/dispatcher-wheel/bin/pip install dist/*.whl
+      - run: /tmp/dispatcher-wheel/bin/codex-dispatcher --help
+      - run: cd /tmp && /tmp/dispatcher-wheel/bin/python "$GITHUB_WORKSPACE/scripts/smoke-wheel.py"
+      - run: python -m pip download --dest /tmp/wheelhouse dist/*.whl
+      - run: python scripts/smoke-install.py dist/*.whl /tmp/wheelhouse
+      - name: Prepare reviewed release bundle (no tag or publication)
+        run: |
+          cp install-wsl.sh uninstall-wsl.sh config/config.example.yaml docs/releases/v2.5.2.md dist/
+          cd dist
+          sha256sum *.whl *.sh config.example.yaml v2.5.2.md > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wsl-release-candidate
+          path: dist/

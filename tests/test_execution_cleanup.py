@@ -444,7 +444,7 @@ def test_cli_orphan_dryrun_and_apply(environment):
     config, store, api, gh, git, *_ = environment
     path, _ = git.prepare(config.projects[0], 999, 'main', 'unused')
     conf_path = config.database.parent / 'config.yaml'
-    conf_path.write_text(yaml.safe_dump({'dispatcher': {'root_path': str(config.database.parent), 'workspace': str(config.workspace), 'database': str(config.database)},
+    conf_path.write_text(yaml.safe_dump({'config_schema_version': 1, 'dispatcher': {'root_path': str(config.database.parent), 'workspace': str(config.workspace), 'database': str(config.database)},
         'projects': [{'id': 'p', 'repository': 'owner/new', 'checkout': str(config.projects[0].checkout)}]}))
     args = [sys.executable, '-c',
             'from local_git import LocalGit; import dispatcher.tools.worktree_cleanup as cli; '
