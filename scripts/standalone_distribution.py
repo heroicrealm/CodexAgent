@@ -149,6 +149,8 @@ def main(uninstall=False):
     base = home / 'codex-dispatcher'
     venv = base / '.venv'
     cli = home / '.local/bin/codex-dispatcher'
+    removal_cli = home / '.local/bin/codex-dispatcher-uninstall'
+    removal_target = venv / 'uninstall-standalone.sh'
     xdg = Path(os.environ.get('XDG_CONFIG_HOME', ''))
     config = (xdg if xdg.is_absolute() else home / '.config') / 'codex-dispatcher/config.yaml'
     if any(p.is_symlink() for p in (base, *base.parents)):
@@ -165,6 +167,10 @@ def main(uninstall=False):
             raise RuntimeError('Dispatcher or another installer is active; stop it before updating/removing') from exc
         state = owned_state(base)
         check_cli(cli, venv)
+        if removal_cli.exists() or removal_cli.is_symlink():
+            if not (state and state.get('uninstaller') is True and removal_cli.is_symlink()
+                    and os.readlink(removal_cli) == str(removal_target)):
+                raise RuntimeError(f'Foreign uninstall command preserved: {removal_cli}')
         if (venv.exists() or venv.is_symlink()) and (
             not state or not venv.is_symlink() or os.readlink(venv) != state['current']):
             raise RuntimeError('Unowned .venv preserved; use a separate installation or reconcile manually')
@@ -187,6 +193,8 @@ def main(uninstall=False):
                         raise RuntimeError('User data/configuration overlaps program venv; removal refused')
                 if cli.is_symlink():
                     cli.unlink()
+                if removal_cli.is_symlink():
+                    removal_cli.unlink()
                 venv.unlink()
                 for name in state['generations']:
                     shutil.rmtree(base / name)
@@ -207,11 +215,15 @@ def main(uninstall=False):
             raise ValueError('Stable release required')
         if current and candidate < current:
             raise RuntimeError(f'Downgrade refused: installed {current}, release {candidate}')
-        if current == candidate:
+        if (current == candidate and state and state.get('uninstaller') is True
+                and removal_target.is_file() and not removal_target.is_symlink()
+                and os.access(removal_target, os.X_OK)):
             print(f'Installed package {current} is current.')
             if not cli.is_symlink():
                 cli.parent.mkdir(parents=True, exist_ok=True)
                 cli.symlink_to(venv / 'bin/codex-dispatcher')
+            if not removal_cli.is_symlink():
+                removal_cli.symlink_to(removal_target)
             if str(cli.parent) not in os.environ.get('PATH', '').split(os.pathsep):
                 print('Add to ~/.profile: export PATH="$HOME/.local/bin:$PATH"; open a new shell.')
             return
@@ -222,7 +234,7 @@ def main(uninstall=False):
         if len(wheels) != 1:
             raise ValueError('Expected one universal dispatcher wheel')
         # Every payload comes from this one release. GitHub asset digest anchors
-        # SHA256SUMS when provided; sums always cover wheel and template.
+        # SHA256SUMS when provided; sums cover wheel, template and uninstaller.
         sums_asset = assets['SHA256SUMS']
         sums = fetch(sums_asset['browser_download_url'])
         digest = sums_asset.get('digest')
@@ -233,7 +245,7 @@ def main(uninstall=False):
             digest, name = line.split(maxsplit=1)
             checksums[name.lstrip('*')] = digest
         with tempfile.TemporaryDirectory() as download:
-            for name in (wheels[0], 'config.example.yaml'):
+            for name in (wheels[0], 'config.example.yaml', 'uninstall-standalone.sh'):
                 payload = fetch(assets[name]['browser_download_url'])
                 if hashlib.sha256(payload).hexdigest() != checksums[name]:
                     raise ValueError(f'SHA-256 mismatch: {name}')
@@ -243,6 +255,8 @@ def main(uninstall=False):
             try:
                 subprocess.run([sys.executable, '-m', 'venv', str(generation)], check=True)
                 subprocess.run([str(generation / 'bin/python'), '-m', 'pip', 'install', str(Path(download) / wheels[0])], check=True)
+                shutil.copyfile(Path(download) / 'uninstall-standalone.sh', generation / 'uninstall-standalone.sh')
+                (generation / 'uninstall-standalone.sh').chmod(0o755)
                 if installed_version(generation) != candidate:
                     raise RuntimeError('Installed package version mismatch')
                 schema = int(call([generation / 'bin/codex-dispatcher', '--config-schema-version']))
@@ -252,7 +266,9 @@ def main(uninstall=False):
                     # All fallible preparation finished before replacing active CLI.
                     old_config = target.read_text() if target.exists() else None
                     old_state = (base / '.standalone-install.json').read_text() if state else None
-                    new_state = {'owner': MARKER, 'current': generation.name,
+                    had_cli = cli.is_symlink()
+                    had_removal_cli = removal_cli.is_symlink()
+                    new_state = {'owner': MARKER, 'uninstaller': True, 'current': generation.name,
                                  'generations': (state['generations'] if state else []) + [generation.name]}
                     try:
                         atomic_write(target, content)
@@ -265,8 +281,14 @@ def main(uninstall=False):
                         cli.parent.mkdir(parents=True, exist_ok=True)
                         if not cli.is_symlink():
                             cli.symlink_to(venv / 'bin/codex-dispatcher')
+                        if not removal_cli.is_symlink():
+                            removal_cli.symlink_to(removal_target)
                         committed = True
                     except BaseException:
+                        if not had_removal_cli and removal_cli.is_symlink() and os.readlink(removal_cli) == str(removal_target):
+                            removal_cli.unlink()
+                        if not had_cli and cli.is_symlink() and os.readlink(cli) == str(venv / 'bin/codex-dispatcher'):
+                            cli.unlink()
                         if venv.is_symlink() and os.readlink(venv) == generation.name:
                             venv.unlink()
                             if state:

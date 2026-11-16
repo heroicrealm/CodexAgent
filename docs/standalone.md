@@ -31,14 +31,16 @@ codex login status
 ```sh
 mkdir -p ~/Downloads/codex-dispatcher
 cd ~/Downloads/codex-dispatcher
-gh release download --repo heroicrealm/CodexAgent --pattern install-standalone.sh --pattern uninstall-standalone.sh --pattern SHA256SUMS
+gh release download --repo heroicrealm/CodexAgent --pattern install-standalone.sh --pattern SHA256SUMS
 sha256sum --check --ignore-missing SHA256SUMS
 sh install-standalone.sh
 ```
 
-`gh release download` без тега выбирает последний стабильный релиз. Для воспроизводимого получения конкретной версии добавьте `v2.5.2` после `download`. При обновлении формата поставки скачайте новый установщик в пустой каталог. Не используйте скрипт из ветки main. Сам установщик запрашивает последний стабильный Release, показывает версии и требует подтверждение в терминале. Без авторизованного gh публичные артефакты можно скачать браузером со страницы конкретного Release.
+`gh release download` без тега выбирает последний стабильный релиз. Для воспроизводимого получения конкретной версии добавьте `v2.5.2.post1` после `download`. При обновлении формата поставки скачайте новый установщик в пустой каталог. Не используйте скрипт из ветки main. Сам установщик запрашивает последний стабильный Release, показывает версии и требует подтверждение в терминале. Без авторизованного gh публичные артефакты можно скачать браузером со страницы конкретного Release.
 
 Пакет устанавливается обычным wheel в отдельный venv внутри `~/codex-dispatcher`, а `~/codex-dispatcher/.venv` указывает на активную генерацию. Предыдущие генерации сохраняются до удаления программы. Повторный запуск той же версии не заменяет пакет; downgrade запрещен. Сбой загрузки, checksum или pip сохраняет прежний пакет. Чужую `.venv` или чужую короткую команду установщик не заменяет: разберите конфликт вручную, не удаляя рабочие данные.
+
+Удалитель скачивается из того же Release, что wheel и шаблон, и проверяется по SHA-256 до установки. Он хранится в `~/codex-dispatcher/.venv-standalone-*/uninstall-standalone.sh` с правами 0755. Ссылка `~/.local/bin/codex-dispatcher-uninstall` указывает через `.venv` на активную генерацию. Обновление и откат переключают пакет и удалитель вместе; чужая команда удаления вызывает отказ. Для перехода с 2.5.2 скачайте новый установщик 2.5.2.post1.
 
 Команда доступна через `~/.local/bin/codex-dispatcher` без активации venv. Если каталога нет в PATH, добавьте в `~/.profile`:
 
@@ -61,7 +63,7 @@ codex-dispatcher --config-schema-version
 В шаблоне сохранены все настройки. `dispatcher.root_path` вложен в `dispatcher`, содержит абсолютный путь пользователя; литерал `~` не поддерживается. Пути workspace/database разрешаются относительно root. Добавьте тестовый проект в `projects`, например:
 
 ```yaml
-dispatcher_version: "2.5.2"
+dispatcher_version: "2.5.2.post1"
 config_schema_version: 1
 dispatcher:
   root_path: /home/alice/codex-dispatcher
@@ -107,7 +109,7 @@ codex-dispatcher stop
 После штатной остановки:
 
 ```sh
-sh uninstall-standalone.sh
+codex-dispatcher-uninstall
 ```
 
-Удаляются только помеченные установщиком venv и его ссылка CLI. Конфигурация, SQLite, workspace/worktrees, репозитории и credentials сохраняются; весь `~/codex-dispatcher` не удаляется. Для запуска скриптов требуется Python и доступ к зависимостям bootstrap. Публикация описана в [регламенте](releasing.md).
+Удаляются помеченные установщиком поколения venv, установленный скрипт удаления, обе ссылки команд и ownership-маркер. Пустой `.standalone-install.lock` сохраняется: удаление его inode создало бы гонку между параллельными установщиками. Конфигурация, SQLite, workspace/worktrees, репозитории и credentials сохраняются; весь `~/codex-dispatcher` не удаляется. Для запуска скриптов требуется Python и доступ к зависимостям bootstrap. Публикация описана в [регламенте](releasing.md).

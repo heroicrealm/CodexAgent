@@ -4,6 +4,7 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -27,14 +28,14 @@ class Terminal(io.StringIO):
 
 @pytest.mark.parametrize('answer,allowed', [('y', True), ('Y', True), ('n', False), ('', False)])
 def test_offline_answers(monkeypatch, answer, allowed):
-    monkeypatch.setattr(releases, 'version', lambda _: '2.5.2')
+    monkeypatch.setattr(releases, 'version', lambda _: '2.5.2.post1')
     monkeypatch.setattr(releases, 'request_json', lambda _: (_ for _ in ()).throw(TimeoutError()))
     monkeypatch.setattr(sys, 'stdin', Terminal(answer + '\n'))
     assert releases.before_run() is allowed
 
 
 def test_offline_nonterminal_and_interrupt(monkeypatch):
-    monkeypatch.setattr(releases, 'version', lambda _: '2.5.2')
+    monkeypatch.setattr(releases, 'version', lambda _: '2.5.2.post1')
     monkeypatch.setattr(releases, 'request_json', lambda _: (_ for _ in ()).throw(OSError()))
     monkeypatch.setattr(sys, 'stdin', io.StringIO('y\n'))
     assert not releases.before_run()
@@ -43,10 +44,10 @@ def test_offline_nonterminal_and_interrupt(monkeypatch):
     assert not releases.before_run()
 
 
-@pytest.mark.parametrize('tag,message', [('v2.5.10', 'New dispatcher version'), ('v2.5.2', ''), ('v2.5.1', '')])
+@pytest.mark.parametrize('tag,message', [('v2.5.10', 'New dispatcher version'), ('v2.5.2.post1', ''), ('v2.5.1', '')])
 def test_release_check(monkeypatch, capsys, tag, message):
     calls = []
-    monkeypatch.setattr(releases, 'version', lambda _: '2.5.2')
+    monkeypatch.setattr(releases, 'version', lambda _: '2.5.2.post1')
     def request(url):
         calls.append(url)
         return {'tag_name': tag}
@@ -57,7 +58,7 @@ def test_release_check(monkeypatch, capsys, tag, message):
 
 
 def test_releases_error_and_timeout(monkeypatch, capsys):
-    monkeypatch.setattr(releases, 'version', lambda _: '2.5.2')
+    monkeypatch.setattr(releases, 'version', lambda _: '2.5.2.post1')
     request_json = releases.request_json
     monkeypatch.setattr(releases, 'request_json', lambda url: {} if url == releases.API else None)
     assert releases.before_run()
@@ -81,11 +82,11 @@ def test_schema_rejects_without_side_effects(tmp_path, schema):
 
 def test_config_preserves_bytes_comments_and_root(tmp_path):
     path = tmp_path / 'config.yaml'
-    old = TEMPLATE.replace('"2.5.2"', '"2.5.1" # my comment').replace('/home/user/codex-dispatcher', '/custom/root')
+    old = TEMPLATE.replace('"2.5.2.post1"', '"2.5.1" # my comment').replace('/home/user/codex-dispatcher', '/custom/root')
     path.write_text(old)
-    target, text = standalone.config_update(path, TEMPLATE, tmp_path, Version('2.5.2'), 1)
+    target, text = standalone.config_update(path, TEMPLATE, tmp_path, Version('2.5.2.post1'), 1)
     assert target == path
-    assert text == old.replace('"2.5.1"', '"2.5.2"')
+    assert text == old.replace('"2.5.1"', '"2.5.2.post1"')
     assert path.read_text() == old
     fresh = standalone.render_template(TEMPLATE, tmp_path)
     data = yaml.safe_load(fresh)
@@ -98,12 +99,12 @@ def test_new_config_does_not_touch_old(tmp_path, schema, monkeypatch):
     path = tmp_path / 'config.yaml'
     path.write_text(schema + 'dispatcher: {}\n')
     original = path.read_bytes()
-    target, text = standalone.config_update(path, TEMPLATE, tmp_path, Version('2.5.2'), 1)
+    target, text = standalone.config_update(path, TEMPLATE, tmp_path, Version('2.5.2.post1'), 1)
     assert target.name == 'config.new.yaml'
     target.write_text('keep')
     monkeypatch.setattr(standalone, 'confirm', lambda _: False)
     with pytest.raises(RuntimeError, match='preserved'):
-        standalone.config_update(path, TEMPLATE, tmp_path, Version('2.5.2'), 1)
+        standalone.config_update(path, TEMPLATE, tmp_path, Version('2.5.2.post1'), 1)
     assert path.read_bytes() == original
     assert target.read_text() == 'keep'
 
@@ -157,10 +158,10 @@ def installer(tmp_path, monkeypatch):
     monkeypatch.setenv('XDG_CONFIG_HOME', str(tmp_path / 'xdg'))
     monkeypatch.setattr(standalone.shutil, 'which', lambda _: '/fake/tool')
     monkeypatch.setattr(standalone, 'confirm', lambda _: True)
-    wheel = 'codex_dispatcher_v2-2.5.2-py3-none-any.whl'
-    payloads = {wheel: b'wheel', 'config.example.yaml': TEMPLATE.encode()}
+    wheel = 'codex_dispatcher_v2-2.5.2.post1-py3-none-any.whl'
+    payloads = {wheel: b'wheel', 'config.example.yaml': TEMPLATE.encode(), 'uninstall-standalone.sh': Path('uninstall-standalone.sh').read_bytes()}
     payloads['SHA256SUMS'] = ''.join(hashlib.sha256(b).hexdigest() + '  ' + n + '\n' for n, b in payloads.items()).encode()
-    release = {'tag_name': 'v2.5.2', 'assets': [{'name': n, 'browser_download_url': 'https://assets/' + n} for n in payloads]}
+    release = {'tag_name': 'v2.5.2.post1', 'assets': [{'name': n, 'browser_download_url': 'https://assets/' + n} for n in payloads]}
     def fetch(url):
         return json.dumps(release).encode() if url == standalone.LATEST else payloads[url.rsplit('/', 1)[1]]
     monkeypatch.setattr(standalone, 'fetch', fetch)
@@ -169,7 +170,7 @@ def installer(tmp_path, monkeypatch):
         if '-m' in argv and 'venv' in argv:
             gen = Path(argv[-1]); (gen / 'bin').mkdir(); (gen / 'bin/python').touch()
         if 'install' in argv:
-            versions[Path(argv[0]).parent.parent.name] = Version('2.5.2')
+            versions[Path(argv[0]).parent.parent.name] = Version('2.5.2.post1')
         return subprocess.CompletedProcess(argv, 0)
     monkeypatch.setattr(standalone.subprocess, 'run', run)
     def installed(path):
@@ -196,6 +197,9 @@ def test_install_repeat_uninstall_preserves_data(installer):
     assert data.read_text() == 'precious'
     assert not (base / '.venv').exists()
     assert not (home / '.local/bin/codex-dispatcher').is_symlink()
+    assert not (home / '.local/bin/codex-dispatcher-uninstall').is_symlink()
+    assert not list(base.glob('.venv-standalone-*'))
+    assert not (base / '.standalone-install.json').exists()
 
 
 @pytest.mark.parametrize('failure', ['checksum', 'download', 'pip', 'active'])
@@ -250,14 +254,14 @@ def test_successful_compatible_upgrade(installer):
     previous = (base / '.venv').resolve()
     versions[previous.name] = Version('2.5.1')
     settings = home / 'xdg/codex-dispatcher/config.yaml'
-    original = settings.read_text().replace('"2.5.2"', '"2.5.1" # preserve').replace(str(base), str(home / 'custom/work'))
+    original = settings.read_text().replace('"2.5.2.post1"', '"2.5.1" # preserve').replace(str(base), str(home / 'custom/work'))
     settings.write_text(original)
     # Use a separate custom root for the lock probe; no application data removed.
     standalone.main()
-    assert settings.read_text() == original.replace('"2.5.1"', '"2.5.2"')
+    assert settings.read_text() == original.replace('"2.5.1"', '"2.5.2.post1"')
     assert (base / '.venv').resolve() != previous
     assert previous.exists()
-    assert standalone.installed_version(base / '.venv') == Version('2.5.2')
+    assert standalone.installed_version(base / '.venv') == Version('2.5.2.post1')
 
 
 def test_schema_upgrade_repeat_uses_package_metadata(installer, monkeypatch):
@@ -266,7 +270,7 @@ def test_schema_upgrade_repeat_uses_package_metadata(installer, monkeypatch):
     base = home / 'codex-dispatcher'
     versions[(base / '.venv').resolve().name] = Version('2.5.1')
     settings = home / 'xdg/codex-dispatcher/config.yaml'
-    settings.write_text(settings.read_text().replace('"2.5.2"', '"2.5.1"'))
+    settings.write_text(settings.read_text().replace('"2.5.2.post1"', '"2.5.1"'))
     original = settings.read_bytes()
     payloads['config.example.yaml'] = TEMPLATE.replace('config_schema_version: 1', 'config_schema_version: 2').encode()
     payloads['SHA256SUMS'] = ''.join(hashlib.sha256(b).hexdigest() + '  ' + n + '\n' for n, b in payloads.items() if n != 'SHA256SUMS').encode()
@@ -351,10 +355,10 @@ def test_global_runtime_lock_allows_independent_configs(tmp_path, monkeypatch):
 
 def test_missing_metadata_and_unicode_root(tmp_path):
     path = tmp_path / 'config.yaml'
-    path.write_text(TEMPLATE.replace('dispatcher_version: "2.5.2"\n', ''))
-    target, content = standalone.config_update(path, TEMPLATE, tmp_path, Version('2.5.2'), 1)
+    path.write_text(TEMPLATE.replace('dispatcher_version: "2.5.2.post1"\n', ''))
+    target, content = standalone.config_update(path, TEMPLATE, tmp_path, Version('2.5.2.post1'), 1)
     assert target == path
-    assert content == 'dispatcher_version: "2.5.2"\n' + path.read_text()
+    assert content == 'dispatcher_version: "2.5.2.post1"\n' + path.read_text()
     root = tmp_path / 'имя пользователя'
     assert yaml.safe_load(standalone.render_template(TEMPLATE, root))['dispatcher']['root_path'] == str(root)
 
@@ -397,3 +401,88 @@ def test_uninstall_preserves_data_inside_program_directory(installer):
         standalone.main(uninstall=True)
     assert user_file.read_text() == 'preserve'
     assert (base / '.venv').is_symlink()
+
+
+def test_legacy_252_upgrade_delivers_uninstaller(installer):
+    home, _, _, versions, _ = installer
+    standalone.main()
+    base = home / 'codex-dispatcher'
+    old = (base / '.venv').resolve()
+    versions[old.name] = Version('2.5.2')
+    (home / '.local/bin/codex-dispatcher-uninstall').unlink()
+    (old / 'uninstall-standalone.sh').unlink()
+    marker = base / '.standalone-install.json'
+    state = json.loads(marker.read_text()); state.pop('uninstaller')
+    marker.write_text(json.dumps(state))
+    settings = home / 'xdg/codex-dispatcher/config.yaml'
+    settings.write_text(settings.read_text().replace('2.5.2.post1', '2.5.2'))
+    standalone.main()
+    command = home / '.local/bin/codex-dispatcher-uninstall'
+    assert command.is_symlink() and os.access(command, os.X_OK)
+    assert command.read_bytes() == Path('uninstall-standalone.sh').read_bytes()
+    assert standalone.installed_version(base / '.venv') == Version('2.5.2.post1')
+    assert yaml.safe_load(settings.read_text())['dispatcher_version'] == '2.5.2.post1'
+    assert yaml.safe_load(settings.read_text())['config_schema_version'] == 1
+
+
+@pytest.mark.parametrize('upgrade', [False, True])
+def test_uninstaller_checksum_refused(installer, upgrade):
+    home, payloads, _, versions, _ = installer
+    if upgrade:
+        standalone.main()
+        versions[(home / 'codex-dispatcher/.venv').resolve().name] = Version('2.5.2')
+    payloads['uninstall-standalone.sh'] += b'corruption'
+    with pytest.raises(ValueError, match='SHA-256 mismatch: uninstall'):
+        standalone.main()
+    command = home / '.local/bin/codex-dispatcher-uninstall'
+    if upgrade:
+        assert command.read_bytes() == Path('uninstall-standalone.sh').read_bytes()
+    else:
+        assert not command.is_symlink()
+
+
+def test_foreign_uninstaller_preserved(installer):
+    home, *_ = installer
+    command = home / '.local/bin/codex-dispatcher-uninstall'
+    command.parent.mkdir(parents=True); command.write_text('foreign')
+    with pytest.raises(RuntimeError, match='Foreign uninstall'):
+        standalone.main()
+    assert command.read_text() == 'foreign'
+
+
+def test_link_failure_restores_uninstaller_and_package(installer, monkeypatch):
+    home, _, _, versions, _ = installer
+    standalone.main()
+    base = home / 'codex-dispatcher'
+    old = (base / '.venv').resolve()
+    versions[old.name] = Version('2.5.2')
+    command = home / '.local/bin/codex-dispatcher-uninstall'
+    command.unlink()
+    settings = home / 'xdg/codex-dispatcher/config.yaml'
+    before = settings.read_bytes()
+    real = Path.symlink_to
+    def fail(path, target, *args, **kwargs):
+        if path == command:
+            raise OSError('uninstall link failure')
+        return real(path, target, *args, **kwargs)
+    monkeypatch.setattr(Path, 'symlink_to', fail)
+    with pytest.raises(OSError, match='uninstall link'):
+        standalone.main()
+    assert (base / '.venv').resolve() == old
+    assert settings.read_bytes() == before
+    assert (old / 'uninstall-standalone.sh').exists()
+
+
+def test_upgrade_switches_uninstaller_payload(installer):
+    home, payloads, _, versions, _ = installer
+    standalone.main()
+    base = home / 'codex-dispatcher'
+    previous = (base / '.venv').resolve()
+    versions[previous.name] = Version('2.5.2')
+    old_bytes = (previous / 'uninstall-standalone.sh').read_bytes()
+    payloads['uninstall-standalone.sh'] += b'\n# next release uninstaller\n'
+    payloads['SHA256SUMS'] = ''.join(hashlib.sha256(b).hexdigest() + '  ' + n + '\n' for n, b in payloads.items() if n != 'SHA256SUMS').encode()
+    standalone.main()
+    command = home / '.local/bin/codex-dispatcher-uninstall'
+    assert command.read_bytes() == payloads['uninstall-standalone.sh']
+    assert (previous / 'uninstall-standalone.sh').read_bytes() == old_bytes
