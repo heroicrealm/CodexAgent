@@ -251,8 +251,10 @@ def test_origin_main_missing_issue_number_11(environment):
 def test_clone_failure_retains_original(environment, monkeypatch, tmp_path):
     from dataclasses import replace
     config, store, api, gh, git, groups, state, pub, poll = environment
-    monkeypatch.setattr('dispatcher.git.subprocess.run', lambda *a, **k:
-        subprocess.CompletedProcess(a, 42, RAW, RAW))
+    actual_run = subprocess.run
+    monkeypatch.setattr('dispatcher.git.subprocess.run', lambda args, **kwargs:
+        subprocess.CompletedProcess(args, 42, RAW, RAW) if 'clone' in args
+        else actual_run(args, **kwargs))
     with pytest.raises(GitError) as caught:
         git.checkout(replace(config.projects[0], checkout=tmp_path / 'missing-clone'))
     assert caught.value.code == 'git_clone_failed'

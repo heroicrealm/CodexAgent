@@ -166,13 +166,11 @@ class Recovery:
         if any(p.is_symlink() for p in (configured, *configured.parents)):
             raise SchemaError('Symlink checkout identity is unproven')
         checkout = self.git.checkout(project, create=False)
-        origin = self.git.run(checkout, 'remote', 'get-url', 'origin')
-        # Credentials and arbitrary local repositories are not identity evidence.
-        repo = project.repository.casefold()
-        normalized = origin.casefold().removesuffix('.git').rstrip('/')
-        if normalized not in ('git@github.com:' + repo, 'https://github.com/' + repo,
-                              'ssh://git@github.com/' + repo):
-            raise SchemaError('Checkout origin identity is unproven')
+        from .git import GitError
+        try:
+            self.git.verify_remote(checkout)
+        except GitError as exc:
+            raise SchemaError('Checkout HTTPS origin identity is unproven; see docs/v2.5.1-https.md') from exc
         remote = self.git.run(checkout, 'ls-remote', 'origin')
         refs = dict(line.split()[::-1] for line in remote.splitlines())
         trees = self.git.worktrees(project)

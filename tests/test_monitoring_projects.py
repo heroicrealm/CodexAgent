@@ -242,7 +242,9 @@ def test_add_warning_and_git_error():
         calls.append(args)
         return dict(full_name='owner/repo', has_issues=True)
     def run(args, **kwargs):
-        assert args == ['git', 'ls-remote', 'git@github.com:owner/repo.git']
+        if args[1] == 'config':
+            return SimpleNamespace(returncode=1)
+        assert args[-2:] == ['ls-remote', 'https://github.com/owner/repo.git']
         assert kwargs['env']['GIT_TERMINAL_PROMPT'] == '0'
         return SimpleNamespace(returncode=0)
     assert validate_remote('owner/repo', transport, run).startswith('WARN')

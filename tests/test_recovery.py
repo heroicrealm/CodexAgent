@@ -71,12 +71,7 @@ class FakeHTTP:
         pytest.fail(f'Unexpected external mutation: {method} {endpoint}')
 
 
-class LocalGit(Git):
-    """Origin identity is injected; all ref/worktree operations use a local bare repo."""
-    def run(self, directory, *args, **kwargs):
-        if args == ('remote', 'get-url', 'origin'):
-            return 'git@github.com:owner/repo.git'
-        return super().run(directory, *args, **kwargs)
+from local_git import LocalGit
 
 
 def git(*args):

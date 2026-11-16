@@ -72,7 +72,7 @@ def main():
     try:
         config = load_config(args.config)
     except (ValueError, OSError, TypeError, KeyError, yaml.YAMLError) as exc:
-        parser.exit(1, f'FAIL configuration: {exc}\n')
+        parser.exit(1, f'FAIL configuration ({type(exc).__name__}): invalid or unreadable V2 configuration\n')
     if args.command in ('status', 'queue', 'show', 'project'):
         try:
             from . import monitoring as queries
@@ -167,20 +167,26 @@ def main():
         check(config, execution=args.command not in ('queue', 'status'))
     except (SchemaError, OSError) as exc:
         parser.exit(1, f'FAIL {exc}\n')
-    runtime = Runtime(config)
-    if args.command == 'run':
-        runtime.run(once=args.once)
-    else:
-        from .locking import InstanceLock
-        with InstanceLock(config):
-            check(config, execution=True)
-            if args.command == 'init-labels':
-                for project in config.projects:
-                    if not project.enabled:
-                        continue
-                    runtime.github.initialize_labels(project)
-            else:
-                runtime.publisher.publish(args.execution_id)
+    try:
+        runtime = Runtime(config)
+        if args.command == 'run':
+            runtime.run(once=args.once)
+        else:
+            from .locking import InstanceLock
+            with InstanceLock(config):
+                check(config, execution=True)
+                if args.command == 'init-labels':
+                    for project in config.projects:
+                        if not project.enabled:
+                            continue
+                        runtime.github.initialize_labels(project)
+                else:
+                    runtime.publisher.publish(args.execution_id)
+    except (RuntimeError, ValueError, OSError, sqlite3.DatabaseError) as exc:
+        # External exceptions can contain credentials. Early failures must be
+        # visible without dumping their free-form text or a traceback.
+        parser.exit(1, f'FAIL runtime ({type(exc).__name__}): check database identity, '
+                       'instance locks and HTTPS Git configuration\n')
 
 
 if __name__ == '__main__':
