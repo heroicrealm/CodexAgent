@@ -1,4 +1,4 @@
-name: WSL distribution artifacts
+name: Standalone distribution artifacts
 on:
   push:
   pull_request:
@@ -14,8 +14,8 @@ jobs:
         with:
           python-version: '3.11'
       - run: python -m pip install build '.[test]'
-      - run: python scripts/embed-wsl.py --check
-      - run: sh -n install-wsl.sh && sh -n uninstall-wsl.sh
+      - run: python scripts/embed-standalone.py --check
+      - run: sh -n install-standalone.sh && sh -n uninstall-standalone.sh
       - run: python -m pytest -q
       - run: python -m build --wheel
       - run: python -m venv /tmp/dispatcher-wheel
@@ -26,10 +26,10 @@ jobs:
       - run: python scripts/smoke-install.py dist/*.whl /tmp/wheelhouse
       - name: Prepare reviewed release bundle (no tag or publication)
         run: |
-          cp install-wsl.sh uninstall-wsl.sh config/config.example.yaml docs/releases/v2.5.2.md dist/
+          cp install-standalone.sh uninstall-standalone.sh config/config.example.yaml docs/releases/v2.5.2.md dist/
           cd dist
           sha256sum *.whl *.sh config.example.yaml v2.5.2.md > SHA256SUMS
       - uses: actions/upload-artifact@v4
         with:
-          name: wsl-release-candidate
+          name: standalone-release-candidate
           path: dist/

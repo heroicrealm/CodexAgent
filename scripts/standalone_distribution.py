@@ -1,4 +1,4 @@
-"""Embedded into standalone release scripts by embed-wsl.py. No repository needed."""
+"""Embedded into standalone release scripts by embed-standalone.py. No repository needed."""
 import contextlib
 import fcntl
 import hashlib
@@ -17,7 +17,7 @@ from packaging.version import Version
 
 REPOSITORY = 'heroicrealm/CodexAgent'
 LATEST = f'https://api.github.com/repos/{REPOSITORY}/releases/latest'
-MARKER = 'codex-dispatcher-wsl-v1'
+MARKER = 'codex-dispatcher-standalone-v1'
 
 
 def call(argv):
@@ -121,14 +121,14 @@ def stopped(config_path, python, module_path):
 
 
 def owned_state(base):
-    marker = base / '.wsl-install.json'
+    marker = base / '.standalone-install.json'
     if not marker.exists():
         return None
     data = json.loads(marker.read_text())
     if data.get('owner') != MARKER:
         raise RuntimeError('Unknown installation owner')
     for name in data['generations']:
-        if not re.fullmatch(r'\.venv-wsl-[A-Za-z0-9_-]+', name):
+        if not re.fullmatch(r'\.venv-standalone-[A-Za-z0-9_-]+', name):
             raise RuntimeError('Unsafe generation name')
         if (base / name).is_symlink():
             raise RuntimeError('Unsafe generation symlink')
@@ -154,11 +154,11 @@ def main(uninstall=False):
     if any(p.is_symlink() for p in (base, *base.parents)):
         raise RuntimeError('Symlink installation directory refused')
     base.mkdir(parents=True, exist_ok=True)
-    for owned in (base / '.wsl-install.json', base / '.wsl-install.lock'):
+    for owned in (base / '.standalone-install.json', base / '.standalone-install.lock'):
         if owned.is_symlink():
             raise RuntimeError('Symlink ownership/lock file refused')
     # Serializes installers/uninstallers independently of runtime locks.
-    with (base / '.wsl-install.lock').open('a+') as guard:
+    with (base / '.standalone-install.lock').open('a+') as guard:
         try:
             fcntl.flock(guard, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
@@ -190,12 +190,12 @@ def main(uninstall=False):
                 venv.unlink()
                 for name in state['generations']:
                     shutil.rmtree(base / name)
-                (base / '.wsl-install.json').unlink()
+                (base / '.standalone-install.json').unlink()
             print('Program removed. Configuration, database, workspace and credentials preserved.')
             return
         for command in ('git', 'gh', 'codex'):
             if not shutil.which(command):
-                raise RuntimeError(f'Missing prerequisite: {command}; see docs/wsl2.md')
+                raise RuntimeError(f'Missing prerequisite: {command}; see docs/standalone.md')
         if subprocess.run(['gh', 'auth', 'status'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode:
             print('WARNING: Configure authentication yourself: gh auth login; gh auth setup-git')
         if subprocess.run(['codex', 'login', 'status'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode:
@@ -238,7 +238,7 @@ def main(uninstall=False):
                 if hashlib.sha256(payload).hexdigest() != checksums[name]:
                     raise ValueError(f'SHA-256 mismatch: {name}')
                 (Path(download) / name).write_bytes(payload)
-            generation = Path(tempfile.mkdtemp(prefix='.venv-wsl-', dir=base))
+            generation = Path(tempfile.mkdtemp(prefix='.venv-standalone-', dir=base))
             committed = False
             try:
                 subprocess.run([sys.executable, '-m', 'venv', str(generation)], check=True)
@@ -251,12 +251,12 @@ def main(uninstall=False):
                 with stopped(config, generation / 'bin/python', str(Path(module).parent)):
                     # All fallible preparation finished before replacing active CLI.
                     old_config = target.read_text() if target.exists() else None
-                    old_state = (base / '.wsl-install.json').read_text() if state else None
+                    old_state = (base / '.standalone-install.json').read_text() if state else None
                     new_state = {'owner': MARKER, 'current': generation.name,
                                  'generations': (state['generations'] if state else []) + [generation.name]}
                     try:
                         atomic_write(target, content)
-                        atomic_write(base / '.wsl-install.json', json.dumps(new_state))
+                        atomic_write(base / '.standalone-install.json', json.dumps(new_state))
                         link = base / '.venv-next'
                         if link.exists() or link.is_symlink():
                             raise RuntimeError('Unexpected .venv-next; preserved')
@@ -272,9 +272,9 @@ def main(uninstall=False):
                             if state:
                                 venv.symlink_to(state['current'])
                         if old_state is None:
-                            (base / '.wsl-install.json').unlink(missing_ok=True)
+                            (base / '.standalone-install.json').unlink(missing_ok=True)
                         else:
-                            atomic_write(base / '.wsl-install.json', old_state)
+                            atomic_write(base / '.standalone-install.json', old_state)
                         if old_config is None:
                             target.unlink(missing_ok=True)
                         else:

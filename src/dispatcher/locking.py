@@ -9,11 +9,11 @@ def installation_lock_path():
     """Installed generations share exclusion even with a custom --config.
 
     This fd joins existing inherited runtime locks, protecting active children.
-    Source checkouts and installations not managed by WSL have no extra lock.
+    Source checkouts and installations not managed by Standalone have no extra lock.
     """
     prefix = Path(sys.prefix).resolve()
-    if prefix.name.startswith(".venv-wsl-") and (prefix.parent / ".wsl-install.json").is_file():
-        return prefix.parent / ".wsl-install.lock"
+    if prefix.name.startswith(".venv-standalone-") and (prefix.parent / ".standalone-install.json").is_file():
+        return prefix.parent / ".standalone-install.lock"
     return None
 
 

@@ -45,7 +45,7 @@ def before_run():
         candidate = stable_version(release)
         if candidate > installed:
             print(f'New dispatcher version {candidate}: https://github.com/heroicrealm/CodexAgent/releases/tag/{release["tag_name"]}\n'
-                  'Stop dispatcher and run install-wsl.sh to update.')
+                  'Stop dispatcher and run install-standalone.sh to update.')
     except (OSError, ValueError, KeyError, TypeError):
         print('WARNING: Unable to check dispatcher updates.')
     return True
