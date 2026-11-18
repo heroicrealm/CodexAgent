@@ -373,3 +373,26 @@ retry, accept и автоматическая сверка проверены р
 [Установка, обновление и удаление: WSL2 и Ubuntu native](docs/standalone.md) · [Регламент сборки и публикации Release](docs/releasing.md) · [Release notes 2.5.2.post2](docs/releases/v2.5.2.post2.md).
 
 Версия пакета: `2.5.2.post2`, схема: `1`. `codex-dispatcher --version` работает без конфигурации. При переходе с 2.5.2.post1 один раз скачайте новый установщик и SHA256SUMS из конкретного Release по инструкции выше; далее используйте `codex-dispatcher-install`. Несовпадение SHA требует ручного скачивания актуального скрипта, установка сохраняется. Удаление требует интерактивного `y`; без TTY отказывает.
+
+### Пользовательская служба Ubuntu Server (V2.5.3)
+
+После установки Standalone, настройки конфига, SQLite и авторизации `gh` и Codex:
+
+```sh
+codex-dispatcher service install
+# Администратор явно включает linger для учётной записи службы
+loginctl enable-linger USER
+codex-dispatcher service start
+codex-dispatcher service status
+codex-dispatcher service logs -n 50 -f
+```
+
+`service install` регистрирует автозапуск без немедленного старта.
+`service stop` ждёт завершения активной Issue и публикации, а `service restart`
+запускает службу после завершения остановки. Перед обновлением остановите её и
+подтвердите остановку runtime. После установки и проверки версии запустите вручную.
+Перед удалением пакета выполните `service uninstall`.
+
+Поддерживается глобальный `--config /absolute/path` перед `service install`.
+Для WSL2 доступен прежний foreground-режим. Команды, диагностика и ручная приёмка
+S01–S19 описаны в [руководстве Ubuntu Server](docs/v2.5.3-ubuntu-service.md).
