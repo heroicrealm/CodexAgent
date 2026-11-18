@@ -1,7 +1,5 @@
 name: Standalone distribution artifacts
 on:
-  push:
-  pull_request:
   workflow_dispatch:
 permissions:
   contents: read
