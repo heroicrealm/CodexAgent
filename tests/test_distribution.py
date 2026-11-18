@@ -27,22 +27,13 @@ class Terminal(io.StringIO):
         return True
 
 
-@pytest.mark.parametrize('answer,allowed', [('y', True), ('Y', True), ('n', False), ('', False)])
-def test_offline_answers(monkeypatch, answer, allowed):
+@pytest.mark.parametrize('error', [OSError, TimeoutError])
+def test_offline_release_check_does_not_read_stdin(monkeypatch, capsys, error):
     monkeypatch.setattr(releases, 'version', lambda _: '2.5.2.post2')
-    monkeypatch.setattr(releases, 'request_json', lambda _: (_ for _ in ()).throw(TimeoutError()))
-    monkeypatch.setattr(sys, 'stdin', Terminal(answer + '\n'))
-    assert releases.before_run() is allowed
-
-
-def test_offline_nonterminal_and_interrupt(monkeypatch):
-    monkeypatch.setattr(releases, 'version', lambda _: '2.5.2.post2')
-    monkeypatch.setattr(releases, 'request_json', lambda _: (_ for _ in ()).throw(OSError()))
-    monkeypatch.setattr(sys, 'stdin', io.StringIO('y\n'))
-    assert not releases.before_run()
-    monkeypatch.setattr(sys, 'stdin', Terminal())
-    monkeypatch.setattr('builtins.input', lambda _: (_ for _ in ()).throw(KeyboardInterrupt()))
-    assert not releases.before_run()
+    monkeypatch.setattr(releases, 'request_json', lambda _: (_ for _ in ()).throw(error()))
+    monkeypatch.setattr('builtins.input', lambda *_: pytest.fail('release check prompted'))
+    releases.before_run()
+    assert 'Unable to check' in capsys.readouterr().err
 
 
 @pytest.mark.parametrize('tag,message', [('v2.5.10', 'New dispatcher version'), ('v2.5.2.post2', ''), ('v2.5.1', '')])
@@ -53,17 +44,17 @@ def test_release_check(monkeypatch, capsys, tag, message):
         calls.append(url)
         return {'tag_name': tag}
     monkeypatch.setattr(releases, 'request_json', request)
-    assert releases.before_run()
-    assert calls == [releases.API, releases.LATEST]
+    releases.before_run()
+    assert calls == [releases.LATEST]
     assert capsys.readouterr().out.startswith(message)
 
 
 def test_releases_error_and_timeout(monkeypatch, capsys):
     monkeypatch.setattr(releases, 'version', lambda _: '2.5.2.post2')
     request_json = releases.request_json
-    monkeypatch.setattr(releases, 'request_json', lambda url: {} if url == releases.API else None)
-    assert releases.before_run()
-    assert 'Unable to check' in capsys.readouterr().out
+    monkeypatch.setattr(releases, 'request_json', lambda url: None)
+    releases.before_run()
+    assert 'Unable to check' in capsys.readouterr().err
     def urlopen(request, timeout):
         assert timeout == 3
         raise TimeoutError()

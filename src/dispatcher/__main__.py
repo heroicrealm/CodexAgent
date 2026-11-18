@@ -188,8 +188,7 @@ def main():
         return
     if args.command == 'run':
         from .releases import before_run
-        if not before_run():
-            parser.exit(1)
+        before_run()
     from .db_guard import check
     from .storage import SchemaError
     try:
