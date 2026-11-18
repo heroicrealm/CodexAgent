@@ -133,6 +133,7 @@ def test_cli_formats(command, as_json, monkeypatch, capsys):
             calls.append((action, project, number))
             return operation['operation_id']
     monkeypatch.setattr('dispatcher.__main__.load_config', lambda p: SimpleNamespace())
+    monkeypatch.setattr('dispatcher.__main__.validate_schema', lambda *a: None)
     monkeypatch.setattr('dispatcher.recovery.Recovery', Service)
     monkeypatch.setattr('dispatcher.github.GitHubAdapter', lambda *a: None)
     monkeypatch.setattr('dispatcher.git.Git', lambda *a: None)
@@ -164,6 +165,7 @@ def test_cli_refusal(command, as_json, monkeypatch, capsys):
     def refuse(*a):
         raise SchemaError('synthetic refusal')
     monkeypatch.setattr('dispatcher.__main__.load_config', lambda p: None)
+    monkeypatch.setattr('dispatcher.__main__.validate_schema', lambda *a: None)
     class Service:
         def __init__(self, *args):
             pass

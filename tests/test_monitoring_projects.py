@@ -29,7 +29,7 @@ def instance(tmp_path):
     maintain(config, 'bootstrap')
     store = Storage(config.database)
     settings = tmp_path / 'config.yaml'
-    settings.write_text(yaml.safe_dump({'custom': {'keep': 42}, 'dispatcher': {
+    settings.write_text(yaml.safe_dump({'config_schema_version': 1, 'custom': {'keep': 42}, 'dispatcher': {
         'root_path': str(tmp_path), 'workspace': 'workspace', 'database': 'runtime/db'},
         'projects': [dict(id=p.id, repository=p.repository, enabled=p.enabled) for p in config.projects]}))
     return config, store, settings

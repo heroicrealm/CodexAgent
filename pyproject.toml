@@ -4,9 +4,9 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "codex-dispatcher-v2"
-version = "2.3.0a0"
+version = "2.5.2.post2"
 requires-python = ">=3.11"
-dependencies = ["PyYAML>=6", "rich>=13"]
+dependencies = ["PyYAML>=6", "rich>=13", "packaging>=23"]
 
 [project.scripts]
 codex-dispatcher = "dispatcher.__main__:main"

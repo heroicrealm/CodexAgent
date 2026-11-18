@@ -367,3 +367,9 @@ retry, accept и автоматическая сверка проверены р
 
 В `show -v` поля Push/PR/Comment publication выводятся как Yes/No/N/A;
 нулевой exit code остаётся 0. `show --json` сохраняет исходные 1/0/null.
+
+### Поставка V2.5.2.2 Standalone
+
+[Установка, обновление и удаление: WSL2 и Ubuntu native](docs/standalone.md) · [Регламент сборки и публикации Release](docs/releasing.md) · [Release notes 2.5.2.post2](docs/releases/v2.5.2.post2.md).
+
+Версия пакета: `2.5.2.post2`, схема: `1`. `codex-dispatcher --version` работает без конфигурации. При переходе с 2.5.2.post1 один раз скачайте новый установщик и SHA256SUMS из конкретного Release по инструкции выше; далее используйте `codex-dispatcher-install`. Несовпадение SHA требует ручного скачивания актуального скрипта, установка сохраняется. Удаление требует интерактивного `y`; без TTY отказывает.

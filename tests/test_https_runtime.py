@@ -226,6 +226,8 @@ def test_early_runtime_error_is_stderr_and_nonzero(environment, monkeypatch, cap
     from dispatcher.__main__ import main
     config = environment[0]
     monkeypatch.setattr('dispatcher.__main__.load_config', lambda *a: config)
+    monkeypatch.setattr('dispatcher.__main__.validate_schema', lambda *a: None)
+    monkeypatch.setattr('dispatcher.releases.before_run', lambda: True)
     def fail(*a):
         raise RuntimeError('token=never-print-this')
     monkeypatch.setattr('dispatcher.__main__.Runtime', fail)

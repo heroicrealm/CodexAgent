@@ -6,6 +6,21 @@ import re
 import os
 import yaml
 
+CONFIG_SCHEMA_VERSION = 1
+
+
+class ConfigSchemaError(ValueError):
+    pass
+
+
+def validate_schema(path=None):
+    data = yaml.safe_load(resolve_config(path).read_text())
+    actual = data.get("config_schema_version") if isinstance(data, dict) else None
+    if type(actual) is not int or actual != CONFIG_SCHEMA_VERSION:
+        raise ConfigSchemaError(f"config_schema_version={actual!r}; expected {CONFIG_SCHEMA_VERSION}. "
+                         "Reconcile config.new.yaml manually.")
+
+
 LABEL_KEYS = frozenset({"codex-ready", "approve", "discovered", "awaiting-children",
     "pending", "running", "manual-running", "review", "rejected", "done",
     "cancelled", "error", "need-fix"})

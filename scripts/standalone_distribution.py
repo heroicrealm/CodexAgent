@@ -1,0 +1,375 @@
+"""Embedded into standalone release scripts by embed-standalone.py. No repository needed."""
+import contextlib
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from urllib.request import Request, urlopen
+
+import yaml
+from packaging.version import Version
+
+REPOSITORY = 'heroicrealm/CodexAgent'
+LATEST = f'https://api.github.com/repos/{REPOSITORY}/releases/latest'
+MARKER = 'codex-dispatcher-standalone-v1'
+
+
+def call(argv):
+    return subprocess.check_output([str(v) for v in argv], text=True).strip()
+
+
+def fetch(url):
+    if not url.startswith('https://'):
+        raise ValueError('HTTPS release assets required')
+    with urlopen(Request(url, headers={'User-Agent': MARKER}), timeout=30) as response:
+        return response.read()
+
+
+def confirm(message):
+    if not sys.stdin.isatty():
+        raise RuntimeError('Interactive terminal required')
+    return input(message + ' [y/N]: ').strip().lower() == 'y'
+
+
+def installed_version(venv):
+    if not (venv / 'bin/python').exists():
+        return None
+    return Version(call([venv / 'bin/python', '-c',
+        'from importlib.metadata import version; print(version("codex-dispatcher-v2"))']))
+
+
+def render_template(text, root):
+    data = yaml.safe_load(text)
+    if not isinstance(data, dict) or type(data.get('config_schema_version')) is not int:
+        raise ValueError('Invalid release template')
+    text, count = re.subn(r'^  root_path:.*$', lambda _: '  root_path: ' + json.dumps(str(root)), text, flags=re.M)
+    if count != 1:
+        raise ValueError('Template must have dispatcher.root_path')
+    data = yaml.safe_load(text)
+    if data['dispatcher']['root_path'] != str(root):
+        raise ValueError('Invalid nested root_path')
+    return text
+
+
+def config_update(path, template, root, version, schema):
+    """Return planned path/content; never rewrite a user's incompatible file."""
+    fresh = render_template(template, root)
+    data = yaml.safe_load(fresh)
+    if data['config_schema_version'] != schema or Version(str(data['dispatcher_version'])) != version:
+        raise ValueError('Wheel/template version or schema mismatch')
+    if not path.exists():
+        return path, fresh
+    original = path.read_text()
+    try:
+        old = yaml.safe_load(original)
+    except yaml.YAMLError:
+        old = None
+    if isinstance(old, dict) and type(old.get('config_schema_version')) is int and old['config_schema_version'] == schema:
+        # Restrict editing to a plain, single top-level metadata line. Exotic YAML
+        # syntax is preserved for manual reconciliation rather than reserialized.
+        pattern = r'^(dispatcher_version:[ \t]*)([^#\r\n]*?)([ \t]*(?:#[^\r\n]*)?)$'
+        result, count = re.subn(pattern, lambda m: m[1] + json.dumps(str(version)) + m[3], original, flags=re.M)
+        if count == 0 and 'dispatcher_version' not in old:
+            result = 'dispatcher_version: ' + json.dumps(str(version)) + '\n' + original
+            count = 1
+        if count != 1 or yaml.safe_load(result) != {**old, 'dispatcher_version': str(version)}:
+            raise ValueError('Cannot safely edit dispatcher_version; use a plain top-level metadata line')
+        return path, result
+    target = path.with_name('config.new.yaml')
+    print('Configuration schema requires manual reconciliation: ' + str(target))
+    if target.exists() and not confirm('Replace existing config.new.yaml?'):
+        raise RuntimeError('Existing config.new.yaml preserved; installation cancelled')
+    return target, fresh
+
+
+def atomic_write(path, text):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(dir=path.parent, prefix='.dispatcher-')
+    try:
+        with os.fdopen(fd, 'w') as stream:
+            stream.write(text)
+        if path.exists():
+            os.chmod(name, path.stat().st_mode & 0o777)
+        os.replace(name, path)
+    finally:
+        Path(name).unlink(missing_ok=True)
+
+
+@contextlib.contextmanager
+def stopped(config_path, python, module_path):
+    """Use release core's exact lock and monitor contracts, even for old YAML."""
+    if not config_path.exists():
+        yield
+        return
+    # Candidate wheel is installed in a separate generation; load its core into
+    # this bootstrap interpreter to hold locks throughout the complete swap.
+    sys.path.insert(0, module_path)
+    from dispatcher.config import load_config
+    from dispatcher.monitoring import daemon
+    from dispatcher.locking import InstanceLock
+    config = load_config(config_path)
+    if daemon(config)['state'] != 'STOPPED':
+        raise RuntimeError('Dispatcher shutdown not proven; run codex-dispatcher stop first')
+    with InstanceLock(config):
+        yield
+
+
+def owned_state(base):
+    marker = base / '.standalone-install.json'
+    if not marker.exists():
+        return None
+    data = json.loads(marker.read_text())
+    if data.get('owner') != MARKER:
+        raise RuntimeError('Unknown installation owner')
+    for name in data['generations']:
+        if not re.fullmatch(r'\.venv-standalone-[A-Za-z0-9_-]+', name):
+            raise RuntimeError('Unsafe generation name')
+        if (base / name).is_symlink():
+            raise RuntimeError('Unsafe generation symlink')
+    if data['current'] not in data['generations']:
+        raise RuntimeError('Unknown current generation')
+    return data
+
+
+def check_cli(cli, venv):
+    if cli.is_symlink() and os.readlink(cli) == str(venv / 'bin/codex-dispatcher'):
+        return
+    if cli.exists() or cli.is_symlink():
+        raise RuntimeError(f'Foreign CLI file preserved: {cli}')
+
+
+def release_check(script, base, installer_cli):
+    """Read-only preflight: no install namespace is created on failure."""
+    release = json.loads(fetch(LATEST))
+    candidate = Version(release['tag_name'].removeprefix('v'))
+    if release.get('draft') or release.get('prerelease') or candidate.is_prerelease or candidate.is_devrelease:
+        raise ValueError('Stable release required')
+    assets = {a['name']: a for a in release['assets']}
+    sums_asset = assets['SHA256SUMS']
+    sums = fetch(sums_asset['browser_download_url'])
+    digest = sums_asset.get('digest')
+    if digest and digest != 'sha256:' + hashlib.sha256(sums).hexdigest():
+        raise ValueError('SHA256SUMS GitHub digest mismatch')
+    checksums = {}
+    for line in sums.decode().splitlines():
+        digest, name = line.split(maxsplit=1)
+        name = name.lstrip('*')
+        if not re.fullmatch('[0-9a-f]{64}', digest) or name in checksums:
+            raise ValueError('Invalid SHA256SUMS entry')
+        checksums[name] = digest
+    expected = checksums['install-standalone.sh']
+    if script.is_symlink():
+        state = owned_state(base)
+        venv = base / '.venv'
+        if not (script.absolute() == installer_cli and state and state.get('installer') is True
+                and os.readlink(script) == str(venv / 'install-standalone.sh')
+                and venv.is_symlink() and os.readlink(venv) == state['current']
+                and not (venv / 'install-standalone.sh').is_symlink()):
+            raise RuntimeError('Unowned installer symlink refused')
+    if hashlib.sha256(script.read_bytes()).hexdigest() != expected:
+        url = f"https://github.com/{REPOSITORY}/releases/tag/{release['tag_name']}"
+        raise RuntimeError(f'Installer SHA-256 mismatch. Release: {url}\n'
+            f"Download install-standalone.sh and SHA256SUMS manually from {url}; "
+            'run sha256sum --check --ignore-missing SHA256SUMS, then sh install-standalone.sh. '
+            'Installation unchanged.')
+    return candidate, assets, checksums
+
+
+def main(uninstall=False, script_path=None):
+    home = Path.home()
+    base = home / 'codex-dispatcher'
+    venv = base / '.venv'
+    cli = home / '.local/bin/codex-dispatcher'
+    removal_cli = home / '.local/bin/codex-dispatcher-uninstall'
+    removal_target = venv / 'uninstall-standalone.sh'
+    installer_cli = home / '.local/bin/codex-dispatcher-install'
+    installer_target = venv / 'install-standalone.sh'
+    if not uninstall:
+        if script_path is None:
+            raise RuntimeError('Executing installer path required')
+        candidate, assets, checksums = release_check(Path(script_path), base, installer_cli)
+    xdg = Path(os.environ.get('XDG_CONFIG_HOME', ''))
+    config = (xdg if xdg.is_absolute() else home / '.config') / 'codex-dispatcher/config.yaml'
+    if any(p.is_symlink() for p in (base, *base.parents)):
+        raise RuntimeError('Symlink installation directory refused')
+    base.mkdir(parents=True, exist_ok=True)
+    for owned in (base / '.standalone-install.json', base / '.standalone-install.lock'):
+        if owned.is_symlink():
+            raise RuntimeError('Symlink ownership/lock file refused')
+    # Serializes installers/uninstallers independently of runtime locks.
+    with (base / '.standalone-install.lock').open('a+') as guard:
+        try:
+            fcntl.flock(guard, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise RuntimeError('Dispatcher or another installer is active; stop it before updating/removing') from exc
+        state = owned_state(base)
+        check_cli(cli, venv)
+        if removal_cli.exists() or removal_cli.is_symlink():
+            if not (state and state.get('uninstaller') is True and removal_cli.is_symlink()
+                    and os.readlink(removal_cli) == str(removal_target)):
+                raise RuntimeError(f'Foreign uninstall command preserved: {removal_cli}')
+        if installer_cli.exists() or installer_cli.is_symlink():
+            if not (state and state.get('installer') is True and installer_cli.is_symlink()
+                    and os.readlink(installer_cli) == str(installer_target)):
+                raise RuntimeError(f'Foreign installer command preserved: {installer_cli}')
+        if (venv.exists() or venv.is_symlink()) and (
+            not state or not venv.is_symlink() or os.readlink(venv) != state['current']):
+            raise RuntimeError('Unowned .venv preserved; use a separate installation or reconcile manually')
+        if uninstall:
+            if not state:
+                raise RuntimeError('No owned installation found')
+            module = call([venv / 'bin/python', '-c', 'import dispatcher; print(next(iter(dispatcher.__path__)))'])
+            with stopped(config, venv / 'bin/python', str(Path(module).parent)):
+                from dispatcher.config import load_config
+                protected = [config.resolve()]
+                if config.exists():
+                    settings = load_config(config)
+                    protected.extend(p.resolve() for p in (settings.database, settings.workspace,
+                        *(project.checkout for project in settings.projects if project.checkout)))
+                    if settings.root_path:
+                        protected.append(settings.root_path.resolve())
+                for name in state['generations']:
+                    generation = (base / name).resolve()
+                    if any(path.is_relative_to(generation) for path in protected):
+                        raise RuntimeError('User data/configuration overlaps program venv; removal refused')
+                print(f'Remove Codex Dispatcher {installed_version(venv)}. Configuration, SQLite, workspace/worktrees, repositories and credentials will be preserved.')
+                try:
+                    approved = confirm('Proceed with uninstall?')
+                except (EOFError, KeyboardInterrupt):
+                    approved = False
+                if not approved:
+                    print('Uninstall cancelled.')
+                    return
+                if installer_cli.is_symlink():
+                    installer_cli.unlink()
+                if cli.is_symlink():
+                    cli.unlink()
+                if removal_cli.is_symlink():
+                    removal_cli.unlink()
+                venv.unlink()
+                for name in state['generations']:
+                    shutil.rmtree(base / name)
+                (base / '.standalone-install.json').unlink()
+            print('Program removed. Configuration, database, workspace and credentials preserved.')
+            return
+        for command in ('git', 'gh', 'codex'):
+            if not shutil.which(command):
+                raise RuntimeError(f'Missing prerequisite: {command}; see docs/standalone.md')
+        if subprocess.run(['gh', 'auth', 'status'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode:
+            print('WARNING: Configure authentication yourself: gh auth login; gh auth setup-git')
+        if subprocess.run(['codex', 'login', 'status'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode:
+            print('WARNING: Configure Codex authentication yourself: codex login')
+        current = installed_version(venv)
+        if current and candidate < current:
+            raise RuntimeError(f'Downgrade refused: installed {current}, release {candidate}')
+        if (current == candidate and state and state.get('installer') is True
+                and installer_target.is_file() and not installer_target.is_symlink()
+                and os.access(installer_target, os.X_OK)
+                and hashlib.sha256(installer_target.read_bytes()).hexdigest() == checksums['install-standalone.sh']
+                and state.get('uninstaller') is True
+                and removal_target.is_file() and not removal_target.is_symlink()
+                and os.access(removal_target, os.X_OK)):
+            print(f'Installed package {current} is current.')
+            if not cli.is_symlink():
+                cli.parent.mkdir(parents=True, exist_ok=True)
+                cli.symlink_to(venv / 'bin/codex-dispatcher')
+            if not installer_cli.is_symlink():
+                installer_cli.symlink_to(installer_target)
+            if not removal_cli.is_symlink():
+                removal_cli.symlink_to(removal_target)
+            if str(cli.parent) not in os.environ.get('PATH', '').split(os.pathsep):
+                print('Add to ~/.profile: export PATH="$HOME/.local/bin:$PATH"; open a new shell.')
+            return
+        if not confirm(f'Install {candidate} (installed: {current or "none"})?'):
+            return
+        wheels = [n for n in assets if n.endswith('-py3-none-any.whl') and n.startswith('codex_dispatcher_v2-')]
+        if len(wheels) != 1:
+            raise ValueError('Expected one universal dispatcher wheel')
+        with tempfile.TemporaryDirectory() as download:
+            for name in (wheels[0], 'config.example.yaml', 'uninstall-standalone.sh', 'install-standalone.sh'):
+                payload = fetch(assets[name]['browser_download_url'])
+                if hashlib.sha256(payload).hexdigest() != checksums[name]:
+                    raise ValueError(f'SHA-256 mismatch: {name}')
+                (Path(download) / name).write_bytes(payload)
+            generation = Path(tempfile.mkdtemp(prefix='.venv-standalone-', dir=base))
+            committed = False
+            try:
+                subprocess.run([sys.executable, '-m', 'venv', str(generation)], check=True)
+                subprocess.run([str(generation / 'bin/python'), '-m', 'pip', 'install', str(Path(download) / wheels[0])], check=True)
+                shutil.copyfile(Path(download) / 'install-standalone.sh', generation / 'install-standalone.sh')
+                (generation / 'install-standalone.sh').chmod(0o755)
+                shutil.copyfile(Path(download) / 'uninstall-standalone.sh', generation / 'uninstall-standalone.sh')
+                (generation / 'uninstall-standalone.sh').chmod(0o755)
+                if installed_version(generation) != candidate:
+                    raise RuntimeError('Installed package version mismatch')
+                schema = int(call([generation / 'bin/codex-dispatcher', '--config-schema-version']))
+                module = call([generation / 'bin/python', '-c', 'import dispatcher; print(next(iter(dispatcher.__path__)))'])
+                target, content = config_update(config, (Path(download) / 'config.example.yaml').read_text(), base, candidate, schema)
+                with stopped(config, generation / 'bin/python', str(Path(module).parent)):
+                    # All fallible preparation finished before replacing active CLI.
+                    old_config = target.read_text() if target.exists() else None
+                    old_state = (base / '.standalone-install.json').read_text() if state else None
+                    had_cli = cli.is_symlink()
+                    had_installer_cli = installer_cli.is_symlink()
+                    had_removal_cli = removal_cli.is_symlink()
+                    new_state = {'owner': MARKER, 'uninstaller': True, 'installer': True, 'current': generation.name,
+                                 'generations': (state['generations'] if state else []) + [generation.name]}
+                    try:
+                        atomic_write(target, content)
+                        atomic_write(base / '.standalone-install.json', json.dumps(new_state))
+                        link = base / '.venv-next'
+                        if link.exists() or link.is_symlink():
+                            raise RuntimeError('Unexpected .venv-next; preserved')
+                        link.symlink_to(generation.name)
+                        os.replace(link, venv)
+                        cli.parent.mkdir(parents=True, exist_ok=True)
+                        if not cli.is_symlink():
+                            cli.symlink_to(venv / 'bin/codex-dispatcher')
+                        if not removal_cli.is_symlink():
+                            removal_cli.symlink_to(removal_target)
+                        if not installer_cli.is_symlink():
+                            installer_cli.symlink_to(installer_target)
+                        committed = True
+                    except BaseException:
+                        if not had_installer_cli and installer_cli.is_symlink() and os.readlink(installer_cli) == str(installer_target):
+                            installer_cli.unlink()
+                        if not had_removal_cli and removal_cli.is_symlink() and os.readlink(removal_cli) == str(removal_target):
+                            removal_cli.unlink()
+                        if not had_cli and cli.is_symlink() and os.readlink(cli) == str(venv / 'bin/codex-dispatcher'):
+                            cli.unlink()
+                        if venv.is_symlink() and os.readlink(venv) == generation.name:
+                            venv.unlink()
+                            if state:
+                                venv.symlink_to(state['current'])
+                        if old_state is None:
+                            (base / '.standalone-install.json').unlink(missing_ok=True)
+                        else:
+                            atomic_write(base / '.standalone-install.json', old_state)
+                        if old_config is None:
+                            target.unlink(missing_ok=True)
+                        else:
+                            atomic_write(target, old_config)
+                        raise
+                print(f'Installed package {installed_version(venv)}. CLI: {cli}')
+                if str(cli.parent) not in os.environ.get('PATH', '').split(os.pathsep):
+                    print('Add to ~/.profile: export PATH="$HOME/.local/bin:$PATH"; open a new shell.')
+            finally:
+                if not committed:
+                    pending = base / '.venv-next'
+                    if pending.is_symlink() and os.readlink(pending) == generation.name:
+                        pending.unlink()
+                    shutil.rmtree(generation)
+
+
+if __name__ == '__main__':
+    try:
+        main('--uninstall' in sys.argv, sys.argv[sys.argv.index('--script-path') + 1])
+    except (Exception, KeyboardInterrupt) as exc:
+        print(f'FAIL: {exc}', file=sys.stderr)
+        sys.exit(1)

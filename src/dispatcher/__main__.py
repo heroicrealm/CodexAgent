@@ -1,14 +1,27 @@
 import argparse
+from importlib import metadata
 from pathlib import Path
 import socket
 import json
-from .config import load_config, resolve_config
+from .config import load_config, resolve_config, validate_schema, CONFIG_SCHEMA_VERSION, ConfigSchemaError
 from .runtime import Runtime
+
+
+class PackageVersion(argparse.Action):
+    def __call__(self, parser, namespace, values, option_string=None):
+        try:
+            value = metadata.version('codex-dispatcher-v2')
+        except metadata.PackageNotFoundError:
+            parser.exit(1, 'FAIL: codex-dispatcher-v2 package metadata unavailable\n')
+        print(f'Codex Dispatcher {value}')
+        parser.exit(0)
 
 
 def main():
     parser = argparse.ArgumentParser(description='Codex Task Dispatcher V2')
+    parser.add_argument('--version', nargs=0, action=PackageVersion)
     parser.add_argument('--config', type=Path)
+    parser.add_argument('--config-schema-version', action='version', version=str(CONFIG_SCHEMA_VERSION))
     commands = parser.add_subparsers(dest='command', required=True)
     run = commands.add_parser('run')
     run.add_argument('--once', action='store_true')
@@ -70,7 +83,15 @@ def main():
     import yaml
     from .storage import SchemaError
     try:
+        readonly = args.command in ('stop', 'status', 'queue', 'show') or (
+            args.command == 'project' and args.project_command in ('list', 'show')) or (
+            args.command == 'db' and (args.db_command == 'check' or (
+                args.db_command == 'recovery' and args.recovery_command == 'status')))
+        if not readonly:
+            validate_schema(args.config)
         config = load_config(args.config)
+    except ConfigSchemaError as exc:
+        parser.exit(1, f'FAIL configuration: {exc}\n')
     except (ValueError, OSError, TypeError, KeyError, yaml.YAMLError) as exc:
         parser.exit(1, f'FAIL configuration ({type(exc).__name__}): invalid or unreadable V2 configuration\n')
     if args.command in ('status', 'queue', 'show', 'project'):
@@ -161,6 +182,10 @@ def main():
             from .monitoring import daemon
             print(f"Daemon: {daemon(config)['state']}; control unavailable: {exc}")
         return
+    if args.command == 'run':
+        from .releases import before_run
+        if not before_run():
+            parser.exit(1)
     from .db_guard import check
     from .storage import SchemaError
     try:
