@@ -5,6 +5,7 @@ import socket
 import json
 from .config import load_config, resolve_config, validate_schema, CONFIG_SCHEMA_VERSION, ConfigSchemaError
 from .runtime import Runtime
+from . import service as user_service
 
 
 class PackageVersion(argparse.Action):
@@ -23,6 +24,7 @@ def main():
     parser.add_argument('--config', type=Path)
     parser.add_argument('--config-schema-version', action='version', version=str(CONFIG_SCHEMA_VERSION))
     commands = parser.add_subparsers(dest='command', required=True)
+    user_service.register(commands)
     run = commands.add_parser('run')
     run.add_argument('--once', action='store_true')
     stop = commands.add_parser('stop')
@@ -79,6 +81,8 @@ def main():
         sub.add_argument('project')
         sub.add_argument('issue', type=int)
     args = parser.parse_args()
+    if args.command == 'service':
+        return user_service.dispatch(parser, args)
     import sqlite3
     import yaml
     from .storage import SchemaError
