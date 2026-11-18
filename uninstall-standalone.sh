@@ -125,7 +125,7 @@ def stopped(config_path, python, module_path):
     from dispatcher.locking import InstanceLock
     config = load_config(config_path)
     if daemon(config)['state'] != 'STOPPED':
-        raise RuntimeError('Dispatcher shutdown not proven; run codex-dispatcher stop first')
+        raise RuntimeError('Dispatcher shutdown not proven; stop the systemd service or foreground runtime first')
     with InstanceLock(config):
         yield
 
@@ -191,6 +191,15 @@ def release_check(script, base, installer_cli):
     return candidate, assets, checksums
 
 
+def require_service_uninstalled(home):
+    unit_dir = home / '.config/systemd/user'
+    for path in (unit_dir / 'codex-dispatcher.service',
+                 unit_dir / 'default.target.wants/codex-dispatcher.service'):
+        if os.path.lexists(path):
+            raise RuntimeError(f'Service registration preserved at {path}; run '
+                               'codex-dispatcher service uninstall before removing the package')
+
+
 def main(uninstall=False, script_path=None):
     home = Path.home()
     base = home / 'codex-dispatcher'
@@ -232,6 +241,7 @@ def main(uninstall=False, script_path=None):
             not state or not venv.is_symlink() or os.readlink(venv) != state['current']):
             raise RuntimeError('Unowned .venv preserved; use a separate installation or reconcile manually')
         if uninstall:
+            require_service_uninstalled(home)
             if not state:
                 raise RuntimeError('No owned installation found')
             module = call([venv / 'bin/python', '-c', 'import dispatcher; print(next(iter(dispatcher.__path__)))'])
