@@ -51,7 +51,7 @@ StartLimitBurst=5
 [Service]
 Type=exec
 ExecStart=:{quote(str(cli))} --config {quote(str(config))} run
-WorkingDirectory={quote(str(home))}
+WorkingDirectory=%h
 Restart=on-failure
 RestartSec=10s
 TimeoutStopSec=infinity
@@ -160,17 +160,18 @@ def execute(action, config_arg, *, lines=50, follow=False):
     if action == 'status':
         report(unit, cli, config)
         return
-    if action in ('start', 'stop', 'restart'):
-        call('systemctl', action, UNIT)
-        return
-
     props = properties()
     check_namespace(unit, props)
     if action == 'install':
         if not cli.is_file() or not os.access(cli, os.X_OK):
             raise RuntimeError(f'Standalone executable missing or inaccessible: {cli}')
-        load_config(config)
-        validate_schema(config)
+        safe_node(cli.stat(), cli, stat.S_ISREG)
+        try:
+            load_config(config)
+            validate_schema(config)
+        except (OSError, ValueError, KeyError, TypeError, yaml.YAMLError) as exc:
+            raise RuntimeError(f'Invalid, missing or unreadable configuration: {config} '
+                               f'({type(exc).__name__})') from exc
         expected = render(home, cli, config)
     with ExitStack() as stack:
         if action == 'install':
@@ -186,11 +187,14 @@ def execute(action, config_arg, *, lines=50, follow=False):
             try:
                 safe_node(directory.lstat(), directory, stat.S_ISDIR)
             except FileNotFoundError:
+                if action != 'uninstall':
+                    raise RuntimeError(f'Service unit is absent: {unit}')
                 return
         directory_fd = os.open(unit.parent, os.O_DIRECTORY | os.O_NOFOLLOW)
         stack.callback(os.close, directory_fd)
         fcntl.flock(directory_fd, fcntl.LOCK_EX)
-        check_namespace(unit, properties())
+        props = properties()
+        check_namespace(unit, props)
         current = owned(unit)
         if action == 'install':
             if current is None:
@@ -198,8 +202,15 @@ def execute(action, config_arg, *, lines=50, follow=False):
             elif current != expected:
                 raise RuntimeError(f'Unit settings differ: {unit}. Run service uninstall before reinstalling.')
             call('systemctl', 'daemon-reload')
-            check_namespace(unit, properties())
+            loaded = properties()
+            check_namespace(unit, loaded)
+            if loaded.get('LoadState') != 'loaded' or not loaded.get('FragmentPath'):
+                raise RuntimeError(f'User manager cannot load {unit}; check its unit search paths')
             call('systemctl', 'enable', UNIT)
+        elif action in ('start', 'stop', 'restart'):
+            if current is None:
+                raise RuntimeError(f'Service unit is absent: {unit}')
+            call('systemctl', action, UNIT)
         elif current is not None:
             call('systemctl', 'stop', UNIT)
             call('systemctl', 'disable', UNIT)

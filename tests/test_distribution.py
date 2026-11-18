@@ -644,3 +644,20 @@ def test_uninstall_explicit_y_holds_maintenance_lock(installer, monkeypatch, cap
     standalone.main(uninstall=True)
     assert 'Proceed with uninstall? [y/N]:' in capsys.readouterr().out
     assert not (home / 'codex-dispatcher/.venv').is_symlink()
+
+
+@pytest.mark.parametrize('entry', ['codex-dispatcher.service', 'default.target.wants/codex-dispatcher.service'])
+@pytest.mark.parametrize('symlink', [False, True])
+def test_uninstall_refuses_service_registration(installer, entry, symlink):
+    home, *_ = installer
+    standalone.main()
+    registration = home / '.config/systemd/user' / entry
+    registration.parent.mkdir(parents=True)
+    if symlink:
+        registration.symlink_to(home / 'missing.service')
+    else:
+        registration.touch()
+    with pytest.raises(RuntimeError, match='service uninstall'):
+        standalone.main(uninstall=True)
+    assert os.path.lexists(registration)
+    assert (home / '.local/bin/codex-dispatcher').is_symlink()

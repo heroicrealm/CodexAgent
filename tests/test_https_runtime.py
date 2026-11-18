@@ -356,3 +356,58 @@ def test_early_config_error_does_not_echo_yaml_secrets(tmp_path):
                              'run', '--once'], capture_output=True, text=True, timeout=5)
     assert result.returncode == 1 and 'FAIL configuration' in result.stderr
     assert 'ghp_PRIVATE_CONFIG_TOKEN' not in result.stderr + result.stdout
+
+
+def test_sigterm_drains_real_piped_codex_and_holds_instance_lock(environment, tmp_path):
+    from dispatcher.execution import ProcessRunner
+    from dispatcher.locking import AlreadyRunning, InstanceLock
+
+    config, store, api, gh, git, *_ = environment
+    approve(api)
+    ready, release = tmp_path / 'codex-ready', tmp_path / 'codex-release'
+    code = """
+from pathlib import Path
+import os
+import sys
+import time
+
+assert all(not os.isatty(fd) for fd in (0, 1, 2))
+assert 'Body 1' in sys.stdin.read()
+Path(sys.argv[1]).write_text(str(os.getpid()))
+while not Path(sys.argv[2]).exists():
+    time.sleep(0.02)
+Path('result.txt').write_text('result\\n')
+print('Agent final result')
+"""
+    runner = ProcessRunner((sys.executable, '-c', code, str(ready), str(release)))
+    runtime = Runtime(config, github=gh, git=git, runner=runner)
+    from concurrent.futures import ThreadPoolExecutor
+
+    def stop_and_check():
+        try:
+            deadline = time.monotonic() + 8
+            while not ready.exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            assert ready.exists()
+            os.kill(os.getpid(), signal.SIGTERM)
+            deadline = time.monotonic() + 3
+            while not runtime.stopping and time.monotonic() < deadline:
+                time.sleep(0.02)
+            assert runtime.stopping
+            os.kill(os.getpid(), signal.SIGTERM)
+            os.kill(int(ready.read_text()), 0)
+            with pytest.raises(AlreadyRunning), InstanceLock(config):
+                pytest.fail('Second runtime admitted during drain')
+        finally:
+            release.touch()
+            runtime.stop()
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        checks = pool.submit(stop_and_check)
+        runtime.run()
+        checks.result(timeout=10)
+    assert not runner.cancelled.is_set()
+    assert store.issue(1)['state'] == 'review'
+    with pytest.raises(ProcessLookupError):
+        os.kill(int(ready.read_text()), 0)
+    assert not (config.workspace / '.control.sock').exists()

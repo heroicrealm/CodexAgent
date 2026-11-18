@@ -20,7 +20,7 @@ with tempfile.TemporaryDirectory() as directory:
     config = root / 'config.yaml'
     config.write_text(f'config_schema_version: 1\ndispatcher:\n  root_path: {root}\nprojects: []\n')
     maintain(load_config(config), 'bootstrap')
-    releases.request_json = lambda url: {} if url == releases.API else {'tag_name': 'v2.5.2.post2'}
+    releases.request_json = lambda _: {'tag_name': 'v2.5.2.post2'}
     sys.argv = ['codex-dispatcher', '--config', str(config), 'run', '--once']
     main()
     assert (root / 'runtime/dispatcher.sqlite3').is_file()

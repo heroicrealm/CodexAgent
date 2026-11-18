@@ -20,7 +20,10 @@ def stable_version(release):
         raise ValueError('Invalid release response')
     if release.get('draft') or release.get('prerelease'):
         raise ValueError('Not a stable release')
-    result = Version(str(release['tag_name']).removeprefix('v'))
+    tag = release.get('tag_name')
+    if not isinstance(tag, str):
+        raise ValueError('Invalid release tag')
+    result = Version(tag.removeprefix('v'))
     if result.is_prerelease or result.is_devrelease:
         raise ValueError('Not a stable version')
     return result
